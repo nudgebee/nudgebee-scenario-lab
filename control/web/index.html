@@ -3,191 +3,414 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NudgeBee Scenario Lab</title>
+<title>Scenario Lab · Control</title>
 <style>
-  :root {
-    --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef; --muted:#98a2b3;
-    --accent:#4f8cff; --ok:#2ecc71; --alarm:#ff5b5b; --warn:#f5a623;
+/* ---------------------------------------------------------------- tokens */
+:root{
+  --bg:#0a0c10; --bg-2:#0e1117; --panel:#12161e; --panel-2:#161b25;
+  --line:#1f2733; --line-2:#2a3441;
+  --fg:#dfe6f0; --fg-2:#8b97a8; --fg-3:#5a6577;
+  --amber:#e8a33d; --amber-dim:#7a5a20;
+  --green:#3ecf8e; --red:#ff5c5c; --blue:#5b9dff; --violet:#a97bff;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,sans-serif;
+  --grid:rgba(255,255,255,.022);
+}
+:root[data-theme="light"]{
+  --bg:#f2f3f5; --bg-2:#eceef1; --panel:#fff; --panel-2:#f7f8fa;
+  --line:#dde1e7; --line-2:#c9d0da;
+  --fg:#10141b; --fg-2:#5a6577; --fg-3:#8b97a8;
+  --amber:#a86a00; --amber-dim:#e8d3ac;
+  --green:#0f8f5b; --red:#c62828; --blue:#2563c9; --violet:#6b3fd4;
+  --grid:rgba(0,0,0,.025);
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){
+    --bg:#f2f3f5; --bg-2:#eceef1; --panel:#fff; --panel-2:#f7f8fa;
+    --line:#dde1e7; --line-2:#c9d0da;
+    --fg:#10141b; --fg-2:#5a6577; --fg-3:#8b97a8;
+    --amber:#a86a00; --amber-dim:#e8d3ac;
+    --green:#0f8f5b; --red:#c62828; --blue:#2563c9; --violet:#6b3fd4;
+    --grid:rgba(0,0,0,.025);
   }
-  @media (prefers-color-scheme: light) {
-    :root { --bg:#f6f7f9; --panel:#fff; --line:#e3e6 eb; --fg:#1b1f27; --muted:#5b6472; }
-  }
-  * { box-sizing:border-box }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif }
-  header { padding:20px 24px; border-bottom:1px solid var(--line);
-           display:flex; align-items:center; gap:16px; flex-wrap:wrap }
-  h1 { font-size:17px; margin:0; font-weight:600 }
-  .meta { color:var(--muted); font-size:13px }
-  .spacer { flex:1 }
-  button { font:inherit; border-radius:7px; border:1px solid var(--line);
-           background:var(--panel); color:var(--fg); padding:7px 14px; cursor:pointer }
-  button:hover:not(:disabled) { border-color:var(--accent) }
-  button:disabled { opacity:.45; cursor:not-allowed }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff }
-  button.danger { border-color:var(--alarm); color:var(--alarm) }
-  main { padding:24px; display:grid; gap:24px;
-         grid-template-columns:minmax(0,2fr) minmax(260px,1fr) }
-  @media (max-width:900px){ main { grid-template-columns:1fr } }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
-          padding:16px; margin-bottom:14px }
-  .row { display:flex; align-items:flex-start; gap:14px }
-  .name { font-weight:600 }
-  .tag { font-size:11px; padding:2px 7px; border-radius:20px;
-         border:1px solid var(--line); color:var(--muted) }
-  .teaches { color:var(--muted); font-size:13px; margin-top:6px }
-  .naive { color:var(--warn); font-size:12.5px; margin-top:6px }
-  .countdown { font-variant-numeric:tabular-nums; color:var(--accent); font-weight:600 }
-  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
-       color:var(--muted); margin:0 0 10px }
-  .alarm { display:flex; justify-content:space-between; gap:10px; padding:6px 0;
-           border-bottom:1px solid var(--line); font-size:13px }
-  .alarm:last-child { border-bottom:0 }
-  .state { font-weight:600; font-size:12px }
-  .OK { color:var(--ok) } .ALARM { color:var(--alarm) }
-  .INSUFFICIENT_DATA { color:var(--muted) }
-  .banner { background:#3a2a10; border:1px solid var(--warn); color:#ffd79a;
-            padding:10px 14px; border-radius:8px; margin:0 24px; font-size:13px }
-  select { font:inherit; background:var(--panel); color:var(--fg);
-           border:1px solid var(--line); border-radius:7px; padding:6px 10px }
-  .err { color:var(--alarm); font-size:13px; margin-top:8px }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg); font:14px/1.5 var(--sans);
+  background-image:linear-gradient(var(--grid) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+  background-size:44px 44px;
+  min-height:100vh; -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:var(--mono)}
+
+/* ---------------------------------------------------------------- chrome */
+header{
+  border-bottom:1px solid var(--line); background:var(--bg-2);
+  position:sticky; top:0; z-index:20;
+}
+.bar{display:flex; align-items:stretch; gap:0; flex-wrap:wrap}
+.brand{
+  padding:14px 18px; border-right:1px solid var(--line);
+  display:flex; align-items:center; gap:10px; min-width:210px;
+}
+.mark{
+  width:9px; height:9px; background:var(--amber); flex:none;
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--amber) 18%,transparent);
+}
+.brand b{font-size:13px; letter-spacing:.14em; text-transform:uppercase; font-weight:650}
+.brand span{display:block; font-size:10.5px; color:var(--fg-3); letter-spacing:.1em}
+
+.ctx{display:flex; flex:1; flex-wrap:wrap}
+.ctx div{
+  padding:11px 16px; border-right:1px solid var(--line);
+  min-width:0; flex:1 1 auto; white-space:nowrap;
+}
+.ctx{min-width:0}
+.ctx dt{font-size:9.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--fg-3)}
+.ctx dd{font-family:var(--mono); font-size:12.5px; margin-top:3px; color:var(--fg)}
+.ctx dd.warnv{color:var(--amber)} .ctx dd.badv{color:var(--red)} .ctx dd.okv{color:var(--green)}
+
+.acts{display:flex; align-items:center; gap:8px; padding:10px 16px; margin-left:auto}
+
+button{
+  font:600 12px/1 var(--sans); letter-spacing:.02em;
+  border:1px solid var(--line-2); background:var(--panel);
+  color:var(--fg); padding:9px 14px; cursor:pointer; border-radius:3px;
+  transition:border-color .12s, background .12s, color .12s;
+}
+button:hover:not(:disabled){border-color:var(--amber); color:var(--amber)}
+button:disabled{opacity:.35; cursor:not-allowed}
+button.go{background:var(--amber); border-color:var(--amber); color:#12161e}
+:root[data-theme="light"] button.go{color:#fff}
+button.go:hover:not(:disabled){filter:brightness(1.08); color:#12161e}
+button.stop{border-color:var(--red); color:var(--red)}
+button.ghost{background:transparent}
+
+/* ---------------------------------------------------------------- banner */
+.warn{
+  display:flex; gap:11px; align-items:flex-start;
+  padding:11px 20px; font-size:12.5px; color:var(--amber);
+  background:color-mix(in srgb,var(--amber) 9%,transparent);
+  border-bottom:1px solid var(--amber-dim);
+}
+.warn b{color:var(--amber)}
+
+/* ---------------------------------------------------------------- layout */
+main{
+  display:grid; grid-template-columns:minmax(0,1fr) 330px;
+  gap:0; align-items:start;
+}
+@media (max-width:1080px){ main{grid-template-columns:1fr} }
+.col-l{padding:20px; min-width:0; min-height:calc(100vh - 104px)}
+.col-r{
+  padding:20px; border-left:1px solid var(--line);
+  min-height:calc(100vh - 104px);
+}
+@media (max-width:1080px){ .col-r{border-left:0; border-top:1px solid var(--line); min-height:0} }
+
+h2{
+  font-size:10px; letter-spacing:.18em; text-transform:uppercase;
+  color:var(--fg-3); margin:0 0 12px; display:flex; gap:9px; align-items:center;
+}
+h2::after{content:""; flex:1; height:1px; background:var(--line)}
+h2 .n{color:var(--fg-2); font-family:var(--mono); letter-spacing:0}
+
+/* ---------------------------------------------------------------- cards */
+.card{
+  background:var(--panel); border:1px solid var(--line);
+  border-radius:4px; margin-bottom:11px; overflow:hidden;
+  transition:border-color .14s;
+}
+.card:hover{border-color:var(--line-2)}
+.card.live{border-color:var(--amber); box-shadow:0 0 0 1px color-mix(in srgb,var(--amber) 22%,transparent)}
+.card.blocked{opacity:.62}
+
+.chead{display:flex; align-items:flex-start; gap:13px; padding:13px 15px}
+.led{
+  width:8px; height:8px; border-radius:50%; margin-top:6px; flex:none;
+  background:var(--fg-3);
+}
+.led.ok{background:var(--green); box-shadow:0 0 7px color-mix(in srgb,var(--green) 65%,transparent)}
+.led.live{background:var(--amber); box-shadow:0 0 8px var(--amber); animation:pulse 1.5s ease-in-out infinite}
+.led.bad{background:var(--red); box-shadow:0 0 7px color-mix(in srgb,var(--red) 65%,transparent)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.cmain{flex:1; min-width:0}
+.ctitle{display:flex; align-items:baseline; gap:9px; flex-wrap:wrap}
+.ctitle b{font-size:14.5px; font-weight:600}
+.chip{
+  font-family:var(--mono); font-size:10px; padding:2px 6px; border-radius:2px;
+  border:1px solid var(--line-2); color:var(--fg-2); white-space:nowrap;
+}
+.chip.sig{color:var(--blue); border-color:color-mix(in srgb,var(--blue) 40%,transparent)}
+.chip.alarm{color:var(--red); border-color:color-mix(in srgb,var(--red) 45%,transparent)}
+.chip.okstate{color:var(--green); border-color:color-mix(in srgb,var(--green) 40%,transparent)}
+.desc{color:var(--fg-2); font-size:12.5px; margin-top:6px}
+.naive{
+  color:var(--violet); font-size:12px; margin-top:6px;
+  padding-left:9px; border-left:2px solid color-mix(in srgb,var(--violet) 45%,transparent);
+}
+.cside{text-align:right; min-width:112px; flex:none}
+.count{font-family:var(--mono); font-size:19px; color:var(--amber); font-variant-numeric:tabular-nums}
+.countlbl{font-size:9.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--fg-3); margin-bottom:7px}
+
+.cfoot{
+  border-top:1px solid var(--line); background:var(--panel-2);
+  padding:9px 15px; display:flex; gap:16px; flex-wrap:wrap;
+  font-family:var(--mono); font-size:11px; color:var(--fg-3);
+}
+.cfoot span b{color:var(--fg-2); font-weight:500}
+.block{
+  border-top:1px solid var(--line);
+  padding:9px 15px; font-size:11.5px; color:var(--red);
+  background:color-mix(in srgb,var(--red) 7%,transparent);
+}
+.hint{
+  border-top:1px solid var(--line);
+  padding:9px 15px; font-size:11.5px; color:var(--fg-3);
+}
+.block div,.hint div{display:flex; gap:7px; align-items:flex-start}
+.block div+div,.hint div+div{margin-top:4px}
+
+/* ---------------------------------------------------------------- right */
+.mini{
+  background:var(--panel); border:1px solid var(--line); border-radius:4px;
+  padding:5px 0; margin-bottom:16px;
+}
+.mrow{
+  display:flex; justify-content:space-between; gap:10px; align-items:center;
+  padding:7px 13px; font-size:12px; border-bottom:1px solid var(--line);
+}
+.mrow:last-child{border-bottom:0}
+.mrow .k{font-family:var(--mono); font-size:11.5px; color:var(--fg-2);
+         overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.st{font-family:var(--mono); font-size:10.5px; font-weight:600; letter-spacing:.04em}
+.st.OK{color:var(--green)} .st.ALARM{color:var(--red)}
+.st.INSUFFICIENT_DATA{color:var(--fg-3)}
+.dot{width:6px;height:6px;border-radius:50%;flex:none;display:inline-block;margin-right:6px}
+.dot.on{background:var(--green)} .dot.off{background:var(--fg-3)}
+
+.empty{color:var(--fg-3); font-size:12px; padding:13px; text-align:center}
+.err{color:var(--red); font-size:12px; margin:10px 0; font-family:var(--mono)}
+select{
+  font:12px var(--mono); background:var(--panel); color:var(--fg);
+  border:1px solid var(--line-2); border-radius:3px; padding:7px 9px;
+  min-width:190px;
+}
+select:disabled,select:has(option:only-child:disabled){color:var(--fg-3)}
 </style>
 </head>
 <body>
+
 <header>
-  <h1>NudgeBee Scenario Lab</h1>
-  <span class="meta" id="meta">connecting…</span>
-  <span class="spacer"></span>
-  <select id="host"></select>
-  <button class="danger" onclick="reset()">Reset everything</button>
+  <div class="bar">
+    <div class="brand">
+      <div class="mark"></div>
+      <div><b>Scenario Lab</b><span id="stackName">—</span></div>
+    </div>
+    <div class="ctx" id="ctx"></div>
+    <div class="acts">
+      <select id="host"></select>
+      <button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button>
+      <button class="stop" onclick="reset()">Reset all</button>
+    </div>
+  </div>
 </header>
 
-<div class="banner">
-  These scenarios deliberately degrade the hosts they run on. Never point this at
-  production. Every scenario stops on its own; <strong>Reset everything</strong> stops them now.
+<div class="warn">
+  <span>⚠</span>
+  <div><b>These scenarios deliberately degrade the hosts they run on.</b>
+  Never point this at production. Every scenario stops on its own; <b>Reset all</b> stops them now.</div>
 </div>
 
 <main>
-  <section>
-    <h2>Scenarios</h2>
-    <div id="scenarios"></div>
-    <div class="err" id="err"></div>
-  </section>
-  <aside>
+  <div class="col-l">
+    <h2>Scenarios <span class="n" id="scount"></span></h2>
+    <div id="err" class="err"></div>
+    <div id="list"></div>
+
+    <h2 style="margin-top:26px">Findings <span class="n">waste tier · read-only</span></h2>
+    <div id="findings"></div>
+  </div>
+
+  <aside class="col-r">
     <h2>Alarms</h2>
-    <div class="card" id="alarms">loading…</div>
+    <div class="mini" id="alarms"><div class="empty">loading…</div></div>
+    <h2>Hosts</h2>
+    <div class="mini" id="hosts"><div class="empty">loading…</div></div>
   </aside>
 </main>
 
 <script>
-let data = null;
+let D=null, F=null;
 
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  if (!r.ok) {
-    let detail = r.statusText;
-    try { detail = (await r.json()).detail || detail; } catch (e) {}
-    throw new Error(detail);
-  }
-  return r.json();
+const api=async(p,o)=>{const r=await fetch(p,o);
+  if(!r.ok){let d=r.statusText;try{d=(await r.json()).detail||d}catch(e){}throw new Error(d)}
+  return r.json()};
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=s=>s<=0?'0:00':Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+const ago=t=>{if(!t)return'never';const d=(Date.now()-new Date(t))/1000;
+  if(d<60)return Math.round(d)+'s ago'; if(d<3600)return Math.round(d/60)+'m ago';
+  if(d<86400)return Math.round(d/3600)+'h ago'; return Math.round(d/86400)+'d ago'};
+
+function toggleTheme(){
+  const cur=document.documentElement.getAttribute('data-theme');
+  const next=cur==='light'?'dark':'light';
+  document.documentElement.setAttribute('data-theme',next);
+  try{localStorage.setItem('sl-theme',next)}catch(e){}
+}
+try{const t=localStorage.getItem('sl-theme'); if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}
+
+function renderCtx(){
+  const id=D.identity||{}, si=D.stack_info||{};
+  const online=D.hosts.filter(h=>h.ssm_online).length;
+  const cells=[
+    ['AWS account', id.account_alias?`${id.account_alias} · ${id.account}`:(id.account||'unknown'),
+      id.account?'':'badv'],
+    ['Identity', id.principal||'—',''],
+    ['Region', D.region,''],
+    ['Stack', si.deployed?si.status:'not deployed', si.deployed?(si.status==='CREATE_COMPLETE'||si.status==='UPDATE_COMPLETE'?'okv':'warnv'):'badv'],
+    ['Hosts', `${online}/${D.hosts.length} SSM online`, D.hosts.length===0?'badv':(online<D.hosts.length?'warnv':'okv')],
+    ['Ceiling', D.max_minutes+' min','']
+  ];
+  document.getElementById('stackName').textContent=D.stack;
+  document.getElementById('ctx').innerHTML=cells.map(([k,v,c])=>
+    `<div><dt>${k}</dt><dd class="${c}">${esc(v)}</dd></div>`).join('');
 }
 
-function fmt(secs) {
-  if (secs <= 0) return '0:00';
-  const m = Math.floor(secs / 60), s = secs % 60;
-  return m + ':' + String(s).padStart(2, '0');
+function renderHostSel(){
+  const sel=document.getElementById('host'), prev=sel.value;
+  sel.innerHTML=D.hosts.length
+    ? D.hosts.map(h=>`<option value="${h.instance_id}" ${h.ssm_online?'':'disabled'}>
+        ${esc(h.name)} · ${h.ssm_online?'online':'offline'}</option>`).join('')
+    : '<option disabled selected>— no hosts —</option>';
+  if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
 }
 
-async function load() {
-  try {
-    data = await api('/api/scenarios');
-    document.getElementById('meta').textContent =
-      data.stack + ' · ' + data.region + ' · ' + data.hosts.length + ' host(s) · ceiling ' +
-      data.max_minutes + ' min';
-    const sel = document.getElementById('host');
-    if (!sel.options.length) {
-      data.hosts.forEach(h => {
-        const o = document.createElement('option');
-        o.value = h.instance_id;
-        o.textContent = h.name + ' (' + h.instance_id + ')';
-        sel.appendChild(o);
-      });
+function renderHosts(){
+  document.getElementById('hosts').innerHTML = D.hosts.length
+    ? D.hosts.map(h=>`<div class="mrow">
+        <span class="k"><span class="dot ${h.ssm_online?'on':'off'}"></span>${esc(h.name)}</span>
+        <span class="st ${h.ssm_online?'OK':'INSUFFICIENT_DATA'}">${h.type||''} ${h.az?'· '+h.az.slice(-2):''}</span>
+      </div>`).join('')
+    : '<div class="empty">deploy lab.yaml to create hosts</div>';
+}
+
+function renderScenarios(){
+  const S=D.scenarios;
+  document.getElementById('scount').textContent =
+    `${S.filter(s=>s.ready).length} ready · ${S.filter(s=>s.running).length} running · ${S.length} total`;
+
+  document.getElementById('list').innerHTML=S.map(s=>{
+    let led='ok', cls='';
+    if(s.running){led='live'; cls='live'}
+    else if(!s.ready){led='bad'; cls='blocked'}
+
+    let side='';
+    if(s.running && s.expires){
+      const left=Math.max(0,Math.round((new Date(s.expires)-new Date())/1000));
+      side=`<div class="countlbl">remaining</div><div class="count">${fmt(left)}</div>`;
+    }else if(s.expect_alarm_secs){
+      side=`<div class="countlbl">alarm in</div><div class="count" style="color:var(--fg-3)">~${fmt(s.expect_alarm_secs)}</div>`;
     }
-    render();
-  } catch (e) {
-    document.getElementById('meta').textContent = 'error: ' + e.message;
-  }
-}
 
-function render() {
-  const host = document.getElementById('host').value;
-  document.getElementById('scenarios').innerHTML = data.scenarios.map(s => {
-    let remain = '';
-    if (s.running && s.expires) {
-      const secs = Math.max(0, Math.round((new Date(s.expires) - new Date()) / 1000));
-      remain = '<span class="countdown">' + fmt(secs) + ' left</span>';
-    }
-    return `<div class="card">
-      <div class="row">
-        <div style="flex:1">
-          <div><span class="name">${s.name}</span>
-               <span class="tag">${s.signal || ''}</span>
-               <span class="tag">${s.default_seconds}s</span>
-               ${s.expect_alarm_secs ? '<span class="tag">alarm ~' + s.expect_alarm_secs + 's</span>' : ''}
+    const a=s.alarm;
+    const alarmChip=a?`<span class="chip ${a.state==='ALARM'?'alarm':(a.state==='OK'?'okstate':'')}">${a.state}</span>`:'';
+
+    return `<div class="card ${cls}">
+      <div class="chead">
+        <div class="led ${led}"></div>
+        <div class="cmain">
+          <div class="ctitle">
+            <b>${esc(s.name)}</b>
+            <span class="chip sig">${esc(s.signal||'')}</span>
+            <span class="chip">${s.default_seconds}s</span>
+            ${alarmChip}
           </div>
-          <div class="teaches">${s.teaches || ''}</div>
-          ${s.naive_answer ? '<div class="naive">Naive answer: “' + s.naive_answer + '”</div>' : ''}
+          <div class="desc">${esc(s.teaches)}</div>
+          ${s.naive_answer?`<div class="naive">Naive answer: “${esc(s.naive_answer)}”</div>`:''}
         </div>
-        <div style="text-align:right;min-width:130px">
-          ${remain}<br>
-          ${s.running
-            ? '<button onclick="stop(\'' + s.id + '\')">Stop</button>'
-            : '<button class="primary" onclick="start(\'' + s.id + '\')">Start</button>'}
+        <div class="cside">
+          ${side}
+          <div style="margin-top:8px">
+            ${s.running
+              ? `<button class="stop" onclick="stop('${s.id}')">Stop</button>`
+              : `<button class="go" ${s.ready?'':'disabled'} onclick="start('${s.id}')">Start</button>`}
+          </div>
         </div>
       </div>
+
+      <div class="cfoot">
+        <span><b>metric</b> ${esc((s.requires&&s.requires.metric)||'—')}</span>
+        <span><b>iam</b> ${esc(((s.requires&&s.requires.iam)||[]).join(', ')||'—')}</span>
+        <span><b>last run</b> ${s.last_run?esc(ago(s.last_run.requested_at))+' · '+esc(s.last_run.status):'never'}</span>
+        ${s.running&&s.host?`<span><b>on</b> ${esc(s.host)}</span>`:''}
+      </div>
+
+      ${s.blockers.length?`<div class="block">${s.blockers.map(b=>`<div>✕ <span>${esc(b)}</span></div>`).join('')}</div>`:''}
+      ${(!s.blockers.length&&s.warnings.length)?`<div class="hint">${s.warnings.map(w=>`<div>• <span>${esc(w)}</span></div>`).join('')}</div>`:''}
     </div>`;
   }).join('');
 }
 
-async function start(id) {
-  document.getElementById('err').textContent = '';
-  try {
-    await api('/api/start', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({scenario_id: id, instance_id: document.getElementById('host').value})
-    });
+function renderFindings(){
+  const f=(F&&F.findings)||[];
+  document.getElementById('findings').innerHTML = f.length ? f.map(x=>`
+    <div class="card">
+      <div class="chead">
+        <div class="led ${x.deployed?'ok':''}"></div>
+        <div class="cmain">
+          <div class="ctitle"><b>${esc(x.name)}</b>
+            <span class="chip">${esc(x.tag)}</span>
+            <span class="chip ${x.deployed?'okstate':''}">${x.deployed?'deployed':'not deployed'}</span>
+          </div>
+          <div class="desc">${esc(x.expect||'')}</div>
+          ${x.manual_step?`<div class="naive">Manual step: ${esc(x.manual_step)}</div>`:''}
+        </div>
+        <div class="cside"><span class="chip">${(x.resources||[]).length} res</span></div>
+      </div>
+    </div>`).join('')
+    : '<div class="card"><div class="empty">deploy waste.yaml to create findings</div></div>';
+}
+
+function renderAlarms(as){
+  document.getElementById('alarms').innerHTML = as.length
+    ? as.map(a=>`<div class="mrow">
+        <span class="k">${esc(a.name.replace(/^.*?-host-/,'host-'))}</span>
+        <span class="st ${a.state}">${a.state==='INSUFFICIENT_DATA'?'NO DATA':a.state}</span>
+      </div>`).join('')
+    : '<div class="empty">no lab alarms found</div>';
+}
+
+async function load(){
+  try{
+    const host=document.getElementById('host').value;
+    D=await api('/api/scenarios'+(host?('?host='+encodeURIComponent(host)):''));
+    renderCtx(); renderHostSel(); renderHosts(); renderScenarios();
+    document.getElementById('err').textContent='';
+  }catch(e){ document.getElementById('err').textContent='load failed: '+e.message }
+}
+async function loadAlarms(){ try{ renderAlarms((await api('/api/alarms')).alarms) }catch(e){} }
+async function loadFindings(){ try{ F=await api('/api/findings'); renderFindings() }catch(e){} }
+
+async function start(id){
+  document.getElementById('err').textContent='';
+  try{
+    await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({scenario_id:id,instance_id:document.getElementById('host').value})});
     load();
-  } catch (e) { document.getElementById('err').textContent = e.message; }
+  }catch(e){ document.getElementById('err').textContent=e.message }
 }
+async function stop(id){ try{ await api('/api/stop/'+id,{method:'POST'}); load() }
+  catch(e){ document.getElementById('err').textContent=e.message } }
+async function reset(){ try{ await api('/api/reset',{method:'POST'}); load() }
+  catch(e){ document.getElementById('err').textContent=e.message } }
 
-async function stop(id) {
-  try { await api('/api/stop/' + id, {method: 'POST'}); load(); }
-  catch (e) { document.getElementById('err').textContent = e.message; }
-}
-
-async function reset() {
-  try { await api('/api/reset', {method: 'POST'}); load(); }
-  catch (e) { document.getElementById('err').textContent = e.message; }
-}
-
-async function loadAlarms() {
-  try {
-    const a = await api('/api/alarms');
-    document.getElementById('alarms').innerHTML = a.alarms.length
-      ? a.alarms.map(x => `<div class="alarm"><span>${x.name.replace(/^.*?-host-/, 'host-')}</span>
-                            <span class="state ${x.state}">${x.state}</span></div>`).join('')
-      : '<span class="meta">no lab alarms found</span>';
-  } catch (e) {
-    document.getElementById('alarms').textContent = 'error: ' + e.message;
-  }
-}
-
-document.getElementById('host').addEventListener('change', render);
-load(); loadAlarms();
-setInterval(load, 10000);
-setInterval(loadAlarms, 15000);
-setInterval(() => { if (data) render(); }, 1000);
+document.getElementById('host').addEventListener('change',load);
+load(); loadAlarms(); loadFindings();
+setInterval(load,10000); setInterval(loadAlarms,15000); setInterval(loadFindings,60000);
+setInterval(()=>{ if(D) renderScenarios() },1000);
 </script>
 </body>
 </html>

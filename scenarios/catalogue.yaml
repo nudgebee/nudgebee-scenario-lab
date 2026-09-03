@@ -24,6 +24,10 @@ scenarios:
     name: CPU saturation
     tier: lab
     signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
     default_seconds: 300
     expect_alarm_secs: 180
     teaches: >
@@ -39,6 +43,10 @@ scenarios:
     name: Memory pressure
     tier: lab
     signal: mem-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [stress-ng]
+      metric: CWAgent MemoryUtilization (needs CloudWatch agent)
     default_seconds: 300
     expect_alarm_secs: 180
     teaches: >
@@ -56,6 +64,10 @@ scenarios:
     name: Disk fill
     tier: lab
     signal: disk-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: CWAgent DiskUtilization (needs CloudWatch agent)
     default_seconds: 600
     expect_alarm_secs: 180
     teaches: >
@@ -74,6 +86,10 @@ scenarios:
     name: Disk I/O saturation
     tier: lab
     signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
     default_seconds: 300
     expect_alarm_secs: 240
     teaches: >
@@ -88,6 +104,11 @@ scenarios:
     name: Outbound network spike
     tier: lab
     signal: net-out-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [curl]
+      metric: AWS/EC2 NetworkOut
+      egress: true
     default_seconds: 300
     expect_alarm_secs: 180
     teaches: >
@@ -101,6 +122,10 @@ scenarios:
     name: Runaway cron job
     tier: lab
     signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [crontab]
+      metric: AWS/EC2 CPUUtilization
     default_seconds: 900
     expect_alarm_secs: 240
     teaches: >
@@ -117,6 +142,10 @@ scenarios:
     name: Service failure
     tier: lab
     signal: status-check
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [systemctl]
+      metric: AWS/EC2 StatusCheckFailed
     default_seconds: 300
     expect_alarm_secs: 120
     teaches: >
@@ -145,6 +174,10 @@ scenarios:
     name: Process table pressure
     tier: lab
     signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
     default_seconds: 300
     expect_alarm_secs: 240
     teaches: >

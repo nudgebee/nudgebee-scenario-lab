@@ -211,6 +211,29 @@ pre{
   padding:5px 9px; margin-top:6px;
 }
 
+/* ---------------------------------------------------------------- deploy */
+.dbtns{display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-top:4px}
+.evts{
+  margin-top:11px; border:1px solid var(--line); border-radius:3px;
+  background:var(--bg); max-height:190px; overflow-y:auto;
+}
+.evt{
+  display:flex; gap:10px; padding:5px 11px; font-family:var(--mono);
+  font-size:11px; border-bottom:1px solid var(--line); align-items:baseline;
+}
+.evt:last-child{border-bottom:0}
+.evt .r{color:var(--fg-2); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.evt .s{font-size:10px; white-space:nowrap}
+.evt .s.done{color:var(--green)} .evt .s.prog{color:var(--amber)}
+.evt .s.fail{color:var(--red)}
+.spin{
+  display:inline-block; width:9px; height:9px; border-radius:50%;
+  border:2px solid var(--amber); border-top-color:transparent;
+  animation:sp .7s linear infinite; vertical-align:-1px; margin-right:7px;
+}
+@keyframes sp{to{transform:rotate(360deg)}}
+.tiny{font-size:11.5px; color:var(--fg-3); margin-top:7px}
+
 /* ---------------------------------------------------------------- right */
 .mini{
   background:var(--panel); border:1px solid var(--line); border-radius:4px;
@@ -442,31 +465,107 @@ function copy(id){
   }).catch(()=>{});
 }
 
+let DEPLOYING=null;
+
 function renderSetup(){
   const box=document.getElementById('setup');
-  if(!S || !S.needs_deploy){ box.innerHTML=''; return; }
+  if(!S){ box.innerHTML=''; return; }
+
+  if(DEPLOYING){
+    const st=DEPLOYING.status||{};
+    const evts=(st.events||[]).map(e=>{
+      const cls = (e.status||'').includes('FAILED')||(e.status||'').includes('ROLLBACK') ? 'fail'
+                : (e.status||'').endsWith('IN_PROGRESS') ? 'prog' : 'done';
+      return `<div class="evt"><span class="r">${esc(e.resource||'')}</span>
+              <span class="s ${cls}">${esc(e.status||'')}</span></div>`;
+    }).join('');
+    const done=st.complete, failed=st.failed;
+    box.innerHTML=`<div class="setup">
+      <div class="sh">
+        <b>${done?'Deployed':(failed?'Deploy failed':'Deploying '+esc(DEPLOYING.tier)+' tier')}</b>
+        <span>${done?'Hosts are registering with SSM - Start buttons enable themselves.'
+              :(failed?'Rolled back. The events below say which resource failed.'
+              :'<span class="spin"></span>Usually about 4 minutes.')}</span>
+      </div>
+      <div class="sb">
+        <div class="tiny">stack ${esc(DEPLOYING.name)} · ${esc(st.status||'submitting…')}</div>
+        ${evts?`<div class="evts">${evts}</div>`:''}
+        ${(done||failed)?`<div class="dbtns" style="margin-top:11px">
+          <button onclick="DEPLOYING=null;renderSetup();loadSetup();load()">Dismiss</button></div>`:''}
+      </div></div>`;
+    return;
+  }
+
+  if(!S.needs_deploy){ box.innerHTML=''; return; }
+
   const why = !S.stack_deployed
     ? 'The lab stack is not deployed in this account yet, so there is nothing to run scenarios on.'
     : `The stack is ${esc(S.stack_status)} but no running scenario hosts were found.`;
+
+  const blocked = S.permissions_checked && !S.can_deploy;
+  const missing = (S.missing_deploy_permissions||[]).join(', ');
+
   box.innerHTML=`<div class="setup">
     <div class="sh"><b>Set up the lab</b><span>${why}</span></div>
     <div class="sb">
       <div class="step"><div class="num">1</div><div class="sc">
-        <div class="st2">Deploy the scenario hosts and alarms. No parameters — the stack creates its own isolated VPC. Takes about 4 minutes.</div>
-        <pre id="cmd1">${esc(S.deploy_command)}</pre>
-        <button class="copy" id="cmd1-btn" onclick="copy('cmd1')">Copy</button>
+        <div class="st2">Deploy the scenario hosts and alarms. No parameters — the stack creates its own
+          isolated VPC, so the lab cannot land in a network you care about. About 4 minutes.</div>
+        <div class="dbtns">
+          <button class="go" ${blocked?'disabled':''}
+            title="${blocked?esc('missing: '+missing):'Creates EC2 hosts, alarms and an isolated VPC'}"
+            onclick="doDeploy('lab')">Deploy lab tier</button>
+          <button ${blocked?'disabled':''} onclick="doDeploy('waste')">Deploy waste tier</button>
+          <span class="tiny" style="margin:0">creates billable resources in
+            ${esc((D&&D.identity&&(D.identity.account_alias||D.identity.account))||'this account')}</span>
+        </div>
+        ${blocked?`<div class="tiny" style="color:var(--red)">Cannot deploy from here — missing ${esc(missing)}</div>`:''}
       </div></div>
+
       <div class="step"><div class="num">2</div><div class="sc">
-        <div class="st2">Optional — deploy the waste tier for cost, rightsizing and security findings. Nothing to trigger; the finding is the resource.</div>
-        <pre id="cmd2">${esc(S.waste_command)}</pre>
-        <button class="copy" id="cmd2-btn" onclick="copy('cmd2')">Copy</button>
-      </div></div>
-      <div class="step"><div class="num">3</div><div class="sc">
-        <div class="st2">This page refreshes every 10s. Once the hosts register with SSM the Start buttons enable themselves.</div>
+        <div class="st2">Prefer the terminal? These do the same thing.</div>
+        <pre id="cmd1">${esc(S.deploy_command)}\n${esc(S.waste_command)}</pre>
+        <button class="copy" id="cmd1-btn" onclick="copy('cmd1')">Copy</button>
       </div></div>
     </div>
   </div>`;
 }
+
+async function doDeploy(tier){
+  const acct=(D&&D.identity&&(D.identity.account_alias||D.identity.account))||'this account';
+  const what = tier==='lab'
+    ? 'EC2 hosts, CloudWatch alarms and an isolated VPC'
+    : 'deliberately wasteful resources (an oversized instance costs ~$140/mo)';
+  if(!confirm(`Deploy the ${tier} tier into ${acct}?\n\nThis creates ${what}.\nBillable until you tear it down.`)) return;
+  try{
+    const r=await api('/api/deploy',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tier:tier,confirm:true})});
+    DEPLOYING={tier:tier,name:r.deploying,status:{}};
+    renderSetup(); pollDeploy();
+  }catch(e){ document.getElementById('err').textContent='deploy failed: '+e.message }
+}
+
+async function pollDeploy(){
+  if(!DEPLOYING) return;
+  try{
+    DEPLOYING.status=await api('/api/deploy/status?tier='+encodeURIComponent(DEPLOYING.tier));
+    renderSetup();
+    if(DEPLOYING.status.in_progress){ setTimeout(pollDeploy,5000); }
+    else { load(); loadSetup(); loadAlarms(); }
+  }catch(e){ setTimeout(pollDeploy,8000) }
+}
+
+async function teardown(tier){
+  const name=(tier==='lab')?S.stack_name_lab:S.stack_name_waste;
+  const typed=prompt(`This deletes every resource in the ${tier} tier.\n\nType the stack name to confirm:`);
+  if(!typed) return;
+  try{
+    await api('/api/teardown',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tier:tier,confirm_name:typed})});
+    DEPLOYING={tier:tier,name:typed,status:{}}; renderSetup(); pollDeploy();
+  }catch(e){ document.getElementById('err').textContent='teardown failed: '+e.message }
+}
+
 async function loadSetup(){ try{ S=await api('/api/setup'); renderSetup() }catch(e){} }
 
 async function start(id){

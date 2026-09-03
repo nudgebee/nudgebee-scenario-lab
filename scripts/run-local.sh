@@ -16,6 +16,7 @@ export SCENARIO_LAB_STACK="${SCENARIO_LAB_STACK:-nudgebee-scenario-lab}"
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 export CATALOGUE_PATH="$ROOT/scenarios/catalogue.yaml"
 export WEB_DIR="$ROOT/control/web"
+export INFRA_DIR="$ROOT/infra/cloudformation"
 
 if [ ! -d "$VENV" ]; then
   echo "Creating virtualenv at .venv"

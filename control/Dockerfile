@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY control/server /app/server
 COPY control/web /app/web
 COPY scenarios /app/scenarios
+COPY infra /app/infra
 
 EXPOSE 8080
 CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8080"]

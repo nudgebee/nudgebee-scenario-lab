@@ -36,6 +36,27 @@ STACK = os.environ.get("SCENARIO_LAB_STACK", "nudgebee-scenario-lab")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 CATALOGUE = Path(os.environ.get("CATALOGUE_PATH", "/app/scenarios/catalogue.yaml"))
 WEB_DIR = Path(os.environ.get("WEB_DIR", "/app/web"))
+INFRA_DIR = Path(os.environ.get("INFRA_DIR", "/app/infra/cloudformation"))
+
+DEPLOY_ACTIONS = (
+    "cloudformation:CreateStack", "cloudformation:DeleteStack",
+    "ec2:RunInstances", "ec2:CreateVpc", "iam:CreateRole", "iam:PassRole",
+    "cloudwatch:PutMetricAlarm", "ssm:PutParameter",
+)
+
+
+def template_path(tier: str) -> Path:
+    if tier not in ("lab", "waste"):
+        raise HTTPException(400, "tier must be lab or waste")
+    for base in (INFRA_DIR, Path(__file__).resolve().parents[2] / "infra" / "cloudformation"):
+        p = base / f"{tier}.yaml"
+        if p.exists():
+            return p
+    raise HTTPException(500, f"{tier}.yaml not found - set INFRA_DIR")
+
+
+def stack_name_for(tier: str) -> str:
+    return STACK if tier == "lab" else f"{STACK}-waste"
 
 ssm = boto3.client("ssm", region_name=REGION)
 ec2 = boto3.client("ec2", region_name=REGION)
@@ -574,7 +595,12 @@ def setup():
         "  --capabilities CAPABILITY_IAM \\\n"
         f"  --region {REGION}"
     )
+    perms = permissions(DEPLOY_ACTIONS)
+    missing = [a for a, ok in perms.items() if not ok]
     return {
+        "can_deploy": bool(perms) and not missing,
+        "missing_deploy_permissions": missing,
+        "permissions_checked": bool(perms),
         "needs_deploy": not si["deployed"] or not hosts,
         "stack_deployed": si["deployed"],
         "stack_status": si["status"],
@@ -585,6 +611,129 @@ def setup():
         "waste_command": waste,
         "manual_command": manual,
     }
+
+
+# ----------------------------------------------------------------- deploy
+
+class DeployRequest(BaseModel):
+    tier: str = "lab"
+    vpc_id: str | None = None
+    subnet_id: str | None = None
+    confirm: bool = False
+
+
+@app.post("/api/deploy")
+def deploy(req: DeployRequest):
+    """
+    Create the stack from the UI. Deliberately requires confirm=true: this
+    creates billable resources and, for the lab tier, hosts that scenarios
+    will degrade.
+    """
+    if not req.confirm:
+        raise HTTPException(400, "confirm=true is required - this creates billable resources")
+
+    name = stack_name_for(req.tier)
+    body = template_path(req.tier).read_text()
+
+    params = []
+    if req.vpc_id:
+        params.append({"ParameterKey": "VpcId", "ParameterValue": req.vpc_id})
+        if not req.subnet_id:
+            raise HTTPException(400, "subnet_id is required when vpc_id is given")
+        params.append({"ParameterKey": "SubnetId", "ParameterValue": req.subnet_id})
+    elif req.tier == "waste":
+        # waste.yaml has no network of its own - reuse the lab's
+        vpc = subnet = None
+        try:
+            outs = cfn.describe_stacks(StackName=STACK)["Stacks"][0].get("Outputs", [])
+            vpc = next((o["OutputValue"] for o in outs if o["OutputKey"] == "VpcUsed"), None)
+        except ClientError:
+            pass
+        if vpc:
+            try:
+                subs = ec2.describe_subnets(
+                    Filters=[{"Name": "vpc-id", "Values": [vpc]}]
+                )["Subnets"]
+                subnet = subs[0]["SubnetId"] if subs else None
+            except ClientError:
+                pass
+        if not vpc or not subnet:
+            raise HTTPException(412, "deploy the lab tier first, or supply vpc_id and subnet_id")
+        params = [
+            {"ParameterKey": "VpcId", "ParameterValue": vpc},
+            {"ParameterKey": "SubnetId", "ParameterValue": subnet},
+        ]
+
+    try:
+        cfn.create_stack(
+            StackName=name,
+            TemplateBody=body,
+            Parameters=params,
+            Capabilities=["CAPABILITY_IAM"],
+            Tags=[{"Key": "nudgebee-scenario-lab", "Value": "true"}],
+            OnFailure="ROLLBACK",
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code == "AlreadyExistsException":
+            raise HTTPException(409, f"stack {name} already exists") from exc
+        raise HTTPException(502, f"create_stack failed: {exc}") from exc
+
+    _cache.pop("identity", None)
+    return {"deploying": name, "tier": req.tier}
+
+
+@app.get("/api/deploy/status")
+def deploy_status(tier: str = "lab"):
+    """Stack status plus the most recent events, so the UI can show progress."""
+    name = stack_name_for(tier)
+    try:
+        st = cfn.describe_stacks(StackName=name)["Stacks"][0]
+    except ClientError:
+        return {"exists": False, "status": None, "events": [], "in_progress": False}
+
+    events = []
+    try:
+        for e in cfn.describe_stack_events(StackName=name)["StackEvents"][:12]:
+            events.append(
+                {
+                    "time": e["Timestamp"].isoformat(),
+                    "resource": e.get("LogicalResourceId"),
+                    "type": e.get("ResourceType"),
+                    "status": e.get("ResourceStatus"),
+                    "reason": e.get("ResourceStatusReason"),
+                }
+            )
+    except ClientError:
+        pass
+
+    status = st["StackStatus"]
+    return {
+        "exists": True,
+        "status": status,
+        "in_progress": status.endswith("_IN_PROGRESS"),
+        "complete": status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"),
+        "failed": "ROLLBACK" in status or "FAILED" in status,
+        "events": events,
+    }
+
+
+class TeardownRequest(BaseModel):
+    tier: str = "lab"
+    confirm_name: str
+
+
+@app.post("/api/teardown")
+def teardown(req: TeardownRequest):
+    """Delete the stack. The caller must type the stack name back to confirm."""
+    name = stack_name_for(req.tier)
+    if req.confirm_name != name:
+        raise HTTPException(400, f"type the stack name '{name}' to confirm deletion")
+    try:
+        cfn.delete_stack(StackName=name)
+    except ClientError as exc:
+        raise HTTPException(502, f"delete_stack failed: {exc}") from exc
+    return {"deleting": name}
 
 
 @app.get("/api/health")

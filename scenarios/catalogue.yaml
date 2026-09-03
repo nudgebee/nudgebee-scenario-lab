@@ -1,0 +1,217 @@
+# NudgeBee Scenario Lab - scenario catalogue
+#
+# Adding a scenario = adding an entry here. No code change.
+#
+# Every scenario MUST be self-limiting: the command it runs has to terminate on
+# its own within `default_seconds`. The control app also enforces a ceiling and
+# runs a sweeper, but the command itself is the first line of defence.
+#
+# Fields:
+#   id                stable identifier, used by the UI and CLI
+#   name              human label
+#   tier              lab | full
+#   signal            which alarm this should trip (suffix after <stack>-host-N-)
+#   expect_alarm_secs rough time from start to alarm, for the UI countdown
+#   teaches           what this scenario is meant to demonstrate in NudgeBee
+#   naive_answer      the wrong-but-plausible conclusion, if any
+#   command           bash run on the host via SSM. MUST self-terminate.
+
+version: 1
+
+scenarios:
+
+  - id: cpu_high
+    name: CPU saturation
+    tier: lab
+    signal: cpu-high
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Attribution of a CPU spike to an operator-issued command rather than
+      application load. NudgeBee should name the command, its timestamp and
+      that CPU returned to baseline when it exited.
+    naive_answer: "The instance is undersized and should be scaled up."
+    command: |
+      NPROC=$(nproc)
+      timeout {{seconds}} bash -c "for i in \$(seq 1 \$((NPROC*2))); do (while :; do :; done) & done; wait" >/dev/null 2>&1
+
+  - id: memory_pressure
+    name: Memory pressure
+    tier: lab
+    signal: mem-high
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Memory exhaustion without an OOM kill - the process holds allocation but
+      never trips the killer, so the host degrades without a crash to point at.
+    naive_answer: "A memory leak in the application."
+    command: |
+      if command -v stress-ng >/dev/null 2>&1; then
+        timeout {{seconds}} stress-ng --vm 2 --vm-bytes 70% --vm-keep >/dev/null 2>&1
+      else
+        timeout {{seconds}} bash -c 'a=(); while :; do a+=($(head -c 1000000 /dev/zero | tr "\0" "x")); sleep 0.1; done' >/dev/null 2>&1
+      fi
+
+  - id: disk_fill
+    name: Disk fill
+    tier: lab
+    signal: disk-high
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      Disk exhaustion from a single large file. NudgeBee should locate the file
+      and the process that wrote it, not just report percent-used.
+    naive_answer: "The volume needs resizing."
+    command: |
+      TARGET=/var/tmp/nudgebee-scenario-fill.bin
+      AVAIL_MB=$(df -Pm / | awk 'NR==2 {print $4}')
+      ALLOC_MB=$(( AVAIL_MB * 85 / 100 ))
+      fallocate -l ${ALLOC_MB}M "$TARGET" 2>/dev/null || dd if=/dev/zero of="$TARGET" bs=1M count=$ALLOC_MB 2>/dev/null
+      sleep {{seconds}}
+      rm -f "$TARGET"
+
+  - id: disk_io_saturation
+    name: Disk I/O saturation
+    tier: lab
+    signal: cpu-high
+    default_seconds: 300
+    expect_alarm_secs: 240
+    teaches: >
+      I/O wait rather than compute. CPU looks busy but the bottleneck is the
+      volume - a distinction a naive reading of CPUUtilization misses.
+    naive_answer: "CPU-bound workload; add vCPUs."
+    command: |
+      timeout {{seconds}} bash -c 'while :; do dd if=/dev/zero of=/var/tmp/nb-io.tmp bs=1M count=256 oflag=direct 2>/dev/null; dd if=/var/tmp/nb-io.tmp of=/dev/null bs=1M iflag=direct 2>/dev/null; done'
+      rm -f /var/tmp/nb-io.tmp
+
+  - id: network_spike
+    name: Outbound network spike
+    tier: lab
+    signal: net-out-high
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Sustained egress from one host. Useful for showing NudgeBee tie a network
+      alarm to the process and destination responsible.
+    naive_answer: "Data exfiltration or a DDoS."
+    command: |
+      timeout {{seconds}} bash -c 'while :; do curl -s -o /dev/null https://speed.cloudflare.com/__down?bytes=100000000 || sleep 2; done'
+
+  - id: runaway_cron
+    name: Runaway cron job
+    tier: lab
+    signal: cpu-high
+    default_seconds: 900
+    expect_alarm_secs: 240
+    teaches: >
+      A RECURRING cause. The spike repeats every minute from a cron entry, so
+      the right answer is the schedule, not the individual process. This is the
+      scenario where the obvious answer is wrong.
+    naive_answer: "A one-off process spiked the CPU; nothing to do."
+    command: |
+      echo '* * * * * root timeout 50 bash -c "for i in 1 2 3 4; do (while :; do :; done) & done; wait" >/dev/null 2>&1' > /etc/cron.d/nudgebee-scenario
+      sleep {{seconds}}
+      rm -f /etc/cron.d/nudgebee-scenario
+
+  - id: service_failure
+    name: Service failure
+    tier: lab
+    signal: status-check
+    default_seconds: 300
+    expect_alarm_secs: 120
+    teaches: >
+      A systemd unit that fails and stays failed. NudgeBee should surface the
+      unit name and its journal output rather than only the status check.
+    naive_answer: "The instance is unhealthy and should be replaced."
+    command: |
+      cat >/etc/systemd/system/nudgebee-scenario-broken.service <<'UNIT'
+      [Unit]
+      Description=NudgeBee scenario - deliberately failing service
+      [Service]
+      Type=simple
+      ExecStart=/bin/bash -c 'echo "scenario: simulated startup failure" >&2; exit 1'
+      Restart=always
+      RestartSec=5
+      UNIT
+      systemctl daemon-reload
+      systemctl start nudgebee-scenario-broken || true
+      sleep {{seconds}}
+      systemctl stop nudgebee-scenario-broken 2>/dev/null || true
+      systemctl disable nudgebee-scenario-broken 2>/dev/null || true
+      rm -f /etc/systemd/system/nudgebee-scenario-broken.service
+      systemctl daemon-reload
+
+  - id: zombie_processes
+    name: Process table pressure
+    tier: lab
+    signal: cpu-high
+    default_seconds: 300
+    expect_alarm_secs: 240
+    teaches: >
+      Process/fork exhaustion. Load climbs without any single process being an
+      obvious culprit - tests whether the investigation looks at process counts.
+    naive_answer: "One runaway process is responsible."
+    command: |
+      timeout {{seconds}} bash -c 'for i in $(seq 1 400); do (sleep 3600) & done; wait' >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# Findings (waste tier) — deployed by infra/cloudformation/waste.yaml.
+#
+# These are NOT scenarios. There is nothing to start or stop: the finding is
+# the resource existing. They demonstrate cost, rightsizing and security
+# analysis rather than incident investigation, and need no fault injection.
+#
+# The control UI lists them read-only so an operator can see what NudgeBee
+# should be reporting.
+# ---------------------------------------------------------------------------
+
+findings:
+
+  - id: unattached_ebs_volume
+    name: Unattached EBS volume
+    tier: waste
+    tag: unattached-ebs-volume
+    expect: Flagged as unused storage incurring cost with no attachment.
+    teaches: Cost analysis finds orphaned resources without any agent on a host.
+
+  - id: unencrypted_ebs_volume
+    name: Unencrypted EBS volume
+    tier: waste
+    tag: unencrypted-ebs-volume
+    expect: Flagged as not encrypted at rest.
+    teaches: Compliance posture checks against resource configuration.
+
+  - id: over_permissive_security_group
+    name: Security group open to the world
+    tier: waste
+    tag: over-permissive-security-group
+    expect: SSH (22) and RDP (3389) open to 0.0.0.0/0.
+    teaches: >
+      Security findings on configuration. Note the SG is attached to nothing,
+      so this creates a finding without creating an actual exposure.
+
+  - id: oversized_instance
+    name: Oversized instance
+    tier: waste
+    tag: oversized-instance
+    expect: Rightsizing recommendation to downsize after utilisation history builds.
+    teaches: >
+      Rightsizing needs days of CloudWatch history, so this one will not appear
+      immediately after deploy — say so rather than treating it as a failure.
+
+  - id: stopped_instance_with_storage
+    name: Stopped instance still billing for storage
+    tier: waste
+    tag: stopped-instance-with-storage
+    expect: Idle-resource finding — compute stopped, 30GB EBS still charged.
+    teaches: Cost attribution beyond running compute.
+    manual_step: >
+      CloudFormation cannot create an instance in the stopped state. Run the
+      stop command printed in the stack outputs after deploying.
+
+  - id: idle_load_balancer
+    name: Idle load balancer
+    tier: waste
+    tag: idle-load-balancer
+    expect: Load balancer with no healthy targets and no traffic.
+    teaches: Idle managed-service spend. Off by default — costs ~$16/mo.

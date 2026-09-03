@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NudgeBee Scenario Lab</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef; --muted:#98a2b3;
+    --accent:#4f8cff; --ok:#2ecc71; --alarm:#ff5b5b; --warn:#f5a623;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --line:#e3e6 eb; --fg:#1b1f27; --muted:#5b6472; }
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif }
+  header { padding:20px 24px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap }
+  h1 { font-size:17px; margin:0; font-weight:600 }
+  .meta { color:var(--muted); font-size:13px }
+  .spacer { flex:1 }
+  button { font:inherit; border-radius:7px; border:1px solid var(--line);
+           background:var(--panel); color:var(--fg); padding:7px 14px; cursor:pointer }
+  button:hover:not(:disabled) { border-color:var(--accent) }
+  button:disabled { opacity:.45; cursor:not-allowed }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff }
+  button.danger { border-color:var(--alarm); color:var(--alarm) }
+  main { padding:24px; display:grid; gap:24px;
+         grid-template-columns:minmax(0,2fr) minmax(260px,1fr) }
+  @media (max-width:900px){ main { grid-template-columns:1fr } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:16px; margin-bottom:14px }
+  .row { display:flex; align-items:flex-start; gap:14px }
+  .name { font-weight:600 }
+  .tag { font-size:11px; padding:2px 7px; border-radius:20px;
+         border:1px solid var(--line); color:var(--muted) }
+  .teaches { color:var(--muted); font-size:13px; margin-top:6px }
+  .naive { color:var(--warn); font-size:12.5px; margin-top:6px }
+  .countdown { font-variant-numeric:tabular-nums; color:var(--accent); font-weight:600 }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
+       color:var(--muted); margin:0 0 10px }
+  .alarm { display:flex; justify-content:space-between; gap:10px; padding:6px 0;
+           border-bottom:1px solid var(--line); font-size:13px }
+  .alarm:last-child { border-bottom:0 }
+  .state { font-weight:600; font-size:12px }
+  .OK { color:var(--ok) } .ALARM { color:var(--alarm) }
+  .INSUFFICIENT_DATA { color:var(--muted) }
+  .banner { background:#3a2a10; border:1px solid var(--warn); color:#ffd79a;
+            padding:10px 14px; border-radius:8px; margin:0 24px; font-size:13px }
+  select { font:inherit; background:var(--panel); color:var(--fg);
+           border:1px solid var(--line); border-radius:7px; padding:6px 10px }
+  .err { color:var(--alarm); font-size:13px; margin-top:8px }
+</style>
+</head>
+<body>
+<header>
+  <h1>NudgeBee Scenario Lab</h1>
+  <span class="meta" id="meta">connecting…</span>
+  <span class="spacer"></span>
+  <select id="host"></select>
+  <button class="danger" onclick="reset()">Reset everything</button>
+</header>
+
+<div class="banner">
+  These scenarios deliberately degrade the hosts they run on. Never point this at
+  production. Every scenario stops on its own; <strong>Reset everything</strong> stops them now.
+</div>
+
+<main>
+  <section>
+    <h2>Scenarios</h2>
+    <div id="scenarios"></div>
+    <div class="err" id="err"></div>
+  </section>
+  <aside>
+    <h2>Alarms</h2>
+    <div class="card" id="alarms">loading…</div>
+  </aside>
+</main>
+
+<script>
+let data = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let detail = r.statusText;
+    try { detail = (await r.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
+function fmt(secs) {
+  if (secs <= 0) return '0:00';
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+async function load() {
+  try {
+    data = await api('/api/scenarios');
+    document.getElementById('meta').textContent =
+      data.stack + ' · ' + data.region + ' · ' + data.hosts.length + ' host(s) · ceiling ' +
+      data.max_minutes + ' min';
+    const sel = document.getElementById('host');
+    if (!sel.options.length) {
+      data.hosts.forEach(h => {
+        const o = document.createElement('option');
+        o.value = h.instance_id;
+        o.textContent = h.name + ' (' + h.instance_id + ')';
+        sel.appendChild(o);
+      });
+    }
+    render();
+  } catch (e) {
+    document.getElementById('meta').textContent = 'error: ' + e.message;
+  }
+}
+
+function render() {
+  const host = document.getElementById('host').value;
+  document.getElementById('scenarios').innerHTML = data.scenarios.map(s => {
+    let remain = '';
+    if (s.running && s.expires) {
+      const secs = Math.max(0, Math.round((new Date(s.expires) - new Date()) / 1000));
+      remain = '<span class="countdown">' + fmt(secs) + ' left</span>';
+    }
+    return `<div class="card">
+      <div class="row">
+        <div style="flex:1">
+          <div><span class="name">${s.name}</span>
+               <span class="tag">${s.signal || ''}</span>
+               <span class="tag">${s.default_seconds}s</span>
+               ${s.expect_alarm_secs ? '<span class="tag">alarm ~' + s.expect_alarm_secs + 's</span>' : ''}
+          </div>
+          <div class="teaches">${s.teaches || ''}</div>
+          ${s.naive_answer ? '<div class="naive">Naive answer: “' + s.naive_answer + '”</div>' : ''}
+        </div>
+        <div style="text-align:right;min-width:130px">
+          ${remain}<br>
+          ${s.running
+            ? '<button onclick="stop(\'' + s.id + '\')">Stop</button>'
+            : '<button class="primary" onclick="start(\'' + s.id + '\')">Start</button>'}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function start(id) {
+  document.getElementById('err').textContent = '';
+  try {
+    await api('/api/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scenario_id: id, instance_id: document.getElementById('host').value})
+    });
+    load();
+  } catch (e) { document.getElementById('err').textContent = e.message; }
+}
+
+async function stop(id) {
+  try { await api('/api/stop/' + id, {method: 'POST'}); load(); }
+  catch (e) { document.getElementById('err').textContent = e.message; }
+}
+
+async function reset() {
+  try { await api('/api/reset', {method: 'POST'}); load(); }
+  catch (e) { document.getElementById('err').textContent = e.message; }
+}
+
+async function loadAlarms() {
+  try {
+    const a = await api('/api/alarms');
+    document.getElementById('alarms').innerHTML = a.alarms.length
+      ? a.alarms.map(x => `<div class="alarm"><span>${x.name.replace(/^.*?-host-/, 'host-')}</span>
+                            <span class="state ${x.state}">${x.state}</span></div>`).join('')
+      : '<span class="meta">no lab alarms found</span>';
+  } catch (e) {
+    document.getElementById('alarms').textContent = 'error: ' + e.message;
+  }
+}
+
+document.getElementById('host').addEventListener('change', render);
+load(); loadAlarms();
+setInterval(load, 10000);
+setInterval(loadAlarms, 15000);
+setInterval(() => { if (data) render(); }, 1000);
+</script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+For CPUUtilization alarms and event analysis on EC2 instances.
+
+CloudWatch tells you the CPU number. It does not tell you what caused it.
+Do not conclude "high load", recommend resizing, or close the event until
+you have established what was actually running on the host.
+
+Use the ec2-cpu-investigation automation. Prefer it over composing
+CloudWatch or SSM CLI calls by hand — it is tested, read-only, and returns
+a structured verdict.
+
+Inputs: instance_id, window_start, window_end (ISO8601 UTC), region.
+Give it a window around the alarm; it handles the rest.
+
+What it does, in order:
+1. Correlates CloudWatch CPU with SSM Run Command history, looking back
+   30 minutes BEFORE the spike — the command that causes a spike always
+   precedes it.
+2. If that does not explain the spike, it inspects the host itself over
+   SSM and returns live state.
+
+Verdicts:
+- operator_command_likely_cause — a command ran just before the spike.
+  Report the command text, its timestamp relative to the alarm, and the
+  comment. This is usually the answer: a load test, deploy, batch job,
+  install or restart.
+- commands_during_spike_only — commands ran, but only after CPU was
+  already high. They are probably a response, not the cause.
+- spike_without_ssm_activity — nothing was run via SSM. The automation
+  will have inspected the host; read that section.
+- no_spike_detected — CPU never crossed the threshold in that window.
+  Check the window before concluding the alarm was wrong.
+
+Optional inputs:
+- host_action: what to look at on the host when inspection runs.
+  Default triage (load, top CPU/memory processes, disk, boot time).
+  Others: top_cpu, top_memory, shell_history, cron_jobs, recent_logins,
+  running_services, failed_services, network_connections, disk_usage,
+  memory_usage, recent_syslog, process_tree, boot_time, package_changes.
+- inspect_host: auto (default), always, or never.
+
+Choosing host_action when the first pass is inconclusive:
+- process still running and eating CPU -> top_cpu (gives owning user and
+  how long it has been alive)
+- suspect a person -> shell_history, recent_logins
+- timing looks periodic or repeats daily -> cron_jobs
+- suspect a crash or restart loop -> failed_services, recent_syslog
+
+Interpreting results honestly:
+- A process that started well before CPU rose is unlikely to be the cause.
+  Compare start times against the spike window; do not assume.
+- Host inspection is a live snapshot taken after the alarm. A short-lived
+  process may already be gone — say so rather than reporting "nothing
+  found" as if it were proof.
+- SSH sessions, cron jobs and boot-time processes leave NO trace in SSM
+  command history or CloudTrail. An empty SSM result means nothing was run
+  via SSM, not that nothing happened.
+- The instance must be SSM-managed and online. If it is not, the host
+  inspection will fail; report that limitation instead of guessing.
+
+Never kill, restart, or reconfigure anything during an investigation.
+This automation is read-only by design; keep it that way.

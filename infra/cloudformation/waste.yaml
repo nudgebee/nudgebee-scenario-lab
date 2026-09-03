@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NudgeBee Scenario Lab - waste tier. Deploys deliberately wasteful and
+  misconfigured (but harmless) AWS resources so NudgeBee's cost, rightsizing
+  and security findings can be demonstrated without injecting any fault.
+  Unlike the lab tier there is nothing to run - the finding IS the resource.
+
+  SAFETY: every resource here is inert. Nothing accepts traffic, nothing runs
+  workloads, and the open security group is attached to NOTHING. Deploy into a
+  sandbox account and delete the stack when finished.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Placement }
+        Parameters: [VpcId, SubnetId]
+      - Label: { default: Which findings to create }
+        Parameters:
+          - CreateUnattachedVolume
+          - CreateOversizedInstance
+          - CreateStoppedInstance
+          - CreateOpenSecurityGroup
+          - CreateUnencryptedVolume
+          - CreateIdleLoadBalancer
+      - Label: { default: Sizing }
+        Parameters: [OversizedInstanceType, WastedVolumeSizeGb]
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  OversizedInstanceType:
+    Type: String
+    Default: m5.xlarge
+    AllowedValues: [m5.large, m5.xlarge, m5.2xlarge]
+    Description: Deliberately too big for its (nonexistent) workload. m5.xlarge ~ $140/mo.
+  WastedVolumeSizeGb:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+  CreateUnattachedVolume:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: An EBS volume attached to nothing, billing forever.
+  CreateOversizedInstance:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: A large instance sitting near-idle - the classic rightsizing finding. COSTS REAL MONEY.
+  CreateStoppedInstance:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: A stopped instance whose EBS root volume still bills.
+  CreateOpenSecurityGroup:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: SSH open to 0.0.0.0/0. Attached to nothing - it is a finding, not a hole.
+  CreateUnencryptedVolume:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: An unencrypted EBS volume - compliance finding.
+  CreateIdleLoadBalancer:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: An ALB with no healthy targets. ~$16/mo, off by default.
+
+Conditions:
+  WantUnattachedVolume:  !Equals [!Ref CreateUnattachedVolume, 'true']
+  WantOversizedInstance: !Equals [!Ref CreateOversizedInstance, 'true']
+  WantStoppedInstance:   !Equals [!Ref CreateStoppedInstance, 'true']
+  WantOpenSg:            !Equals [!Ref CreateOpenSecurityGroup, 'true']
+  WantUnencryptedVolume: !Equals [!Ref CreateUnencryptedVolume, 'true']
+  WantIdleLb:            !Equals [!Ref CreateIdleLoadBalancer, 'true']
+
+Resources:
+
+  # --- Finding: unattached EBS volume (pure waste) ---------------------------
+  UnattachedVolume:
+    Type: AWS::EC2::Volume
+    Condition: WantUnattachedVolume
+    DeletionPolicy: Delete
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: !Ref WastedVolumeSizeGb
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-unattached-volume' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: nudgebee-finding, Value: unattached-ebs-volume }
+        - { Key: expected-finding, Value: 'Unused EBS volume incurring cost' }
+
+  # --- Finding: unencrypted EBS volume (compliance) -------------------------
+  UnencryptedVolume:
+    Type: AWS::EC2::Volume
+    Condition: WantUnencryptedVolume
+    DeletionPolicy: Delete
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: 1
+      VolumeType: gp3
+      Encrypted: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-unencrypted-volume' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: nudgebee-finding, Value: unencrypted-ebs-volume }
+        - { Key: expected-finding, Value: 'EBS volume is not encrypted at rest' }
+
+  # --- Finding: over-permissive security group ------------------------------
+  # Attached to nothing. Existing is the finding; it opens no actual access.
+  OpenSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: WantOpenSg
+    Properties:
+      GroupDescription: >
+        NudgeBee scenario - deliberately over-permissive, ATTACHED TO NOTHING.
+        Exists so security scanning has something to find.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: Intentionally open for demonstration - not attached to any resource
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+          Description: Intentionally open for demonstration - not attached to any resource
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-open-sg' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: nudgebee-finding, Value: over-permissive-security-group }
+        - { Key: expected-finding, Value: 'SSH/RDP open to 0.0.0.0/0' }
+
+  # --- Finding: oversized instance (rightsizing) ----------------------------
+  OversizedInstanceSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: WantOversizedInstance
+    Properties:
+      GroupDescription: Egress-only SG for the oversized demo instance
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: outbound only }
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  OversizedInstance:
+    Type: AWS::EC2::Instance
+    Condition: WantOversizedInstance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref OversizedInstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref OversizedInstanceSg ]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-oversized' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: nudgebee-finding, Value: oversized-instance }
+        - { Key: expected-finding, Value: 'Instance consistently under-utilised; downsize candidate' }
+
+  # --- Finding: stopped instance still paying for storage -------------------
+  StoppedInstance:
+    Type: AWS::EC2::Instance
+    Condition: WantStoppedInstance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: t3.small
+      SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-stopped' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: nudgebee-finding, Value: stopped-instance-with-storage }
+        - { Key: expected-finding, Value: 'Instance stopped but 30GB EBS still billing' }
+        - { Key: nudgebee-action-required, Value: 'Stop this instance manually after deploy - CloudFormation cannot create it stopped' }
+
+  # --- Finding: idle load balancer -----------------------------------------
+  IdleLbSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: WantIdleLb
+    Properties:
+      GroupDescription: SG for the idle demo load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: outbound only }
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  IdleTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: WantIdleLb
+    Properties:
+      Name: !Sub '${AWS::StackName}-idle-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: nudgebee-finding, Value: idle-load-balancer }
+
+  IdleLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: WantIdleLb
+    Properties:
+      Name: !Sub '${AWS::StackName}-idle-alb'
+      Scheme: internal
+      Type: application
+      Subnets: [ !Ref SubnetId ]
+      SecurityGroups: [ !Ref IdleLbSg ]
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: nudgebee-finding, Value: idle-load-balancer }
+        - { Key: expected-finding, Value: 'Load balancer with no healthy targets and no traffic' }
+
+Outputs:
+  FindingsDeployed:
+    Description: Findings NudgeBee should surface from this stack
+    Value: !Join
+      - ', '
+      - - !If [WantUnattachedVolume,  'unattached-ebs-volume',          !Ref 'AWS::NoValue']
+        - !If [WantUnencryptedVolume, 'unencrypted-ebs-volume',         !Ref 'AWS::NoValue']
+        - !If [WantOpenSg,            'over-permissive-security-group', !Ref 'AWS::NoValue']
+        - !If [WantOversizedInstance, 'oversized-instance',             !Ref 'AWS::NoValue']
+        - !If [WantStoppedInstance,   'stopped-instance-with-storage',  !Ref 'AWS::NoValue']
+        - !If [WantIdleLb,            'idle-load-balancer',             !Ref 'AWS::NoValue']
+  ManualStepRequired:
+    Condition: WantStoppedInstance
+    Description: CloudFormation cannot create an instance in the stopped state
+    Value: !Sub 'aws ec2 stop-instances --instance-ids ${StoppedInstance}'
+  EstimatedMonthlyCost:
+    Description: Rough on-demand cost if left running (us-east-1)
+    Value: !Sub 'oversized ${OversizedInstanceType} dominates - see docs/07-cost.md. Delete the stack when finished.'
+  TearDown:
+    Value: !Sub 'aws cloudformation delete-stack --stack-name ${AWS::StackName}'

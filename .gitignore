@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+*.tar.gz
+.DS_Store

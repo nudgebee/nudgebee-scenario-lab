@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NudgeBee Scenario Lab - lab tier. Deploys SSM-managed EC2 hosts plus
+  CloudWatch alarms so infrastructure incidents can be injected on demand and
+  observed in NudgeBee. NOT for production: scenarios deliberately degrade
+  these hosts.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Placement }
+        Parameters: [VpcId, SubnetId, InstanceType, HostCount]
+      - Label: { default: Alarm thresholds }
+        Parameters: [CpuThreshold, MemoryThreshold, DiskThreshold]
+      - Label: { default: Safety }
+        Parameters: [MaxScenarioMinutes]
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into. Must have outbound internet (or SSM VPC endpoints).
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet with a route to the internet or SSM endpoints.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: Small is fine - scenarios saturate whatever they are given.
+  HostCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 4
+    Description: Number of scenario hosts.
+  CpuThreshold:
+    Type: Number
+    Default: 70
+    Description: CPUUtilization percent that trips the CPU alarm.
+  MemoryThreshold:
+    Type: Number
+    Default: 80
+    Description: Memory percent that trips the memory alarm (needs CW agent).
+  DiskThreshold:
+    Type: Number
+    Default: 80
+    Description: Disk used percent that trips the disk alarm (needs CW agent).
+  MaxScenarioMinutes:
+    Type: Number
+    Default: 30
+    Description: Safety net - the sweeper clears any scenario older than this.
+
+Conditions:
+  TwoOrMore:   !Or [ !Equals [!Ref HostCount, 2], !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
+  ThreeOrMore: !Or [ !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
+  FourHosts:   !Equals [!Ref HostCount, 4]
+
+Mappings:
+  # Amazon Linux 2023 via SSM public parameter is resolved at deploy time
+  # using the AWS::SSM::Parameter::Value type below, so no AMI map needed.
+  Placeholder:
+    Unused:
+      Key: value
+
+Resources:
+
+  # ---------------------------------------------------------------- IAM
+
+  ScenarioHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  ScenarioHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref ScenarioHostRole ]
+
+  # ---------------------------------------------------------------- Network
+
+  ScenarioHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NudgeBee scenario lab hosts - no inbound required (SSM only)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound for SSM, CloudWatch and network scenarios
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-hosts' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # ---------------------------------------------------------------- Hosts
+
+  ScenarioHost1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          dnf install -y stress-ng amazon-cloudwatch-agent || yum install -y stress-ng amazon-cloudwatch-agent || true
+          mkdir -p /opt/nudgebee-scenario
+          cat >/opt/aws/amazon-cloudwatch-agent/etc/cw-agent.json <<'CWCFG'
+          {
+            "metrics": {
+              "append_dimensions": { "InstanceId": "${!aws:InstanceId}" },
+              "metrics_collected": {
+                "mem":  { "measurement": [ { "name": "mem_used_percent", "rename": "MemoryUtilization", "unit": "Percent" } ], "metrics_collection_interval": 60 },
+                "disk": { "measurement": [ { "name": "used_percent", "rename": "DiskUtilization", "unit": "Percent" } ], "resources": [ "/" ], "metrics_collection_interval": 60 }
+              }
+            }
+          }
+          CWCFG
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/cw-agent.json || true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-1' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: scenario-role, Value: primary }
+
+  ScenarioHost2:
+    Type: AWS::EC2::Instance
+    Condition: TwoOrMore
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf install -y stress-ng amazon-cloudwatch-agent || yum install -y stress-ng amazon-cloudwatch-agent || true
+          mkdir -p /opt/nudgebee-scenario
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-2' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: scenario-role, Value: secondary }
+
+  ScenarioHost3:
+    Type: AWS::EC2::Instance
+    Condition: ThreeOrMore
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-3' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  ScenarioHost4:
+    Type: AWS::EC2::Instance
+    Condition: FourHosts
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-4' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # ---------------------------------------------------------------- Alarms
+  # One set per host. Named <stack>-host-N-<signal> so NudgeBee events carry a
+  # readable aggregation key.
+
+  Host1CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-cpu-high'
+      AlarmDescription: CPU utilization high on scenario host 1
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref CpuThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-mem-high'
+      AlarmDescription: Memory utilization high on scenario host 1 (requires CloudWatch agent)
+      Namespace: CWAgent
+      MetricName: MemoryUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref MemoryThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1DiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-disk-high'
+      AlarmDescription: Disk utilization high on scenario host 1 (requires CloudWatch agent)
+      Namespace: CWAgent
+      MetricName: DiskUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref DiskThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-status-check'
+      AlarmDescription: Status check failed on scenario host 1
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1NetworkAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-net-out-high'
+      AlarmDescription: Outbound network unusually high on scenario host 1
+      Namespace: AWS/EC2
+      MetricName: NetworkOut
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 50000000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host2CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: TwoOrMore
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-2-cpu-high'
+      AlarmDescription: CPU utilization high on scenario host 2
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost2 } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref CpuThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ---------------------------------------------------------------- State
+
+  ScenarioStateParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/nudgebee-scenario-lab/${AWS::StackName}/active'
+      Type: String
+      Value: '{}'
+      Description: >
+        JSON map of running scenarios written by the control app:
+        {"<scenario_id>": {"host": "...", "started": "...", "expires": "..."}}
+      Tags:
+        nudgebee-scenario-lab: 'true'
+
+  ScenarioMaxMinutesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/nudgebee-scenario-lab/${AWS::StackName}/max_minutes'
+      Type: String
+      Value: !Ref MaxScenarioMinutes
+      Description: Safety ceiling - the control app refuses longer durations.
+
+Outputs:
+  StackNameOut:
+    Description: Pass this to the control app as SCENARIO_LAB_STACK
+    Value: !Ref AWS::StackName
+  Host1Id:
+    Description: Primary scenario host
+    Value: !Ref ScenarioHost1
+  Host2Id:
+    Condition: TwoOrMore
+    Value: !Ref ScenarioHost2
+  AlarmPrefix:
+    Description: All lab alarms share this prefix
+    Value: !Sub '${AWS::StackName}-host-'
+  StateParameter:
+    Value: !Ref ScenarioStateParameter
+  NextSteps:
+    Value: !Sub 'Run: SCENARIO_LAB_STACK=${AWS::StackName} docker compose up  (then open http://127.0.0.1:880)'

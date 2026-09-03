@@ -1,0 +1,19 @@
+# Runs the control app locally against YOUR AWS credentials.
+# Bound to 127.0.0.1 deliberately: this is an operator tool, not a service.
+services:
+  control:
+    build:
+      context: ..
+      dockerfile: control/Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SCENARIO_LAB_STACK: "${SCENARIO_LAB_STACK:-nudgebee-scenario-lab}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_PROFILE: "${AWS_PROFILE:-}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+    volumes:
+      # Mounted read-only so `aws sso login` / profiles work without copying creds
+      - ~/.aws:/root/.aws:ro

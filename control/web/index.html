@@ -452,12 +452,12 @@ function renderSetup(){
     <div class="sh"><b>Set up the lab</b><span>${why}</span></div>
     <div class="sb">
       <div class="step"><div class="num">1</div><div class="sc">
-        <div class="st2">Deploy the scenario hosts and alarms${S.suggested_vpc?' — VPC and subnet below are from this account':''}. Takes about 4 minutes.</div>
+        <div class="st2">Deploy the scenario hosts and alarms. No parameters — the stack creates its own isolated VPC. Takes about 4 minutes.</div>
         <pre id="cmd1">${esc(S.deploy_command)}</pre>
         <button class="copy" id="cmd1-btn" onclick="copy('cmd1')">Copy</button>
       </div></div>
       <div class="step"><div class="num">2</div><div class="sc">
-        <div class="st2">Optional — deploy the waste tier for cost, rightsizing and security findings. No fault injection needed.</div>
+        <div class="st2">Optional — deploy the waste tier for cost, rightsizing and security findings. Nothing to trigger; the finding is the resource.</div>
         <pre id="cmd2">${esc(S.waste_command)}</pre>
         <button class="copy" id="cmd2-btn" onclick="copy('cmd2')">Copy</button>
       </div></div>

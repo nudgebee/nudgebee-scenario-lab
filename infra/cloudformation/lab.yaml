@@ -17,11 +17,21 @@ Metadata:
 
 Parameters:
   VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC to deploy into. Must have outbound internet (or SSM VPC endpoints).
+    Type: String
+    Default: ''
+    Description: >
+      OPTIONAL. Leave blank and the stack creates its own isolated VPC - no
+      lookup needed, and no risk of landing in a network you care about.
+      Supply one only if you specifically want the lab inside an existing VPC
+      (it must have outbound internet or SSM VPC endpoints).
   SubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Description: Subnet with a route to the internet or SSM endpoints.
+    Type: String
+    Default: ''
+    Description: OPTIONAL. Required only if VpcId is supplied.
+  LabCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    Description: CIDR for the VPC the stack creates when VpcId is left blank.
   InstanceType:
     Type: String
     Default: t3.micro
@@ -51,6 +61,8 @@ Parameters:
     Description: Safety net - the sweeper clears any scenario older than this.
 
 Conditions:
+  CreateNetwork: !Equals [!Ref VpcId, '']
+  UseExistingNetwork: !Not [!Equals [!Ref VpcId, '']]
   TwoOrMore:   !Or [ !Equals [!Ref HostCount, 2], !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
   ThreeOrMore: !Or [ !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
   FourHosts:   !Equals [!Ref HostCount, 4]
@@ -63,6 +75,73 @@ Mappings:
       Key: value
 
 Resources:
+
+  # ---------------------------------------------------------------- Network
+  # Created only when VpcId is left blank. A public subnet with an internet
+  # gateway is enough: SSM needs outbound HTTPS, and nothing inbound is opened.
+
+  LabVpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNetwork
+    Properties:
+      CidrBlock: !Ref LabCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabIgw:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-igw' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref LabVpc
+      InternetGatewayId: !Ref LabIgw
+
+  LabSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref LabVpc
+      CidrBlock: !Select [0, !Cidr [!Ref LabCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-subnet' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref LabVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-rt' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    DependsOn: LabIgwAttach
+    Properties:
+      RouteTableId: !Ref LabRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref LabIgw
+
+  LabSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref LabSubnet
+      RouteTableId: !Ref LabRouteTable
 
   # ---------------------------------------------------------------- IAM
 
@@ -92,7 +171,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: NudgeBee scenario lab hosts - no inbound required (SSM only)
-      VpcId: !Ref VpcId
+      VpcId: !If [CreateNetwork, !Ref LabVpc, !Ref VpcId]
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -108,7 +187,7 @@ Resources:
     Properties:
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
-      SubnetId: !Ref SubnetId
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
       UserData:
@@ -141,7 +220,7 @@ Resources:
     Properties:
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
-      SubnetId: !Ref SubnetId
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
       UserData:
@@ -160,7 +239,7 @@ Resources:
     Properties:
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
-      SubnetId: !Ref SubnetId
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
       Tags:
@@ -173,7 +252,7 @@ Resources:
     Properties:
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
-      SubnetId: !Ref SubnetId
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
       Tags:
@@ -312,5 +391,10 @@ Outputs:
     Value: !Sub '${AWS::StackName}-host-'
   StateParameter:
     Value: !Ref ScenarioStateParameter
+  NetworkMode:
+    Description: Whether the stack created its own VPC or used one you supplied
+    Value: !If [CreateNetwork, 'created an isolated VPC for the lab', 'used the VPC you supplied']
+  VpcUsed:
+    Value: !If [CreateNetwork, !Ref LabVpc, !Ref VpcId]
   NextSteps:
-    Value: !Sub 'Run: SCENARIO_LAB_STACK=${AWS::StackName} docker compose up  (then open http://127.0.0.1:880)'
+    Value: !Sub 'Run: SCENARIO_LAB_STACK=${AWS::StackName} ./scripts/run-local.sh  (then open http://127.0.0.1:8080)'

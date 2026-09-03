@@ -565,20 +565,14 @@ def setup():
     except ClientError:
         pass
 
-    cmd = (
+    cmd = "./scripts/deploy.sh"
+    waste = "./scripts/deploy.sh waste"
+    manual = (
         "aws cloudformation deploy \\\n"
         "  --template-file infra/cloudformation/lab.yaml \\\n"
         f"  --stack-name {STACK} \\\n"
         "  --capabilities CAPABILITY_IAM \\\n"
-        f"  --region {REGION} \\\n"
-        f"  --parameter-overrides VpcId={vpc or '<vpc-id>'} SubnetId={subnet or '<subnet-id>'}"
-    )
-    waste = (
-        "aws cloudformation deploy \\\n"
-        "  --template-file infra/cloudformation/waste.yaml \\\n"
-        f"  --stack-name {STACK}-waste \\\n"
-        f"  --region {REGION} \\\n"
-        f"  --parameter-overrides VpcId={vpc or '<vpc-id>'} SubnetId={subnet or '<subnet-id>'}"
+        f"  --region {REGION}"
     )
     return {
         "needs_deploy": not si["deployed"] or not hosts,
@@ -589,6 +583,7 @@ def setup():
         "suggested_subnet": subnet,
         "deploy_command": cmd,
         "waste_command": waste,
+        "manual_command": manual,
     }
 
 

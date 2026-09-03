@@ -10,21 +10,21 @@ incidents on demand, and watch NudgeBee detect, triage and explain them.
 ## Quickstart
 
 ```bash
-# 1. Check your account is ready (read-only, changes nothing)
-./scripts/preflight.sh
-
-# 2. Deploy the lab (~4 minutes)
-aws cloudformation deploy \
-  --template-file infra/cloudformation/lab.yaml \
-  --stack-name nudgebee-scenario-lab \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides VpcId=vpc-xxxx SubnetId=subnet-xxxx
-
-# 3. Start the control UI
-cd control && SCENARIO_LAB_STACK=nudgebee-scenario-lab docker compose up
-
-# 4. Open http://127.0.0.1:8080 and start a scenario
+./scripts/preflight.sh     # is this account ready? (read-only)
+./scripts/deploy.sh        # deploy the lab   (~4 min, no parameters)
+./scripts/run-local.sh     # start the UI  -> http://127.0.0.1:8080
 ```
+
+**No VPC or subnet to look up.** The stack creates its own isolated VPC by
+default, which also means the lab cannot land in a network you care about. To
+use an existing one instead:
+
+```bash
+VPC_ID=vpc-123 SUBNET_ID=subnet-456 ./scripts/deploy.sh
+```
+
+Docker is optional — `run-local.sh` uses a Python virtualenv. If you prefer
+containers: `cd control && docker compose up`.
 
 ## Two things to deploy
 
@@ -85,10 +85,7 @@ Nothing is hosted by NudgeBee; nothing inbound is opened to your VPC.
 ## Waste tier
 
 ```bash
-aws cloudformation deploy \
-  --template-file infra/cloudformation/waste.yaml \
-  --stack-name nudgebee-scenario-waste \
-  --parameter-overrides VpcId=vpc-xxxx SubnetId=subnet-xxxx
+./scripts/deploy.sh waste     # or: ./scripts/deploy.sh both
 ```
 
 | Finding | Resource created | Cost impact |

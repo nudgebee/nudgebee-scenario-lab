@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# One-command deploy. No arguments, nothing to look up.
+#
+#   ./scripts/deploy.sh            # lab tier (hosts + alarms)
+#   ./scripts/deploy.sh waste      # waste tier (cost/security findings)
+#   ./scripts/deploy.sh both
+#
+# By default the stack creates its own isolated VPC, so you do not need to know
+# or choose a network - and the lab cannot land in one you care about.
+# To use an existing VPC instead:
+#
+#   VPC_ID=vpc-123 SUBNET_ID=subnet-456 ./scripts/deploy.sh
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REGION="${AWS_REGION:-us-east-1}"
+STACK="${SCENARIO_LAB_STACK:-nudgebee-scenario-lab}"
+WHAT="${1:-lab}"
+
+c_ok(){ printf '\033[32m%s\033[0m\n' "$1"; }
+c_hd(){ printf '\n\033[1m%s\033[0m\n' "$1"; }
+c_dim(){ printf '\033[90m%s\033[0m\n' "$1"; }
+
+command -v aws >/dev/null 2>&1 || { echo "aws CLI not found - install AWS CLI v2"; exit 1; }
+IDENT=$(aws sts get-caller-identity --output json 2>/dev/null) || {
+  echo "Not authenticated. Run 'aws configure' or 'aws sso login' first."; exit 1; }
+ACCOUNT=$(echo "$IDENT" | python3 -c 'import sys,json;print(json.load(sys.stdin)["Account"])')
+ALIAS=$(aws iam list-account-aliases --query 'AccountAliases[0]' --output text 2>/dev/null)
+[ "$ALIAS" = "None" ] && ALIAS=""
+
+c_hd "Target"
+echo "  account : ${ALIAS:+$ALIAS · }$ACCOUNT"
+echo "  region  : $REGION"
+echo "  stack   : $STACK"
+if [ -n "${VPC_ID:-}" ]; then
+  echo "  network : existing VPC ${VPC_ID} / ${SUBNET_ID:-<subnet required>}"
+  [ -z "${SUBNET_ID:-}" ] && { echo "SUBNET_ID is required when VPC_ID is set"; exit 1; }
+else
+  echo "  network : a new isolated VPC created by the stack"
+fi
+
+printf '\nThese hosts are deliberately degraded by scenarios. Continue? [y/N] '
+read -r reply
+case "$reply" in [yY]*) ;; *) echo "aborted"; exit 0 ;; esac
+
+overrides=()
+[ -n "${VPC_ID:-}" ] && overrides+=("VpcId=${VPC_ID}" "SubnetId=${SUBNET_ID}")
+
+deploy_lab() {
+  c_hd "Deploying lab tier (about 4 minutes)"
+  aws cloudformation deploy \
+    --template-file "$ROOT/infra/cloudformation/lab.yaml" \
+    --stack-name "$STACK" \
+    --capabilities CAPABILITY_IAM \
+    --region "$REGION" \
+    ${overrides:+--parameter-overrides "${overrides[@]}"}
+  c_ok "lab tier deployed"
+  aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`NetworkMode`||OutputKey==`VpcUsed`].[OutputKey,OutputValue]' \
+    --output text 2>/dev/null | sed 's/^/  /'
+}
+
+deploy_waste() {
+  c_hd "Deploying waste tier"
+  local woverrides=()
+  if [ -n "${VPC_ID:-}" ]; then
+    woverrides+=("VpcId=${VPC_ID}" "SubnetId=${SUBNET_ID}")
+  else
+    # waste.yaml needs a network; reuse whatever the lab stack ended up with
+    local vpc sub
+    vpc=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
+          --query 'Stacks[0].Outputs[?OutputKey==`VpcUsed`].OutputValue' --output text 2>/dev/null)
+    sub=$(aws ec2 describe-subnets --region "$REGION" \
+          --filters "Name=vpc-id,Values=$vpc" --query 'Subnets[0].SubnetId' --output text 2>/dev/null)
+    [ -z "$vpc" ] || [ "$vpc" = "None" ] && { echo "Deploy the lab tier first, or set VPC_ID/SUBNET_ID"; return 1; }
+    woverrides+=("VpcId=${vpc}" "SubnetId=${sub}")
+  fi
+  aws cloudformation deploy \
+    --template-file "$ROOT/infra/cloudformation/waste.yaml" \
+    --stack-name "${STACK}-waste" \
+    --region "$REGION" \
+    --parameter-overrides "${woverrides[@]}"
+  c_ok "waste tier deployed"
+  c_dim "  One manual step - CloudFormation cannot create a stopped instance:"
+  aws cloudformation describe-stacks --stack-name "${STACK}-waste" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`ManualStepRequired`].OutputValue' --output text 2>/dev/null | sed 's/^/  /'
+}
+
+case "$WHAT" in
+  lab)   deploy_lab ;;
+  waste) deploy_waste ;;
+  both)  deploy_lab; deploy_waste ;;
+  *) echo "usage: $0 [lab|waste|both]"; exit 1 ;;
+esac
+
+c_hd "Next"
+echo "  ./scripts/run-local.sh      then open http://127.0.0.1:8080"
+c_dim "  Hosts take a minute or two to register with SSM; the UI enables Start on its own."
+c_hd "Teardown"
+c_dim "  aws cloudformation delete-stack --stack-name $STACK --region $REGION"

@@ -534,6 +534,64 @@ def reset():
     return {"stopped": stopped, "cleanup_dispatched": True}
 
 
+@app.get("/api/setup")
+def setup():
+    """
+    When the lab is not deployed the UI should say how to deploy it, with the
+    account's own VPC and subnet filled in - not a placeholder the operator has
+    to go and look up.
+    """
+    si = stack_info()
+    hosts = lab_hosts()
+    vpc = subnet = None
+    try:
+        vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"]
+        if not vpcs:
+            vpcs = ec2.describe_vpcs()["Vpcs"]
+        if vpcs:
+            vpc = vpcs[0]["VpcId"]
+            subs = ec2.describe_subnets(
+                Filters=[
+                    {"Name": "vpc-id", "Values": [vpc]},
+                    {"Name": "map-public-ip-on-launch", "Values": ["true"]},
+                ]
+            )["Subnets"]
+            if not subs:
+                subs = ec2.describe_subnets(
+                    Filters=[{"Name": "vpc-id", "Values": [vpc]}]
+                )["Subnets"]
+            if subs:
+                subnet = subs[0]["SubnetId"]
+    except ClientError:
+        pass
+
+    cmd = (
+        "aws cloudformation deploy \\\n"
+        "  --template-file infra/cloudformation/lab.yaml \\\n"
+        f"  --stack-name {STACK} \\\n"
+        "  --capabilities CAPABILITY_IAM \\\n"
+        f"  --region {REGION} \\\n"
+        f"  --parameter-overrides VpcId={vpc or '<vpc-id>'} SubnetId={subnet or '<subnet-id>'}"
+    )
+    waste = (
+        "aws cloudformation deploy \\\n"
+        "  --template-file infra/cloudformation/waste.yaml \\\n"
+        f"  --stack-name {STACK}-waste \\\n"
+        f"  --region {REGION} \\\n"
+        f"  --parameter-overrides VpcId={vpc or '<vpc-id>'} SubnetId={subnet or '<subnet-id>'}"
+    )
+    return {
+        "needs_deploy": not si["deployed"] or not hosts,
+        "stack_deployed": si["deployed"],
+        "stack_status": si["status"],
+        "host_count": len(hosts),
+        "suggested_vpc": vpc,
+        "suggested_subnet": subnet,
+        "deploy_command": cmd,
+        "waste_command": waste,
+    }
+
+
 @app.get("/api/health")
 def health():
     hosts = lab_hosts()

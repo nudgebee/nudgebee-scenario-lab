@@ -80,12 +80,19 @@ button{
   transition:border-color .12s, background .12s, color .12s;
 }
 button:hover:not(:disabled){border-color:var(--amber); color:var(--amber)}
-button:disabled{opacity:.35; cursor:not-allowed}
+
 button.go{background:var(--amber); border-color:var(--amber); color:#12161e}
 :root[data-theme="light"] button.go{color:#fff}
 button.go:hover:not(:disabled){filter:brightness(1.08); color:#12161e}
 button.stop{border-color:var(--red); color:var(--red)}
 button.ghost{background:transparent}
+button:disabled,button.go:disabled{
+  opacity:1; cursor:not-allowed; background:transparent;
+  border:1px dashed var(--line-2); color:var(--fg-3); font-weight:500;
+}
+button:disabled:hover,button.go:disabled:hover{
+  border-color:var(--line-2); color:var(--fg-3); filter:none;
+}
 
 /* ---------------------------------------------------------------- banner */
 .warn{
@@ -124,7 +131,7 @@ h2 .n{color:var(--fg-2); font-family:var(--mono); letter-spacing:0}
 }
 .card:hover{border-color:var(--line-2)}
 .card.live{border-color:var(--amber); box-shadow:0 0 0 1px color-mix(in srgb,var(--amber) 22%,transparent)}
-.card.blocked{opacity:.62}
+.card.blocked{background:var(--panel-2)}
 
 .chead{display:flex; align-items:flex-start; gap:13px; padding:13px 15px}
 .led{
@@ -172,6 +179,37 @@ h2 .n{color:var(--fg-2); font-family:var(--mono); letter-spacing:0}
 }
 .block div,.hint div{display:flex; gap:7px; align-items:flex-start}
 .block div+div,.hint div+div{margin-top:4px}
+
+/* ---------------------------------------------------------------- setup */
+.setup{
+  border:1px solid var(--amber-dim); border-radius:4px; overflow:hidden;
+  margin-bottom:20px; background:color-mix(in srgb,var(--amber) 6%,var(--panel));
+}
+.setup .sh{
+  padding:13px 16px; display:flex; gap:11px; align-items:baseline;
+  border-bottom:1px solid var(--amber-dim);
+}
+.setup .sh b{font-size:14px; color:var(--amber)}
+.setup .sh span{font-size:12.5px; color:var(--fg-2)}
+.setup .sb{padding:14px 16px}
+.step{display:flex; gap:11px; margin-bottom:13px}
+.step:last-child{margin-bottom:0}
+.step .num{
+  width:19px; height:19px; border-radius:50%; flex:none; margin-top:1px;
+  border:1px solid var(--amber); color:var(--amber);
+  font:600 10.5px/17px var(--mono); text-align:center;
+}
+.step .sc{flex:1; min-width:0}
+.step .st2{font-size:12.5px; color:var(--fg); margin-bottom:6px}
+pre{
+  font-family:var(--mono); font-size:11.5px; line-height:1.65;
+  background:var(--bg); border:1px solid var(--line); border-radius:3px;
+  padding:10px 12px; overflow-x:auto; color:var(--fg-2); white-space:pre;
+}
+.copy{
+  font:600 10px/1 var(--sans); letter-spacing:.06em; text-transform:uppercase;
+  padding:5px 9px; margin-top:6px;
+}
 
 /* ---------------------------------------------------------------- right */
 .mini{
@@ -226,6 +264,8 @@ select:disabled,select:has(option:only-child:disabled){color:var(--fg-3)}
 
 <main>
   <div class="col-l">
+    <div id="setup"></div>
+
     <h2>Scenarios <span class="n" id="scount"></span></h2>
     <div id="err" class="err"></div>
     <div id="list"></div>
@@ -243,7 +283,7 @@ select:disabled,select:has(option:only-child:disabled){color:var(--fg-3)}
 </main>
 
 <script>
-let D=null, F=null;
+let D=null, F=null, S=null;
 
 const api=async(p,o)=>{const r=await fetch(p,o);
   if(!r.ok){let d=r.statusText;try{d=(await r.json()).detail||d}catch(e){}throw new Error(d)}
@@ -336,7 +376,7 @@ function renderScenarios(){
           <div style="margin-top:8px">
             ${s.running
               ? `<button class="stop" onclick="stop('${s.id}')">Stop</button>`
-              : `<button class="go" ${s.ready?'':'disabled'} onclick="start('${s.id}')">Start</button>`}
+              : `<button class="go" ${s.ready?'':'disabled'} onclick="start('${s.id}')" title="${s.ready?'':esc(s.blockers[0]||'')}">${s.ready?'Start':'Unavailable'}</button>`}
           </div>
         </div>
       </div>
@@ -394,6 +434,41 @@ async function load(){
 async function loadAlarms(){ try{ renderAlarms((await api('/api/alarms')).alarms) }catch(e){} }
 async function loadFindings(){ try{ F=await api('/api/findings'); renderFindings() }catch(e){} }
 
+function copy(id){
+  const el=document.getElementById(id);
+  navigator.clipboard.writeText(el.textContent).then(()=>{
+    const b=document.getElementById(id+'-btn'); const t=b.textContent;
+    b.textContent='copied'; setTimeout(()=>b.textContent=t,1400);
+  }).catch(()=>{});
+}
+
+function renderSetup(){
+  const box=document.getElementById('setup');
+  if(!S || !S.needs_deploy){ box.innerHTML=''; return; }
+  const why = !S.stack_deployed
+    ? 'The lab stack is not deployed in this account yet, so there is nothing to run scenarios on.'
+    : `The stack is ${esc(S.stack_status)} but no running scenario hosts were found.`;
+  box.innerHTML=`<div class="setup">
+    <div class="sh"><b>Set up the lab</b><span>${why}</span></div>
+    <div class="sb">
+      <div class="step"><div class="num">1</div><div class="sc">
+        <div class="st2">Deploy the scenario hosts and alarms${S.suggested_vpc?' — VPC and subnet below are from this account':''}. Takes about 4 minutes.</div>
+        <pre id="cmd1">${esc(S.deploy_command)}</pre>
+        <button class="copy" id="cmd1-btn" onclick="copy('cmd1')">Copy</button>
+      </div></div>
+      <div class="step"><div class="num">2</div><div class="sc">
+        <div class="st2">Optional — deploy the waste tier for cost, rightsizing and security findings. No fault injection needed.</div>
+        <pre id="cmd2">${esc(S.waste_command)}</pre>
+        <button class="copy" id="cmd2-btn" onclick="copy('cmd2')">Copy</button>
+      </div></div>
+      <div class="step"><div class="num">3</div><div class="sc">
+        <div class="st2">This page refreshes every 10s. Once the hosts register with SSM the Start buttons enable themselves.</div>
+      </div></div>
+    </div>
+  </div>`;
+}
+async function loadSetup(){ try{ S=await api('/api/setup'); renderSetup() }catch(e){} }
+
 async function start(id){
   document.getElementById('err').textContent='';
   try{
@@ -408,8 +483,9 @@ async function reset(){ try{ await api('/api/reset',{method:'POST'}); load() }
   catch(e){ document.getElementById('err').textContent=e.message } }
 
 document.getElementById('host').addEventListener('change',load);
-load(); loadAlarms(); loadFindings();
-setInterval(load,10000); setInterval(loadAlarms,15000); setInterval(loadFindings,60000);
+load(); loadAlarms(); loadFindings(); loadSetup();
+setInterval(load,10000); setInterval(loadAlarms,15000);
+setInterval(loadFindings,60000); setInterval(loadSetup,20000);
 setInterval(()=>{ if(D) renderScenarios() },1000);
 </script>
 </body>

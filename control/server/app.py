@@ -177,12 +177,28 @@ def read_state() -> dict:
 
 
 def write_state(state: dict) -> None:
+    """
+    Update the state parameter, but NEVER create it.
+
+    The parameter is declared by lab.yaml. If this app creates it first -
+    which it will, if anyone opens the UI before deploying - CloudFormation's
+    AWS::EarlyValidation::ResourceExistenceCheck refuses the whole stack with
+    "Validation failed with 1 error(s)" and rolls back, having created nothing.
+    That failure names no resource, so it is genuinely hard to diagnose.
+
+    Before the stack exists there are no hosts and therefore no scenarios to
+    track, so skipping the write costs nothing.
+    """
+    try:
+        ssm.get_parameter(Name=STATE_PARAM)
+    except ClientError:
+        return  # not deployed yet - do not create it
     try:
         ssm.put_parameter(
             Name=STATE_PARAM, Value=json.dumps(state), Type="String", Overwrite=True
         )
     except ClientError:
-        pass  # stack may not be deployed yet; state is best-effort
+        pass
 
 
 # ----------------------------------------------------------------- hosts

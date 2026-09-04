@@ -233,7 +233,10 @@ def lab_hosts() -> list[dict]:
                 {
                     "instance_id": iid,
                     "name": tags.get("Name", iid),
-                    "role": tags.get("scenario-role", ""),
+                    # services-tier hosts carry nb-service (order, payment,
+                    # inventory, database); the original lab hosts carry neither
+                    "role": tags.get("scenario-role", "") or tags.get("nb-service", ""),
+                    "service": tags.get("nb-service", ""),
                     "type": inst.get("InstanceType"),
                     "az": inst.get("Placement", {}).get("AvailabilityZone"),
                     "private_ip": inst.get("PrivateIpAddress"),
@@ -482,7 +485,21 @@ def start(req: StartRequest):
     hosts = lab_hosts()
     if not hosts:
         raise HTTPException(412, "no scenario hosts found - is the lab stack deployed?")
-    instance_id = req.instance_id or hosts[0]["instance_id"]
+    # Cascade scenarios only make sense on one specific host - stopping "order"
+    # has to happen on the order host, whatever is selected in the UI. Those
+    # scenarios declare target_service and we resolve the host ourselves.
+    target = scenario.get("target_service")
+    if target:
+        match = next((h for h in hosts if h.get("service") == target), None)
+        if not match:
+            raise HTTPException(
+                412,
+                f"{req.scenario_id} needs the '{target}' host - deploy the services tier "
+                f"(infra/cloudformation/services.json)",
+            )
+        instance_id = match["instance_id"]
+    else:
+        instance_id = req.instance_id or hosts[0]["instance_id"]
     host = next((h for h in hosts if h["instance_id"] == instance_id), None)
     if not host:
         raise HTTPException(400, f"{instance_id} is not a scenario-lab host")

@@ -239,6 +239,59 @@ scenarios:
     cleanup: |
       pkill -f 'nb-scenario:zombie_processes' 2>/dev/null || true
 
+  - id: service_failure_cascade
+    name: Service failure with downstream impact
+    tier: services
+    target_service: order
+    signal: order-down
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: NudgebeeScenarioLab ServiceHealthy
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      Correlating several simultaneous alerts back to one cause. Stopping order
+      on host A also fails payment on host B and inventory on host C, because
+      both call order. Three alarms, one cause. NudgeBee should name order as
+      the parent and the other two as downstream, not report three equal
+      incidents.
+    naive_answer: "Three separate services failed - a network or platform-wide problem."
+    command: |
+      # Stops the service and puts it back. Payment and inventory keep running
+      # throughout; they fail only because their health check calls order, so
+      # the downstream failure is a real consequence rather than a second
+      # injected fault.
+      systemctl stop order
+      sleep {{seconds}}
+      systemctl start order
+    cleanup: |
+      systemctl start order 2>/dev/null || true
+
+  - id: database_outage
+    name: Database down, application impact
+    tier: services
+    target_service: database
+    signal: database-down
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: NudgebeeScenarioLab ServiceHealthy
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      An application failure whose cause is underneath the application. Stopping
+      PostgreSQL fails order, payment and inventory at once, plus the database
+      alarm itself. The investigation should reach the database rather than
+      stopping at "the application is unreachable", and should rule out network
+      and firewall causes rather than asserting them.
+    naive_answer: "The application is down - restart the application servers."
+    command: |
+      systemctl stop postgresql
+      sleep {{seconds}}
+      systemctl start postgresql
+    cleanup: |
+      systemctl start postgresql 2>/dev/null || true
 
 findings:
 

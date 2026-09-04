@@ -1,0 +1,93 @@
+For CloudWatch alarms and event analysis on AWS resources.
+
+CloudWatch tells you the number. It does not tell you what caused it.
+Do not conclude "high load", recommend resizing, or close the event until
+you have looked at what was happening on that resource around the alarm.
+
+Two automations fetch that evidence. Both are read-only data tools: they
+return CloudWatch datapoints alongside the activity recorded against the
+resource, in time order, and nothing else. They do not rank, filter or
+conclude. The reasoning is yours.
+
+  ec2-investigation
+    EC2 only. Returns metric datapoints, SSM Run Command history, and a
+    read-only inspection of the host itself.
+    Inputs: instance_id, region, namespace, metric_name, window_start,
+    window_end, host_action.
+
+  aws-resource-investigation
+    Any resource with a CloudWatch metric - RDS, Lambda, ECS, ALB,
+    DynamoDB, ElastiCache, EC2. Returns metric datapoints and CloudTrail
+    events. No host access, because most of these have no host.
+    Inputs: resource_name, region, namespace, metric_name, dimension_name,
+    dimension_value, period_seconds, window_start, window_end.
+
+Prefer them over composing CloudWatch, SSM or CloudTrail CLI calls by hand.
+For EC2 prefer ec2-investigation: CloudTrail cannot see what ran inside
+the instance.
+
+Choosing the window:
+The tool returns exactly the window you ask for. Nothing outside it is
+fetched. A cause precedes its effect, so start the window before the alarm
+- thirty minutes earlier is usually enough, longer if the metric climbed
+slowly. If the first result shows the metric already elevated at the start,
+the window began too late; widen it and fetch again.
+
+Choosing namespace and dimension:
+- EC2 native      AWS/EC2      InstanceId
+- memory, disk    CWAgent      InstanceId    (needs the CloudWatch agent)
+- RDS             AWS/RDS      DBInstanceIdentifier
+- Lambda          AWS/Lambda   FunctionName
+- ECS             AWS/ECS      ServiceName
+- ALB             AWS/ApplicationELB  LoadBalancer  (app/name/id form)
+- DynamoDB        AWS/DynamoDB TableName
+- ElastiCache     AWS/ElastiCache  CacheClusterId
+
+A dimension key that does not match the resource type returns zero
+datapoints. So does a stopped CloudWatch agent, and so does a resource
+that genuinely had no traffic. `datapoint_count: 0` does not distinguish
+between them - check the namespace and dimension before reporting that
+nothing happened.
+
+Choosing host_action (EC2 only), by what alarmed:
+- CPU        -> top_cpu, then process_tree
+- memory     -> top_memory, memory_usage
+- disk full  -> disk_usage
+- disk I/O   -> top_cpu (I/O wait surfaces there), process_tree
+- network    -> network_connections
+- status check failure -> failed_services, recent_syslog, boot_time
+
+And by what you suspect, whatever alarmed:
+- something still running -> top_cpu or top_memory (gives owning user and
+  how long it has been alive)
+- a person -> shell_history, recent_logins
+- periodic or daily timing -> cron_jobs
+- a crash or restart loop -> failed_services, recent_syslog
+- started right after a change -> package_changes
+
+Reading the results honestly:
+- Order is not cause. A command or API call that ran before the metric
+  moved is a candidate, not an answer. Check that its timing and its
+  content plausibly explain the change, and say which parts you are
+  inferring.
+- CloudTrail returns read-only calls too, each flagged `read_only`. A
+  Describe or List did not change anything. A mutating call with an
+  `error_code` did not take effect either - it was attempted and refused.
+- `request_parameters` on a CloudTrail event usually contains the actual
+  change. Quote it rather than paraphrasing the API name.
+- A process that started well before the metric moved is unlikely to be
+  the cause. Compare start times; do not assume.
+- Host inspection is a snapshot taken now, after the alarm. A short-lived
+  process may already be gone - say so rather than reporting "nothing
+  found" as if it were proof.
+- SSH sessions, cron jobs and boot-time processes leave NO trace in SSM
+  command history. An empty SSM result means nothing ran via SSM, not that
+  nothing happened.
+- If the evidence does not explain the alarm, say that. An honest "the
+  data does not show a cause, here is what I ruled out" is worth more than
+  a confident guess.
+
+The instance must be SSM-managed and online for host inspection. If it is
+not, report that limitation instead of guessing.
+
+Never kill, restart, or reconfigure anything during an investigation.

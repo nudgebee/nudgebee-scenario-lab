@@ -31,15 +31,9 @@
       "description": "Metric that alarmed, e.g. CPUUtilization, MemoryUtilization, DiskUtilization, NetworkOut, StatusCheckFailed."
     },
     {
-      "id": "spike_threshold",
-      "type": "string",
-      "default": "70",
-      "description": "Value above which the metric counts as spiking. Pass the firing alarm's own threshold - the event carries it. The default of 70 only suits percentage metrics; for byte-valued metrics like NetworkOut it is meaningless, so always pass the real one."
-    },
-    {
       "id": "window_start",
       "type": "string",
-      "description": "ISO8601 UTC start of the window around the alarm, e.g. 2026-09-03T12:00:00Z."
+      "description": "ISO8601 UTC start of the window, e.g. 2026-09-03T12:00:00Z. Set this earlier than the alarm if you want to see what preceded it - the tool returns exactly the window you ask for and nothing outside it."
     },
     {
       "id": "window_end",
@@ -50,13 +44,7 @@
       "id": "host_action",
       "type": "string",
       "default": "triage",
-      "description": "What to inspect on the host if a live look is needed. One of: triage (default - load, top CPU/memory processes, disk, boot time), top_cpu, top_memory, disk_usage, memory_usage, network_connections, running_services, failed_services, recent_logins, shell_history, cron_jobs, recent_syslog, process_tree, boot_time, package_changes."
-    },
-    {
-      "id": "inspect_host",
-      "type": "string",
-      "default": "auto",
-      "description": "auto = only look inside the host when SSM history does not explain the spike (default, cheapest). always = always inspect. never = metrics and SSM history only."
+      "description": "What to read from the host. Default triage (load, top CPU/memory processes, disk, boot time). Others: top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes. All read-only."
     }
   ],
   "triggers": [
@@ -82,7 +70,7 @@
       }
     },
     {
-      "id": "correlate",
+      "id": "collect",
       "type": "scripting.run_script",
       "params": {
         "language": "python",
@@ -92,11 +80,11 @@
           "SSM_JSON": "{{ Tasks['ssm-commands'].output.data }}",
           "INSTANCE": "{{ Inputs.instance_id }}",
           "METRIC_NAME": "{{ Inputs.metric_name }}",
-          "SPIKE_THRESHOLD": "{{ Inputs.spike_threshold }}",
-          "INSPECT_MODE": "{{ Inputs.inspect_host }}",
-          "LOOKBACK_MIN": "30"
+          "NAMESPACE": "{{ Inputs.namespace }}",
+          "WINDOW_START": "{{ Inputs.window_start }}",
+          "WINDOW_END": "{{ Inputs.window_end }}"
         },
-        "script": "import json, os\nfrom datetime import datetime, timedelta, timezone\n\nLOOKBACK_MIN = int(os.environ.get('LOOKBACK_MIN') or 30)\nMODE = (os.environ.get('INSPECT_MODE') or 'auto').strip().lower()\n\ndef load(name):\n    raw = os.environ.get(name, '') or '{}'\n    try:\n        return json.loads(raw)\n    except Exception:\n        return {}\n\ndef parse(ts):\n    if not ts:\n        return None\n    s = str(ts).replace('Z', '+00:00')\n    try:\n        d = datetime.fromisoformat(s)\n        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)\n    except Exception:\n        return None\n\nseries = load('METRIC_JSON')\nmetric = os.environ.get('METRIC_NAME', 'metric')\n# The spike threshold is the alarm's own. Baseline is what sits clearly\n# below it - proportional, so this works for percentages and bytes alike\n# rather than assuming a 0-100 scale.\ntry:\n    SPIKE_AT = float(os.environ.get('SPIKE_THRESHOLD') or 70)\nexcept ValueError:\n    SPIKE_AT = 70.0\nBASELINE_UNDER = SPIKE_AT * 0.7\nssm = load('SSM_JSON')\ninstance = os.environ.get('INSTANCE', '')\n\npts = sorted(series.get('Datapoints', []), key=lambda p: str(p.get('Timestamp', '')))\nbaseline = [p for p in pts if (p.get('Average') or 0) < BASELINE_UNDER]\nspiked = [p for p in pts if (p.get('Average') or 0) >= SPIKE_AT]\nbase_avg = round(sum((p.get('Average') or 0) for p in baseline) / len(baseline), 1) if baseline else None\npeak = round(max([(p.get('Maximum') or p.get('Average') or 0) for p in pts], default=0), 1)\nspike_start = parse(spiked[0].get('Timestamp')) if spiked else None\nspike_end = parse(spiked[-1].get('Timestamp')) if spiked else None\n\nlower = (spike_start - timedelta(minutes=LOOKBACK_MIN)) if spike_start else None\nupper = spike_end or None\n\ncmds = []\nfor c in ssm.get('Commands', []):\n    when = parse(c.get('RequestedDateTime'))\n    if lower and upper and when and not (lower <= when <= upper):\n        continue\n    params = c.get('Parameters') or {}\n    text = params.get('commands') or []\n    if isinstance(text, list):\n        text = ' ; '.join(str(t) for t in text)\n    rel = 'unknown'\n    if when and spike_start:\n        rel = 'before_spike' if when <= spike_start else 'during_spike'\n    cmds.append({\n        'command_id': c.get('CommandId'),\n        'requested_at': c.get('RequestedDateTime'),\n        'relative_to_spike': rel,\n        'document': c.get('DocumentName'),\n        'status': c.get('Status'),\n        'comment': c.get('Comment'),\n        'command_text': text,\n    })\ncmds.sort(key=lambda c: str(c.get('requested_at') or ''))\n\nlikely = [c for c in cmds if c['relative_to_spike'] == 'before_spike']\nif not spiked:\n    verdict = 'no_spike_detected'\nelif likely:\n    verdict = 'operator_command_likely_cause'\nelif cmds:\n    verdict = 'commands_during_spike_only'\nelse:\n    verdict = 'spike_without_ssm_activity'\n\nif MODE == 'never':\n    should_inspect = 'no'\nelif MODE == 'always':\n    should_inspect = 'yes'\nelse:\n    should_inspect = 'no' if verdict == 'operator_command_likely_cause' else 'yes'\n\nprint(json.dumps({\n    'instance_id': instance,\n    'metric_name': metric,\n    'spike_threshold': SPIKE_AT,\n    'baseline_value': base_avg,\n    'peak_value': peak,\n    'spike_start': spike_start,\n    'spike_end': spike_end,\n    'spike_minutes': len(spiked),\n    'lookback_minutes': LOOKBACK_MIN,\n    'ssm_command_count': len(cmds),\n    'likely_cause_count': len(likely),\n    'ssm_commands': cmds,\n    'verdict': verdict,\n    'should_inspect': should_inspect,\n}, default=str))"
+        "script": "import json, os\n\ndef load(name):\n    raw = os.environ.get(name, '') or '{}'\n    try:\n        return json.loads(raw)\n    except Exception:\n        return {}\n\nseries = load('METRIC_JSON')\nssm = load('SSM_JSON')\n\npoints = []\nfor p in series.get('Datapoints', []):\n    points.append({\n        'timestamp': p.get('Timestamp'),\n        'average': p.get('Average'),\n        'maximum': p.get('Maximum'),\n        'unit': p.get('Unit'),\n    })\npoints.sort(key=lambda x: str(x.get('timestamp') or ''))\n\n# Every command in the window is returned, in time order. Which of them\n# relates to the metric is a judgement, and this returns facts.\ncmds = []\nfor c in ssm.get('Commands', []):\n    text = (c.get('Parameters') or {}).get('commands') or []\n    if isinstance(text, list):\n        text = ' ; '.join(str(x) for x in text)\n    cmds.append({\n        'requested_at': c.get('RequestedDateTime'),\n        'command_id': c.get('CommandId'),\n        'document': c.get('DocumentName'),\n        'status': c.get('Status'),\n        'comment': c.get('Comment'),\n        'command_text': text,\n    })\ncmds.sort(key=lambda c: str(c.get('requested_at') or ''))\n\nprint(json.dumps({\n    'instance_id': os.environ.get('INSTANCE', ''),\n    'metric_name': os.environ.get('METRIC_NAME', ''),\n    'namespace': os.environ.get('NAMESPACE', ''),\n    'window_start': os.environ.get('WINDOW_START', ''),\n    'window_end': os.environ.get('WINDOW_END', ''),\n    'datapoint_count': len(points),\n    'datapoints': points,\n    'ssm_command_count': len(cmds),\n    'ssm_commands': cmds,\n}, default=str))"
       },
       "depends_on": [
         "metrics",
@@ -105,7 +93,6 @@
     },
     {
       "id": "inspect-host",
-      "if": "{{ Tasks['correlate'].output.data.should_inspect == 'yes' }}",
       "type": "scripting.run_script",
       "failure_policy": {
         "action": "continue"
@@ -122,20 +109,20 @@
         "script": "#!/bin/bash\nset -o pipefail\nACTION=\"${ACTION:-triage}\"\nhr() { echo; echo \"===== $1 =====\"; }\ncase \"$ACTION\" in\n  triage)\n    hr \"uptime / load\"; uptime\n    hr \"top 10 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -11\n    hr \"top 10 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,cmd --sort=-pmem 2>/dev/null | head -11\n    hr \"memory\"; free -m 2>/dev/null\n    hr \"disk\"; df -hP 2>/dev/null\n    hr \"boot time\"; who -b 2>/dev/null; uptime -s 2>/dev/null ;;\n  top_cpu)    hr \"top 20 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -21 ;;\n  top_memory) hr \"top 20 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pmem 2>/dev/null | head -21 ;;\n  disk_usage) hr \"filesystems\"; df -hP 2>/dev/null; hr \"largest dirs under /var\"; du -xh --max-depth=2 /var 2>/dev/null | sort -rh | head -20 ;;\n  memory_usage) hr \"free\"; free -m 2>/dev/null; hr \"meminfo\"; head -20 /proc/meminfo 2>/dev/null ;;\n  network_connections) hr \"listening\"; ss -tulpn 2>/dev/null | head -60; hr \"established\"; ss -tnp state established 2>/dev/null | head -60 ;;\n  running_services) hr \"running units\"; systemctl list-units --type=service --state=running --no-pager 2>/dev/null | head -60 ;;\n  failed_services) hr \"failed units\"; systemctl --failed --no-pager 2>/dev/null ;;\n  recent_logins) hr \"last logins\"; last -a -n 40 2>/dev/null; hr \"logged in now\"; w 2>/dev/null ;;\n  shell_history)\n    hr \"shell history (most recent 100 per user)\"\n    for f in /root/.bash_history /home/*/.bash_history; do\n      [ -r \"$f\" ] || continue; echo \"--- $f\"; tail -100 \"$f\" 2>/dev/null\n    done ;;\n  cron_jobs)\n    hr \"system crontab\"; cat /etc/crontab 2>/dev/null\n    hr \"cron.d\"; ls -la /etc/cron.d 2>/dev/null\n    hr \"per-user crontabs\"\n    for u in $(cut -d: -f1 /etc/passwd 2>/dev/null); do\n      out=$(crontab -l -u \"$u\" 2>/dev/null); [ -n \"$out\" ] && { echo \"--- $u\"; echo \"$out\"; }\n    done\n    hr \"systemd timers\"; systemctl list-timers --all --no-pager 2>/dev/null | head -30 ;;\n  recent_syslog) hr \"journal (warning+, last 200)\"; journalctl -p warning -n 200 --no-pager 2>/dev/null ;;\n  process_tree) hr \"process tree\"; ps -ejH -o pid,ppid,user,pcpu,etime,cmd 2>/dev/null | head -120 ;;\n  boot_time) hr \"boot\"; who -b 2>/dev/null; uptime -s 2>/dev/null; uptime ;;\n  package_changes)\n    hr \"recent package activity\"\n    if command -v rpm >/dev/null 2>&1; then rpm -qa --last 2>/dev/null | head -40; fi\n    if command -v dpkg >/dev/null 2>&1; then grep -h ' install \\| upgrade ' /var/log/dpkg.log 2>/dev/null | tail -40; fi ;;\n  *) echo \"ERROR: unknown host_action '$ACTION'\"; exit 2 ;;\nesac\n"
       },
       "depends_on": [
-        "correlate"
+        "collect"
       ]
     },
     {
       "id": "report",
       "type": "core.print",
       "params": {
-        "message": "EC2 investigation \u2014 {{ Inputs.instance_id }} ({{ Inputs.region }})\n\n{{ Inputs.metric_name }}: baseline {{ Tasks['correlate'].output.data.baseline_value }}  ->  peak {{ Tasks['correlate'].output.data.peak_value }}\nSpike: {{ Tasks['correlate'].output.data.spike_start }} to {{ Tasks['correlate'].output.data.spike_end }} ({{ Tasks['correlate'].output.data.spike_minutes }} min above {{ Tasks['correlate'].output.data.spike_threshold }})\n\nVERDICT: {{ Tasks['correlate'].output.data.verdict }}\nSSM commands in window (incl. {{ Tasks['correlate'].output.data.lookback_minutes }} min lookback): {{ Tasks['correlate'].output.data.ssm_command_count }}\nLikely cause candidates (ran before the spike): {{ Tasks['correlate'].output.data.likely_cause_count }}\n\n{{ Tasks['correlate'].output.data.ssm_commands }}\n\n--- Host inspection ({{ Inputs.host_action }}) ---\nRun: {{ Tasks['correlate'].output.data.should_inspect }}\n\n{{ Tasks['inspect-host'].output.data }}\n"
+        "message": "EC2 data \u2014 {{ Inputs.instance_id }} ({{ Inputs.region }})\nMetric: {{ Inputs.namespace }} / {{ Inputs.metric_name }}   Window: {{ Inputs.window_start }} to {{ Inputs.window_end }}\n\nDatapoints ({{ Tasks['collect'].output.data.datapoint_count }}):\n{{ Tasks['collect'].output.data.datapoints }}\n\nSSM commands in window ({{ Tasks['collect'].output.data.ssm_command_count }}):\n{{ Tasks['collect'].output.data.ssm_commands }}\n\nHost inspection ({{ Inputs.host_action }}):\n{{ Tasks['inspect-host'].output.data }}\n"
       },
       "depends_on": [
-        "correlate",
+        "collect",
         "inspect-host"
       ]
     }
   ],
-  "llm_description": "Investigates any EC2 instance alarm end to end and says what caused it - CPU, memory, disk, network or status check.\n\nFirst it correlates the alarming CloudWatch metric with AWS SSM Run Command history, looking back 30 minutes before the spike, because the command that causes a spike always precedes it. If that identifies a likely cause it reports the exact command, when it ran and its comment, and stops there.\n\nIf SSM history does not explain it, it inspects the host over SSM and returns live state: load, top CPU and memory consumers, disk, memory, network connections, services, logins, shell history, cron jobs and timers, system logs, or package changes - set host_action to choose, default 'triage'.\n\nSet namespace and metric_name to whatever alarmed (AWS/EC2 CPUUtilization, NetworkOut, StatusCheckFailed; CWAgent MemoryUtilization, DiskUtilization). Pass spike_threshold from the alarm itself - the default 70 suits percentages only and is wrong for byte-valued metrics.\n\nRead-only. It never kills, restarts or reconfigures anything."
+  "llm_description": "Returns CloudWatch datapoints, SSM Run Command history and a read-only host inspection for one EC2 instance over a time window.\n\nThis is a data tool. It fetches and returns; it does not interpret. There is no verdict and no root cause - every SSM command in the window is returned in time order with its text, comment, status and timestamp, alongside the metric datapoints and live host state. Deciding what caused what is your job, not the tool's.\n\nSet namespace and metric_name to whatever you want to look at: AWS/EC2 for CPUUtilization, NetworkOut, NetworkIn, StatusCheckFailed, DiskReadBytes, DiskWriteBytes; CWAgent for MemoryUtilization and DiskUtilization. Widen window_start beyond the alarm to see what preceded it.\n\nhost_action chooses what is read from the host - default triage; also top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes.\n\nTwo things the data cannot tell you, which matter when reading it: SSH sessions, cron jobs and boot-time processes leave no trace in SSM history, and host inspection is a snapshot taken now, so a short-lived process may already be gone. An empty result is not evidence of absence.\n\nThe instance must be SSM-managed and online. Read-only: it never kills, restarts or reconfigures anything."
 }

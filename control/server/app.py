@@ -564,17 +564,22 @@ def stop(scenario_id: str):
     return {"stopped": scenario_id, "cleanup_dispatched": cleaned}
 
 
-CLEANUP = (
-    "pkill -f 'while :; do :; done' 2>/dev/null || true; "
-    "pkill stress-ng 2>/dev/null || true; "
-    "rm -f /var/tmp/nudgebee-scenario-fill.bin /var/tmp/nb-io.tmp 2>/dev/null || true; "
-    "rm -f /etc/cron.d/nudgebee-scenario 2>/dev/null || true; "
-    "systemctl stop nudgebee-scenario-broken 2>/dev/null || true; "
-    "systemctl disable nudgebee-scenario-broken 2>/dev/null || true; "
-    "rm -f /etc/systemd/system/nudgebee-scenario-broken.service 2>/dev/null || true; "
-    "systemctl daemon-reload 2>/dev/null || true; "
-    "echo scenario-lab reset complete"
-)
+def full_cleanup() -> str:
+    """
+    The reset sweep: every scenario's own cleanup, concatenated.
+
+    Built from the catalogue rather than hand-maintained here. The previous
+    hardcoded version had already drifted - it never touched zombie_processes -
+    and a second copy of the cleanup logic is exactly the kind of thing that
+    silently rots. Adding a scenario stays a YAML entry, not a code change.
+    """
+    parts = ["echo 'scenario-lab: resetting'"]
+    for s in load_catalogue().values():
+        if s.get("cleanup"):
+            parts.append(f"# --- {s['id']}")
+            parts.append(s["cleanup"].rstrip())
+    parts.append("echo 'scenario-lab reset complete'")
+    return "\n".join(parts)
 
 
 @app.post("/api/reset")
@@ -595,7 +600,7 @@ def reset():
                 InstanceIds=[host["instance_id"]],
                 DocumentName="AWS-RunShellScript",
                 Comment=f"{CMD_PREFIX} reset",
-                Parameters={"commands": [CLEANUP]},
+                Parameters={"commands": [full_cleanup()]},
                 TimeoutSeconds=60,
             )
         except ClientError:

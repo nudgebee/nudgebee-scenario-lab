@@ -240,6 +240,182 @@ scenarios:
       pkill -f 'nb-scenario:zombie_processes' 2>/dev/null || true
 
 
+# ---------------------------------------------------------------------------
+# Database scenarios (db tier) — deployed by infra/cloudformation/db.yaml.
+#
+# These need the db tier: a self-managed PostgreSQL host. Target them at the
+# host tagged scenario-role=database; every one of them runs there and reaches
+# the database over the LOCAL SOCKET, so no scenario needs a password and no
+# credential ever crosses a host boundary.
+#
+# Alarms for these live in db.yaml but are named after the LAB stack
+# (<lab-stack>-host-db-*), because the control panel discovers alarms by that
+# prefix and matches `signal` as a name suffix.
+#
+# Two scenarios below have no `signal` on purpose. Nothing in the alarm
+# catalogue can see a filtered port or a rejected password — that is the point
+# of them, and inventing an alarm that half-resolves would be worse than
+# admitting it. They are for the log- and connection-diagnosis workflows.
+# ---------------------------------------------------------------------------
+
+  - id: db_connection_saturation
+    name: Database connection saturation
+    tier: db
+    signal: db-conn-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_connections_pct (published by the db tier host)
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Server-side connection exhaustion, and the distinction that matters when
+      an application reports "cannot connect": the database is reachable, up and
+      answering — it has simply run out of connection slots. Note that a normal
+      user is refused once total reaches max_connections minus
+      superuser_reserved_connections, i.e. BELOW 100%, so "92% of max" is
+      already an outage for the application.
+    naive_answer: "The database is down."
+    command: |
+      timeout {{seconds}} runuser -u postgres -- bash -c 'for i in $(seq 1 36); do psql -d labdb -c "SELECT pg_sleep(3600)" >/dev/null 2>&1 & done; wait # nb-scenario:db_connection_saturation'
+    cleanup: |
+      pkill -f 'nb-scenario:db_connection_saturation' 2>/dev/null || true
+      runuser -u postgres -- psql -d labdb -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(3600)%' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+
+
+  - id: db_idle_in_transaction
+    name: Leaked connection pool
+    tier: db
+    signal: db-conn-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_idle_in_transaction
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      The same alarm as saturation with a completely different cause. Sessions
+      sit idle INSIDE a transaction — an application that took a connection,
+      opened a transaction and never gave it back. The database is doing no
+      work at all, so CPU and disk look perfect while connections run out. A
+      good investigation names idle_in_transaction and the client holding them.
+    naive_answer: "The database is overloaded and needs a bigger instance."
+    command: |
+      timeout {{seconds}} runuser -u postgres -- bash -c 'for i in $(seq 1 30); do (printf "BEGIN;\nSELECT 1 FROM lab_accounts LIMIT 1;\n"; sleep 3600) | psql -d labdb >/dev/null 2>&1 & done; wait # nb-scenario:db_idle_in_transaction'
+    cleanup: |
+      pkill -f 'nb-scenario:db_idle_in_transaction' 2>/dev/null || true
+      runuser -u postgres -- psql -d labdb -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+
+
+  - id: db_blocking_chain
+    name: Blocking chain
+    tier: db
+    signal: db-blocked
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_blocked_sessions
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      One transaction holds a row lock and everything behind it queues. Query
+      latency collapses while CPU, memory and disk stay flat, so every
+      utilisation dashboard says the host is healthy. The answer is a single
+      blocking PID, which is only visible in pg_stat_activity.
+    naive_answer: "The database is slow because it is under-provisioned."
+    command: |
+      timeout {{seconds}} runuser -u postgres -- bash -c '(printf "BEGIN;\nUPDATE lab_accounts SET balance = balance + 1 WHERE id = 1;\n"; sleep 3600) | psql -d labdb >/dev/null 2>&1 & sleep 3; for i in $(seq 1 6); do psql -d labdb -c "UPDATE lab_accounts SET balance = balance + 1 WHERE id = 1" >/dev/null 2>&1 & done; wait # nb-scenario:db_blocking_chain'
+    cleanup: |
+      pkill -f 'nb-scenario:db_blocking_chain' 2>/dev/null || true
+      runuser -u postgres -- psql -d labdb -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'labdb' AND pid <> pg_backend_pid() AND (state = 'idle in transaction' OR wait_event_type = 'Lock')" >/dev/null 2>&1 || true
+
+
+  - id: db_service_stopped
+    name: Database stopped
+    tier: db
+    signal: db-down
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: CWAgent pg_up
+    default_seconds: 240
+    expect_alarm_secs: 150
+    teaches: >
+      The unambiguous case, and the control for the two below it: the port
+      REFUSES connections immediately rather than hanging. Refused means the
+      network path is fine and nothing is listening; a hang means something is
+      dropping packets. Any diagnosis that reports both as "unreachable" has
+      thrown away the one bit that decides which team is on the hook.
+    naive_answer: "A network or firewall problem is blocking the database."
+    command: |
+      systemctl stop postgresql
+      sleep {{seconds}}
+      systemctl start postgresql
+    cleanup: |
+      systemctl start postgresql 2>/dev/null || true
+
+
+  - id: db_port_filtered
+    name: Database port filtered
+    tier: db
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [iptables]
+      metric: none - deliberately invisible to the alarm catalogue
+    default_seconds: 300
+    expect_alarm_secs: 0
+    teaches: >
+      A security-group style fault reproduced at the host: packets to 5432 are
+      DROPPED, so clients hang until timeout while the database itself is
+      perfectly healthy and still serving local connections. Nothing alarms —
+      every host metric is normal — which is exactly why connection failures get
+      blamed on the database. The distinguishing evidence is that a client times
+      out (rather than being refused) while the server reports itself up.
+    naive_answer: "The database has crashed or is overloaded."
+    command: |
+      command -v iptables >/dev/null 2>&1 || { echo "iptables not present - cannot inject" >&2; exit 1; }
+      iptables -I INPUT -p tcp --dport 5432 -j DROP
+      sleep {{seconds}}
+      iptables -D INPUT -p tcp --dport 5432 -j DROP 2>/dev/null || true
+    cleanup: |
+      while iptables -D INPUT -p tcp --dport 5432 -j DROP 2>/dev/null; do :; done
+
+
+  - id: db_auth_failures
+    name: Authentication failures
+    tier: db
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: none - visible only in the PostgreSQL log
+    default_seconds: 180
+    expect_alarm_secs: 0
+    teaches: >
+      Repeated password rejections against a database that is up, reachable and
+      has plenty of connection headroom. Note what this is NOT: IAM database
+      authentication does not exist for self-managed PostgreSQL — that is an
+      RDS/Aurora feature — so the failure is pg_hba plus a wrong credential, and
+      it appears as SQLSTATE 28P01 in the log and nowhere else. Exercises the
+      log-analysis path rather than the metric path.
+    naive_answer: "The database is rejecting connections because it is overloaded."
+    command: |
+      timeout {{seconds}} bash -c 'while :; do PGPASSWORD=definitely-the-wrong-password psql -h 127.0.0.1 -U labapp -d labdb -c "SELECT 1" >/dev/null 2>&1; sleep 2; done # nb-scenario:db_auth_failures'
+    cleanup: |
+      pkill -f 'nb-scenario:db_auth_failures' 2>/dev/null || true
+
+
+# ---------------------------------------------------------------------------
+# Findings (waste tier) — deployed by infra/cloudformation/waste.yaml.
+#
+# These are NOT scenarios. There is nothing to start or stop: the finding is
+# the resource existing. They demonstrate cost, rightsizing and security
+# analysis rather than incident investigation, and need no fault injection.
+#
+# The control UI lists them read-only so an operator can see what NudgeBee
+# should be reporting.
+# ---------------------------------------------------------------------------
+
+
 findings:
 
   - id: unattached_ebs_volume

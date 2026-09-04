@@ -11,7 +11,7 @@ Metadata:
       - Label: { default: Placement }
         Parameters: [VpcId, SubnetId, InstanceType, HostCount]
       - Label: { default: Alarm thresholds }
-        Parameters: [CpuThreshold, MemoryThreshold, DiskThreshold]
+        Parameters: [CpuThreshold, MemoryThreshold, DiskThreshold, DetailedMonitoring]
       - Label: { default: Safety }
         Parameters: [MaxScenarioMinutes]
 
@@ -59,10 +59,24 @@ Parameters:
     Type: Number
     Default: 30
     Description: Safety net - the sweeper clears any scenario older than this.
+  DetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Publish EC2 metrics every minute instead of every five. Keep this on.
+      With basic (5-minute) monitoring the CPU and network alarms evaluate
+      against mostly-empty one-minute buckets and take 10+ minutes to fire,
+      if they fire at all - which makes most scenarios look broken. Costs
+      about $2.10 per host per month.
 
 Conditions:
   CreateNetwork: !Equals [!Ref VpcId, '']
   UseExistingNetwork: !Not [!Equals [!Ref VpcId, '']]
+  # EC2-published metrics arrive every 60s only with detailed monitoring.
+  # The alarm period has to match the publishing rate or the alarm is
+  # scoring gaps rather than data.
+  MinuteMetrics: !Equals [!Ref DetailedMonitoring, 'true']
   TwoOrMore:   !Or [ !Equals [!Ref HostCount, 2], !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
   ThreeOrMore: !Or [ !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
   FourHosts:   !Equals [!Ref HostCount, 4]
@@ -190,11 +204,15 @@ Resources:
       SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -x
-          dnf install -y stress-ng amazon-cloudwatch-agent || yum install -y stress-ng amazon-cloudwatch-agent || true
+          # cronie is NOT present on Amazon Linux 2023, and runaway_cron needs
+          # a working scheduler or it silently does nothing.
+          dnf install -y stress-ng amazon-cloudwatch-agent cronie || yum install -y stress-ng amazon-cloudwatch-agent cronie || true
+          systemctl enable --now crond || true
           mkdir -p /opt/nudgebee-scenario
           cat >/opt/aws/amazon-cloudwatch-agent/etc/cw-agent.json <<'CWCFG'
           {
@@ -223,10 +241,14 @@ Resources:
       SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          dnf install -y stress-ng amazon-cloudwatch-agent || yum install -y stress-ng amazon-cloudwatch-agent || true
+          # cronie is NOT present on Amazon Linux 2023, and runaway_cron needs
+          # a working scheduler or it silently does nothing.
+          dnf install -y stress-ng amazon-cloudwatch-agent cronie || yum install -y stress-ng amazon-cloudwatch-agent cronie || true
+          systemctl enable --now crond || true
           mkdir -p /opt/nudgebee-scenario
       Tags:
         - { Key: Name, Value: !Sub '${AWS::StackName}-host-2' }
@@ -242,6 +264,7 @@ Resources:
       SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
       Tags:
         - { Key: Name, Value: !Sub '${AWS::StackName}-host-3' }
         - { Key: nudgebee-scenario-lab, Value: 'true' }
@@ -255,6 +278,7 @@ Resources:
       SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
       SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
       IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
       Tags:
         - { Key: Name, Value: !Sub '${AWS::StackName}-host-4' }
         - { Key: nudgebee-scenario-lab, Value: 'true' }
@@ -272,7 +296,7 @@ Resources:
       MetricName: CPUUtilization
       Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
       Statistic: Average
-      Period: 60
+      Period: !If [MinuteMetrics, 60, 300]
       EvaluationPeriods: 2
       Threshold: !Ref CpuThreshold
       ComparisonOperator: GreaterThanThreshold
@@ -332,7 +356,7 @@ Resources:
       MetricName: NetworkOut
       Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
       Statistic: Average
-      Period: 60
+      Period: !If [MinuteMetrics, 60, 300]
       EvaluationPeriods: 2
       Threshold: 50000000
       ComparisonOperator: GreaterThanThreshold
@@ -348,7 +372,7 @@ Resources:
       MetricName: CPUUtilization
       Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost2 } ]
       Statistic: Average
-      Period: 60
+      Period: !If [MinuteMetrics, 60, 300]
       EvaluationPeriods: 2
       Threshold: !Ref CpuThreshold
       ComparisonOperator: GreaterThanThreshold

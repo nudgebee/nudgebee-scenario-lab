@@ -45,9 +45,11 @@ cycle. It is the faster demo of the two.
 | IAM role + instance profile | SSM Run Command + CloudWatch agent |
 | Security group | egress only — no inbound is opened |
 | CloudWatch alarms | CPU, memory, disk, network, status check |
+| Detailed monitoring | 1-minute EC2 metrics — the CPU and network alarms cannot fire reliably on the 5-minute default |
 | SSM parameters | scenario state and the safety ceiling |
 
-Roughly **$15/month** if left running. Tear down with
+Roughly **$19/month** if left running (that includes detailed monitoring at
+~$2.10 per host, which the alarms need — see below). Tear down with
 `aws cloudformation delete-stack --stack-name nudgebee-scenario-lab`.
 
 ## Scenarios
@@ -74,10 +76,26 @@ pipeline works, not that the product is useful.
 
 Four independent layers, in order:
 
-1. Every scenario command is wrapped in `timeout` — it dies on its own
+1. Every scenario is bounded — wrapped in `timeout`, or a `sleep` followed by
+   its own undo
 2. The API refuses any duration above the stack's `MaxScenarioMinutes`
-3. A sweeper cancels anything that outlives its expiry
-4. **Reset everything** cancels all commands and runs per-scenario cleanup
+3. A sweeper cancels anything that outlives its expiry, **then runs that
+   scenario's cleanup**
+4. **Reset everything** cancels every command and sweeps all hosts
+
+Layer 3 says "then runs cleanup" for a reason. Cancelling an SSM command kills
+the script where it stands, so a scenario that undoes itself on its last line
+never gets there. Stopping `runaway_cron` used to leave its schedule installed,
+burning CPU every minute forever with nothing in the UI to show for it. Stop,
+expiry and reset all run cleanup now, and `verify-scenarios.sh` fails if a
+scenario has no cleanup to run.
+
+Verify all of this yourself:
+
+```bash
+./scripts/verify-scenarios.sh          # static, free, no AWS writes
+./scripts/verify-scenarios.sh --live   # runs each scenario briefly on a host
+```
 
 The control app binds to `127.0.0.1` and uses your own AWS credentials.
 Nothing is hosted by NudgeBee; nothing inbound is opened to your VPC.

@@ -517,6 +517,38 @@ def start(req: StartRequest):
     return {"started": req.scenario_id, "instance_id": instance_id, "seconds": seconds}
 
 
+def run_cleanup(scenario_id: str, instance_id: str) -> bool:
+    """
+    Undo one scenario on one host.
+
+    Cancelling an SSM command is not enough. Several scenarios change state
+    and undo it at the end of their own script - disk_fill removes its file,
+    runaway_cron removes /etc/cron.d/nudgebee-scenario, service_failure
+    removes its unit. cancel_command kills the script where it stands, so
+    those trailing lines never run and the damage outlives the scenario with
+    nothing left in the UI to show for it. A cancelled runaway_cron would
+    burn CPU every minute forever.
+
+    So every stop path runs the scenario's own cleanup afterwards. It is
+    per-scenario rather than the global sweep because another scenario may
+    still be running on the same host, and the global sweep would kill it.
+    """
+    scenario = load_catalogue().get(scenario_id)
+    if not scenario or not scenario.get("cleanup"):
+        return False
+    try:
+        ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Comment=f"{CMD_PREFIX} cleanup: {scenario_id}",
+            Parameters={"commands": [scenario["cleanup"]]},
+            TimeoutSeconds=60,
+        )
+        return True
+    except ClientError:
+        return False
+
+
 @app.post("/api/stop/{scenario_id}")
 def stop(scenario_id: str):
     state = read_state()
@@ -527,8 +559,9 @@ def stop(scenario_id: str):
         ssm.cancel_command(CommandId=entry["command_id"], InstanceIds=[entry["instance_id"]])
     except ClientError:
         pass
+    cleaned = run_cleanup(scenario_id, entry["instance_id"])
     write_state(state)
-    return {"stopped": scenario_id}
+    return {"stopped": scenario_id, "cleanup_dispatched": cleaned}
 
 
 CLEANUP = (
@@ -781,6 +814,10 @@ def sweeper() -> None:
                         )
                     except ClientError:
                         pass
+                    # Cancelling stops the script mid-flight, so the undo at
+                    # the end of it never runs. Without this the safety net
+                    # leaves the damage in place at expiry.
+                    run_cleanup(sid, entry["instance_id"])
                     state.pop(sid, None)
                     changed = True
             if changed:

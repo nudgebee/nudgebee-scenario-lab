@@ -36,8 +36,13 @@ scenarios:
       that CPU returned to baseline when it exited.
     naive_answer: "The instance is undersized and should be scaled up."
     command: |
-      NPROC=$(nproc)
-      timeout {{seconds}} bash -c "for i in \$(seq 1 \$((NPROC*2))); do (while :; do :; done) & done; wait" >/dev/null 2>&1
+      # nproc is resolved INSIDE the subshell: a variable set out here is not
+      # exported, so the inner shell would see it empty, seq would produce
+      # nothing, and the command would exit instantly reporting Success.
+      timeout {{seconds}} bash -c 'n=$(nproc); for i in $(seq 1 $((n*2))); do (while :; do :; done) & done; wait # nb-scenario:cpu_high' >/dev/null 2>&1
+    cleanup: |
+      pkill -f 'nb-scenario:cpu_high' 2>/dev/null || true
+
 
   - id: memory_pressure
     name: Memory pressure
@@ -57,8 +62,12 @@ scenarios:
       if command -v stress-ng >/dev/null 2>&1; then
         timeout {{seconds}} stress-ng --vm 2 --vm-bytes 70% --vm-keep >/dev/null 2>&1
       else
-        timeout {{seconds}} bash -c 'a=(); while :; do a+=($(head -c 1000000 /dev/zero | tr "\0" "x")); sleep 0.1; done' >/dev/null 2>&1
+        timeout {{seconds}} bash -c 'a=(); while :; do a+=($(head -c 1000000 /dev/zero | tr "\0" "x")); sleep 0.1; done # nb-scenario:memory_pressure' >/dev/null 2>&1
       fi
+    cleanup: |
+      pkill -f 'nb-scenario:memory_pressure' 2>/dev/null || true
+      pkill stress-ng 2>/dev/null || true
+
 
   - id: disk_fill
     name: Disk fill
@@ -81,6 +90,9 @@ scenarios:
       fallocate -l ${ALLOC_MB}M "$TARGET" 2>/dev/null || dd if=/dev/zero of="$TARGET" bs=1M count=$ALLOC_MB 2>/dev/null
       sleep {{seconds}}
       rm -f "$TARGET"
+    cleanup: |
+      rm -f /var/tmp/nudgebee-scenario-fill.bin 2>/dev/null || true
+
 
   - id: disk_io_saturation
     name: Disk I/O saturation
@@ -97,8 +109,12 @@ scenarios:
       volume - a distinction a naive reading of CPUUtilization misses.
     naive_answer: "CPU-bound workload; add vCPUs."
     command: |
-      timeout {{seconds}} bash -c 'while :; do dd if=/dev/zero of=/var/tmp/nb-io.tmp bs=1M count=256 oflag=direct 2>/dev/null; dd if=/var/tmp/nb-io.tmp of=/dev/null bs=1M iflag=direct 2>/dev/null; done'
+      timeout {{seconds}} bash -c 'while :; do dd if=/dev/zero of=/var/tmp/nb-io.tmp bs=1M count=256 oflag=direct 2>/dev/null; dd if=/var/tmp/nb-io.tmp of=/dev/null bs=1M iflag=direct 2>/dev/null; done # nb-scenario:disk_io_saturation'
       rm -f /var/tmp/nb-io.tmp
+    cleanup: |
+      pkill -f 'nb-scenario:disk_io_saturation' 2>/dev/null || true
+      rm -f /var/tmp/nb-io.tmp 2>/dev/null || true
+
 
   - id: network_spike
     name: Outbound network spike
@@ -116,7 +132,10 @@ scenarios:
       alarm to the process and destination responsible.
     naive_answer: "Data exfiltration or a DDoS."
     command: |
-      timeout {{seconds}} bash -c 'while :; do curl -s -o /dev/null https://speed.cloudflare.com/__down?bytes=100000000 || sleep 2; done'
+      timeout {{seconds}} bash -c 'while :; do curl -s -o /dev/null https://speed.cloudflare.com/__down?bytes=100000000 || sleep 2; done # nb-scenario:network_spike'
+    cleanup: |
+      pkill -f 'nb-scenario:network_spike' 2>/dev/null || true
+
 
   - id: runaway_cron
     name: Runaway cron job
@@ -134,9 +153,23 @@ scenarios:
       scenario where the obvious answer is wrong.
     naive_answer: "A one-off process spiked the CPU; nothing to do."
     command: |
-      echo '* * * * * root timeout 50 bash -c "for i in 1 2 3 4; do (while :; do :; done) & done; wait" >/dev/null 2>&1' > /etc/cron.d/nudgebee-scenario
+      # Amazon Linux 2023 ships without cron - no cronie package, no
+      # /etc/cron.d, crond inactive. Writing the schedule blind fails
+      # silently and the scenario does nothing at all, so install it first.
+      # The lab AMI preinstalls cronie; this covers hosts built before that.
+      if ! systemctl is-active --quiet crond 2>/dev/null; then
+        (dnf install -y cronie || yum install -y cronie) >/dev/null 2>&1
+        systemctl enable --now crond >/dev/null 2>&1 || true
+      fi
+      mkdir -p /etc/cron.d
+      echo '* * * * * root timeout 50 bash -c "for i in 1 2 3 4; do (while :; do :; done) & done; wait # nb-scenario:runaway_cron" >/dev/null 2>&1' > /etc/cron.d/nudgebee-scenario
       sleep {{seconds}}
       rm -f /etc/cron.d/nudgebee-scenario
+    cleanup: |
+      # remove the schedule first, then kill whatever it already spawned
+      rm -f /etc/cron.d/nudgebee-scenario 2>/dev/null || true
+      pkill -f 'nb-scenario:runaway_cron' 2>/dev/null || true
+
 
   - id: service_failure
     name: Service failure
@@ -169,6 +202,12 @@ scenarios:
       systemctl disable nudgebee-scenario-broken 2>/dev/null || true
       rm -f /etc/systemd/system/nudgebee-scenario-broken.service
       systemctl daemon-reload
+    cleanup: |
+      systemctl stop nudgebee-scenario-broken 2>/dev/null || true
+      systemctl disable nudgebee-scenario-broken 2>/dev/null || true
+      rm -f /etc/systemd/system/nudgebee-scenario-broken.service 2>/dev/null || true
+      systemctl daemon-reload 2>/dev/null || true
+
 
   - id: zombie_processes
     name: Process table pressure
@@ -185,7 +224,7 @@ scenarios:
       obvious culprit - tests whether the investigation looks at process counts.
     naive_answer: "One runaway process is responsible."
     command: |
-      timeout {{seconds}} bash -c 'for i in $(seq 1 400); do (sleep 3600) & done; wait' >/dev/null 2>&1
+      timeout {{seconds}} bash -c 'for i in $(seq 1 400); do (sleep 3600) & done; wait # nb-scenario:zombie_processes' >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # Findings (waste tier) — deployed by infra/cloudformation/waste.yaml.
@@ -197,6 +236,9 @@ scenarios:
 # The control UI lists them read-only so an operator can see what NudgeBee
 # should be reporting.
 # ---------------------------------------------------------------------------
+    cleanup: |
+      pkill -f 'nb-scenario:zombie_processes' 2>/dev/null || true
+
 
 findings:
 

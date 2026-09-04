@@ -1,150 +1,157 @@
 # NudgeBee Scenario Lab
 
-Deploy a small, disposable AWS environment, inject realistic infrastructure
-incidents on demand, and watch NudgeBee detect, triage and explain them.
+**See what NudgeBee does during a real incident — without waiting for one.**
 
-> **These scenarios deliberately degrade the hosts they run on.** Deploy into a
-> sandbox or non-production account. Every scenario stops on its own, and
-> **Reset everything** stops them immediately.
+This sets up a few small, throwaway servers in your own AWS account, then lets
+you break them on purpose. High CPU. Full disk. A service that won't start.
+NudgeBee notices, investigates, and explains what happened — and you get to
+watch it work on a problem you created thirty seconds ago.
 
-## Quickstart
+Everything is temporary. Every scenario stops by itself, one button puts
+everything back, and deleting the lab takes one command.
+
+---
+
+## Is this safe?
+
+Yes, with one rule: **use a test or sandbox AWS account, not production.**
+
+The scenarios deliberately overload the servers they run on. That's the point.
+But they only ever touch the servers this lab creates, and:
+
+- Every scenario stops on its own after a few minutes
+- **Reset everything** stops them all immediately and cleans up
+- Nothing is opened to the internet — no inbound access at all
+- Nothing here reads or touches anything else in your account
+
+## What it costs
+
+About **$19 a month** if you leave it running — roughly the price of two
+coffees. Most of that is two small servers.
+
+You'll almost certainly delete it the same day. A few hours costs cents.
+
+---
+
+## Getting started
+
+You'll need someone who can run commands on a Mac or Linux machine and has
+access to your AWS account. It takes about ten minutes.
+
+### 1. Check your account is ready
 
 ```bash
-./scripts/preflight.sh     # is this account ready? (read-only)
-./scripts/deploy.sh        # deploy the lab   (~4 min, no parameters)
-./scripts/run-local.sh     # start the UI  -> http://127.0.0.1:8080
+./scripts/preflight.sh
 ```
 
-**No VPC or subnet to look up.** The stack creates its own isolated VPC by
-default, which also means the lab cannot land in a network you care about. To
-use an existing one instead:
+This only looks — it changes nothing. It tells you whether your AWS account
+has the permissions the lab needs, and whether NudgeBee is set up to receive
+alerts from it.
+
+### 2. Create the lab
 
 ```bash
-VPC_ID=vpc-123 SUBNET_ID=subnet-456 ./scripts/deploy.sh
+./scripts/deploy.sh
 ```
 
-Docker is optional — `run-local.sh` uses a Python virtualenv. If you prefer
-containers: `cd control && docker compose up`.
+Takes about four minutes. It asks nothing and needs no configuration — it
+builds its own private network so it can't land anywhere near your real
+systems.
 
-## Two things to deploy
+### 3. Open the control panel
 
-| Stack | What it is | Demonstrates |
-|---|---|---|
-| `lab.yaml` | hosts + alarms, scenarios injected on demand | incident detection and investigation |
-| `waste.yaml` | deliberately wasteful/misconfigured resources | cost, rightsizing and security findings |
+```bash
+./scripts/run-local.sh
+```
 
-`waste.yaml` needs no fault injection at all — the finding *is* the resource
-existing. Deploy it and NudgeBee should surface real findings within a sync
-cycle. It is the faster demo of the two.
+Then open **http://127.0.0.1:8080** in your browser.
 
-## What gets deployed (lab tier)
+The panel runs on your own machine, using your own AWS access. Nothing is
+hosted by NudgeBee and nothing is sent anywhere.
 
-| Resource | Why |
+### 4. Break something
+
+Pick a scenario, press **Start**. Then watch NudgeBee.
+
+An alarm appears in about three minutes. The event shows up in NudgeBee
+shortly after, and it starts investigating on its own.
+
+### 5. Put it back
+
+Press **Reset everything**. Or just wait — scenarios expire by themselves.
+
+### 6. Delete the lab when you're done
+
+```bash
+aws cloudformation delete-stack --stack-name nudgebee-scenario-lab
+```
+
+Everything the lab created disappears. Nothing is left behind and billing stops.
+
+---
+
+## What you can break
+
+| Scenario | What it looks like |
 |---|---|
-| 1–4 × t3.micro EC2 | the hosts scenarios run on |
-| IAM role + instance profile | SSM Run Command + CloudWatch agent |
-| Security group | egress only — no inbound is opened |
-| CloudWatch alarms | CPU, memory, disk, network, status check |
-| Detailed monitoring | 1-minute EC2 metrics — the CPU and network alarms cannot fire reliably on the 5-minute default |
-| SSM parameters | scenario state and the safety ceiling |
+| CPU saturation | The server is pinned at 100% and everything on it slows down |
+| Memory pressure | Memory runs out, but nothing crashes — it just degrades |
+| Disk fill | The disk fills up until things start failing |
+| Disk I/O saturation | The disk is so busy the server looks overloaded |
+| Network spike | The server floods its network connection |
+| Runaway scheduled job | A job fires every minute and keeps burning CPU |
+| Service failure | A service fails to start and keeps retrying forever |
+| Zombie processes | Hundreds of stuck processes pile up |
 
-Roughly **$19/month** if left running (that includes detailed monitoring at
-~$2.10 per host, which the alarms need — see below). Tear down with
-`aws cloudformation delete-stack --stack-name nudgebee-scenario-lab`.
+**The interesting part isn't whether NudgeBee spots the alarm.** Any monitoring
+tool does that. It's whether it can tell you *why*.
 
-## Scenarios
+Each scenario has an obvious wrong answer. "High CPU" usually gets diagnosed as
+"the server is too small — make it bigger", when the real cause was a command
+someone ran two minutes earlier. The runaway scheduled job is the clearest
+example: the cause isn't a process at all, it's a schedule, and no amount of
+looking at what's running right now will find it.
 
-Defined in [`scenarios/catalogue.yaml`](scenarios/catalogue.yaml) — adding one
-is a YAML entry, not a code change.
+That's what you're evaluating.
 
-| Scenario | Trips | What it teaches |
-|---|---|---|
-| `cpu_high` | CPU alarm | attribute a spike to an operator command, not "undersized instance" |
-| `memory_pressure` | memory alarm | exhaustion with no OOM kill — degradation without a crash |
-| `disk_fill` | disk alarm | find the file and the writer, not just percent-used |
-| `disk_io_saturation` | CPU alarm | I/O wait masquerading as CPU load |
-| `network_spike` | network alarm | tie egress to the responsible process |
-| `runaway_cron` | CPU alarm (recurring) | **the cause is a schedule, not a process** |
-| `service_failure` | status check | a unit that fails and stays failed |
-| `zombie_processes` | CPU alarm | fork pressure with no single culprit |
+---
 
-Each carries a `naive_answer` — the plausible-but-wrong conclusion. Those are
-the interesting ones: a scenario whose obvious answer is correct proves the
-pipeline works, not that the product is useful.
-
-## Safety
-
-Four independent layers, in order:
-
-1. Every scenario is bounded — wrapped in `timeout`, or a `sleep` followed by
-   its own undo
-2. The API refuses any duration above the stack's `MaxScenarioMinutes`
-3. A sweeper cancels anything that outlives its expiry, **then runs that
-   scenario's cleanup**
-4. **Reset everything** cancels every command and sweeps all hosts
-
-Layer 3 says "then runs cleanup" for a reason. Cancelling an SSM command kills
-the script where it stands, so a scenario that undoes itself on its last line
-never gets there. Stopping `runaway_cron` used to leave its schedule installed,
-burning CPU every minute forever with nothing in the UI to show for it. Stop,
-expiry and reset all run cleanup now, and `verify-scenarios.sh` fails if a
-scenario has no cleanup to run.
-
-Verify all of this yourself:
+## The waste tier (optional)
 
 ```bash
-./scripts/verify-scenarios.sh          # static, free, no AWS writes
-./scripts/verify-scenarios.sh --live   # runs each scenario briefly on a host
+./scripts/deploy.sh waste
 ```
 
-The control app binds to `127.0.0.1` and uses your own AWS credentials.
-Nothing is hosted by NudgeBee; nothing inbound is opened to your VPC.
+This creates deliberately wasteful and misconfigured resources — an unused
+disk, an oversized server, a security group left wide open. Nothing needs to be
+triggered; the problem *is* that they exist. NudgeBee should find them on its
+own within a sync cycle.
 
-## Waste tier
+It's the quicker demo of the two: no scenarios to run, just deploy and look.
 
-```bash
-./scripts/deploy.sh waste     # or: ./scripts/deploy.sh both
-```
+One thing to know: the oversized-server finding needs a few days of history
+before it appears. That's expected, not a fault.
 
-| Finding | Resource created | Cost impact |
-|---|---|---|
-| unattached EBS volume | 20 GB gp3, no attachment | ~$1.60/mo |
-| unencrypted EBS volume | 1 GB, encryption off | negligible |
-| over-permissive SG | 22 + 3389 open, **attached to nothing** | none |
-| oversized instance | m5.xlarge near-idle | **~$140/mo** |
-| stopped instance | t3.small + 30 GB EBS | ~$2.40/mo |
-| idle load balancer | ALB, no targets (off by default) | ~$16/mo |
+---
 
-Two things to know:
+## Two things people get wrong
 
-- **The open security group is attached to nothing.** It exists so security
-  scanning has something to find; it opens no actual access.
-- **The oversized-instance finding needs history.** Rightsizing is based on
-  days of CloudWatch utilisation data, so it will not appear immediately after
-  deploying. That is expected, not a failure.
-- **One manual step:** CloudFormation cannot create an instance in the stopped
-  state. Run the `stop-instances` command from the stack outputs afterwards.
+**Connecting your AWS account to NudgeBee isn't enough.** Alert forwarding has
+to be switched on separately, or alarms fire in AWS and never reach NudgeBee.
+`preflight.sh` checks this and tells you if it's missing.
 
-The `oversized_instance` finding dominates the cost. Set
-`CreateOversizedInstance=false` if you only want the free findings.
+**Servers take a minute or two to come online** after the lab is created. The
+control panel enables the Start buttons by itself once they're ready — you
+don't need to do anything.
 
-## NudgeBee integration
+---
 
-[`nudgebee/`](nudgebee/) ships an automation and a knowledge-base article that
-turn "an alarm fired" into "here is what caused it". Import both — see
-[`nudgebee/README.md`](nudgebee/README.md).
+## For the technically minded
 
-**The prerequisite people miss:** onboarding the AWS account is not enough.
-EventBridge forwarding must be enabled or alarms fire in CloudWatch and never
-reach NudgeBee. `preflight.sh` checks this explicitly.
+- `infra/cloudformation/` — what gets created in AWS
+- `scenarios/catalogue.yaml` — the scenarios; adding one is a few lines of YAML
+- `control/` — the local control panel (Python, no external services)
+- `nudgebee/` — automations and a knowledge-base article to import into NudgeBee
+- `scripts/verify-scenarios.sh` — checks every scenario still actually works
 
-## Docs
-
-- `docs/01-prerequisites.md`
-- `docs/02-deploy.md`
-- `docs/03-connect-nudgebee.md`
-- `docs/04-run-scenarios.md`
-- `docs/05-what-to-look-for.md` — expected NudgeBee output per scenario
-- `docs/06-teardown.md`
-- `docs/07-cost.md`
-- `docs/08-troubleshooting.md`
+Full detail lives in each of those directories.

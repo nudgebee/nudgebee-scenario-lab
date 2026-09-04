@@ -4,8 +4,7 @@
     {
       "id": "account_id",
       "type": "account",
-      "default": "00666e9f-3774-4f5d-b86c-60b201ae18c5",
-      "description": "Cloud account owning the instance."
+      "description": "Cloud account owning the resource. Pick your own AWS account in NudgeBee."
     },
     {
       "id": "instance_id",

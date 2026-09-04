@@ -1,0 +1,91 @@
+For CloudWatch alarms and event analysis on EC2 instances — CPU, memory,
+disk, network or status check.
+
+CloudWatch tells you the number. It does not tell you what caused it.
+Do not conclude "high load", recommend resizing, or close the event until
+you have established what was actually running on the host.
+
+Use the ec2-investigation automation. Prefer it over composing CloudWatch
+or SSM CLI calls by hand — it is tested, read-only, and returns a
+structured verdict.
+
+Required inputs: instance_id, window_start, window_end (ISO8601 UTC), region.
+Give it a window around the alarm; it handles the rest.
+
+Tell it what alarmed:
+- metric_name — CPUUtilization, MemoryUtilization, DiskUtilization,
+  NetworkOut, NetworkIn, StatusCheckFailed, DiskReadBytes, DiskWriteBytes.
+- namespace — AWS/EC2 for metrics EC2 publishes itself; CWAgent for
+  MemoryUtilization, DiskUtilization and anything else the CloudWatch
+  agent publishes. Getting this wrong returns an empty series, which
+  looks identical to "no spike" — so set it deliberately.
+- spike_threshold — take this from the firing alarm, which carries its own
+  threshold. The default of 70 is right for percentage metrics and WRONG
+  for byte-valued ones like NetworkOut, where 70 bytes is always exceeded
+  and every datapoint looks like a spike.
+
+What it does, in order:
+1. Correlates the alarming metric with SSM Run Command history, looking
+   back 30 minutes BEFORE the spike — the command that causes a spike
+   always precedes it.
+2. If that does not explain the spike, it inspects the host itself over
+   SSM and returns live state.
+
+Step 1 is metric-agnostic. A deploy that pins CPU, a leak that exhausts
+memory, a job that fills a disk and a transfer that saturates the NIC are
+all "something ran just before the number moved", and the same correlation
+finds all four.
+
+Verdicts:
+- operator_command_likely_cause — a command ran just before the spike.
+  Report the command text, its timestamp relative to the alarm, and the
+  comment. This is usually the answer: a load test, deploy, batch job,
+  install or restart.
+- commands_during_spike_only — commands ran, but only after the metric was
+  already high. They are probably a response, not the cause.
+- spike_without_ssm_activity — nothing was run via SSM. The automation
+  will have inspected the host; read that section.
+- no_spike_detected — the metric never crossed the threshold in that
+  window. Before concluding the alarm was wrong, check that namespace and
+  spike_threshold were right — a wrong namespace produces this same result.
+
+Optional inputs:
+- host_action: what to look at on the host when inspection runs.
+  Default triage (load, top CPU/memory processes, disk, boot time).
+  Others: top_cpu, top_memory, shell_history, cron_jobs, recent_logins,
+  running_services, failed_services, network_connections, disk_usage,
+  memory_usage, recent_syslog, process_tree, boot_time, package_changes.
+- inspect_host: auto (default), always, or never.
+
+Choosing host_action, by what alarmed:
+- CPU        -> top_cpu, then process_tree
+- memory     -> top_memory, memory_usage
+- disk full  -> disk_usage
+- disk I/O   -> top_cpu (I/O wait shows there), process_tree
+- network    -> network_connections
+- status check failure -> failed_services, recent_syslog, boot_time
+
+And by what you suspect, regardless of metric:
+- process still running and consuming -> top_cpu or top_memory (gives the
+  owning user and how long it has been alive)
+- a person -> shell_history, recent_logins
+- timing looks periodic or repeats daily -> cron_jobs
+- a crash or restart loop -> failed_services, recent_syslog
+- it started right after a change -> package_changes
+
+Interpreting results honestly:
+- A process that started well before the metric moved is unlikely to be
+  the cause. Compare start times against the spike window; do not assume.
+- Host inspection is a live snapshot taken after the alarm. A short-lived
+  process may already be gone — say so rather than reporting "nothing
+  found" as if it were proof.
+- SSH sessions, cron jobs and boot-time processes leave NO trace in SSM
+  command history or CloudTrail. An empty SSM result means nothing was run
+  via SSM, not that nothing happened.
+- Memory and disk metrics come from the CloudWatch agent. If the agent is
+  not installed or has stopped, the series is empty — that is a monitoring
+  gap, not a healthy host. Do not report it as "no problem found".
+- The instance must be SSM-managed and online. If it is not, the host
+  inspection will fail; report that limitation instead of guessing.
+
+Never kill, restart, or reconfigure anything during an investigation.

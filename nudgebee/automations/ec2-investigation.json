@@ -66,7 +66,7 @@
       "type": "aws.cli",
       "params": {
         "account_id": "{{ Inputs.account_id }}",
-        "command": "aws ssm list-commands --instance-id {{ Inputs.instance_id }} --max-results 50 --region {{ Inputs.region }} --output json"
+        "command": "aws ssm list-commands --instance-id {{ Inputs.instance_id }} --filters key=InvokedAfter,value={{ Inputs.window_start }} key=InvokedBefore,value={{ Inputs.window_end }} --max-results 50 --region {{ Inputs.region }} --output json"
       }
     },
     {

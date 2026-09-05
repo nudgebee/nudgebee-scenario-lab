@@ -157,6 +157,61 @@ Resources:
       SubnetId: !Ref LabSubnet
       RouteTableId: !Ref LabRouteTable
 
+  # ------------------------------------------------------- VPC flow logs
+  # NudgeBee builds its AWS service map from these. It discovers them with
+  # DescribeFlowLogs, so no naming convention is needed - but it keeps only
+  # RFC1918 traffic with log_status OK, so the default format is required
+  # (it carries srcaddr, dstaddr and log-status).
+  #
+  # Only created when the stack made its own VPC. If you pointed the lab at
+  # an existing VPC, enabling flow logs on it is your call, not ours.
+
+  LabFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateNetwork
+    Properties:
+      LogGroupName: !Sub '/aws/vpc-flow-logs/${AWS::StackName}'
+      RetentionInDays: 3
+
+  LabFlowLogRole:
+    Type: AWS::IAM::Role
+    Condition: CreateNetwork
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteFlowLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt LabFlowLogGroup.Arn
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateNetwork
+    Properties:
+      ResourceId: !Ref LabVpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref LabFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt LabFlowLogRole.Arn
+      MaxAggregationInterval: 60
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-flowlogs' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
   # ---------------------------------------------------------------- IAM
 
   ScenarioHostRole:
@@ -193,6 +248,18 @@ Resources:
       Tags:
         - { Key: Name, Value: !Sub '${AWS::StackName}-hosts' }
         - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # Host-to-host only, and only from this same group - still nothing inbound
+  # from the internet. Needed so lab services can actually call each other:
+  # without accepted traffic between them the VPC flow logs have nothing to
+  # record, and NudgeBee's service map is built from those flows.
+  ScenarioHostSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ScenarioHostSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ScenarioHostSecurityGroup
+      Description: Lab hosts talking to each other
 
   # ---------------------------------------------------------------- Hosts
 
@@ -422,3 +489,22 @@ Outputs:
     Value: !If [CreateNetwork, !Ref LabVpc, !Ref VpcId]
   NextSteps:
     Value: !Sub 'Run: SCENARIO_LAB_STACK=${AWS::StackName} ./scripts/run-local.sh  (then open http://127.0.0.1:8080)'
+
+  # Exported so the services tier can reuse this network and instance profile
+  # instead of building a second copy of everything.
+  SubnetIdOut:
+    Description: Subnet the lab hosts run in
+    Value: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
+    Export: { Name: !Sub '${AWS::StackName}-SubnetId' }
+  SecurityGroupIdOut:
+    Description: Security group for lab hosts (egress plus host-to-host)
+    Value: !Ref ScenarioHostSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-SecurityGroupId' }
+  InstanceProfileOut:
+    Description: Instance profile granting SSM and CloudWatch access
+    Value: !Ref ScenarioHostProfile
+    Export: { Name: !Sub '${AWS::StackName}-InstanceProfile' }
+  VpcIdOut:
+    Description: VPC the lab runs in
+    Value: !If [CreateNetwork, !Ref LabVpc, !Ref VpcId]
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }

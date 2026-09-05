@@ -293,6 +293,48 @@ scenarios:
     cleanup: |
       systemctl start postgresql 2>/dev/null || true
 
+  - id: order_db_connectivity_loss
+    name: Order loses its database, everything downstream follows
+    tier: services
+    target_service: order
+    signal: order-cpu
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
+    default_seconds: 900
+    expect_alarm_secs: 240
+    teaches: >
+      Correlation and blast radius across three hosts, from native metrics.
+      Order loses database connectivity and starts retrying, which burns CPU.
+      Payment and inventory cannot get a healthy answer from order and retry
+      too. Three CPU alarms, one cause. Order is the parent: it is the only one
+      whose own dependency is broken, and it is upstream of the other two.
+      Blast radius seeded on order should name payment and inventory.
+
+      Prefer this over service_failure_cascade for anything involving
+      correlation. Stopping a service produces no native metric on the host
+      that failed - a stopped process burns nothing - so the parent arrives as
+      an untyped alarm event and cannot be traversed in the graph.
+    naive_answer: "Three servers are overloaded - they need more CPU."
+    command: |
+      # Drop traffic to PostgreSQL from this host only. The database stays
+      # healthy and serves the other two; the fault is genuinely one service's
+      # connectivity, which is what makes order the parent rather than the DB.
+      # Amazon Linux 2023 ships without iptables - third thing it omits after
+      # cron and an unauthenticated metadata endpoint. Install on demand.
+      command -v iptables >/dev/null 2>&1 || dnf install -y iptables-nft >/dev/null 2>&1 || yum install -y iptables >/dev/null 2>&1
+      DB_IP=$(grep -oP 'NB_DB_HOST=\K\S+' /etc/systemd/system/order.service | head -1)
+      iptables -I OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP
+      sleep {{seconds}}
+      iptables -D OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP 2>/dev/null || true
+    cleanup: |
+      DB_IP=$(grep -oP 'NB_DB_HOST=\K\S+' /etc/systemd/system/order.service 2>/dev/null | head -1)
+      # Removing the rule is the whole cleanup. The burn belongs to the
+      # service, not to this scenario, and its supervisor stops it as soon as
+      # the database is reachable again - killing it here would race that.
+      [ -n "$DB_IP" ] && iptables -D OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP 2>/dev/null || true
+
 findings:
 
   - id: unattached_ebs_volume

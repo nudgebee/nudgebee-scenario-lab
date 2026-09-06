@@ -10,6 +10,11 @@ watch it work on a problem you created thirty seconds ago.
 Everything is temporary. Every scenario stops by itself, one button puts
 everything back, and deleting the lab takes one command.
 
+![Starting a scenario and watching the alarm fire](docs/media/scenario-lab-demo.gif)
+
+*Pick a scenario, press Start, and the alarm goes red about three minutes
+later — the same alarm NudgeBee picks up and investigates.*
+
 ---
 
 ## Is this safe?

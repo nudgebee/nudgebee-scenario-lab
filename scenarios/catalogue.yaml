@@ -335,6 +335,101 @@ scenarios:
       # the database is reachable again - killing it here would race that.
       [ -n "$DB_IP" ] && iptables -D OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP 2>/dev/null || true
 
+  # The two below are the reason the database tier logs to CloudWatch at all.
+  # Every other scenario here is visible in metrics; these are visible in
+  # metrics AND in the PostgreSQL log, which is what a log-analysis workflow
+  # has to have something to read. Both run on the database host itself.
+
+  - id: db_connection_saturation
+    name: Connection pool exhausted
+    tier: services
+    target_service: database
+    signal: db-conn-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_connections_pct
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      The database is up and healthy and still refusing work. Metrics show
+      connection usage at the ceiling; the log shows the refusals themselves,
+      SQLSTATE 53300, repeated for as long as the application keeps trying.
+      An investigation should reach "nothing can get a connection" rather than
+      "the database is down" - it answers pg_isready throughout - and should
+      not conclude the database needs to be bigger.
+    naive_answer: "The database is overloaded and needs a larger instance."
+    command: |
+      # Superusers keep superuser_reserved_connections, so the metric collector
+      # (postgres, local socket) keeps publishing while the application user is
+      # being refused. That asymmetry is the scenario: the graphs stay alive
+      # and tell you the thing is full, which is only true for labapp.
+      export PGPASSWORD='labapp-not-a-secret'
+      MAXC=$(runuser -u postgres -- psql -tAXc 'show max_connections' 2>/dev/null || echo 40)
+      for i in $(seq 1 $(( MAXC - 2 ))); do
+        timeout {{seconds}} psql -h 127.0.0.1 -U labapp -d labdb -tAc \
+          'select pg_sleep({{seconds}}) /* nb-scenario:db_connection_saturation */' \
+          >/dev/null 2>&1 &
+      done
+      # Keep asking for one more connection for the whole window. A single
+      # refusal at the start is a blip; an application under load produces a
+      # steady stream of them, and a log analysis that only ever sees one line
+      # has not really been tested.
+      end=$(( $(date +%s) + {{seconds}} ))
+      while [ "$(date +%s)" -lt "$end" ]; do
+        psql -h 127.0.0.1 -U labapp -d labdb -tAc 'select 1' >/dev/null 2>&1
+        sleep 10
+      done
+      wait
+    cleanup: |
+      pkill -f 'nb-scenario:db_connection_saturation' 2>/dev/null || true
+      runuser -u postgres -- psql -d labdb -tAc \
+        "select pg_terminate_backend(pid) from pg_stat_activity
+          where usename = 'labapp' and pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+
+  - id: db_lock_contention
+    name: Sessions blocked on a lock
+    tier: services
+    target_service: database
+    signal: db-blocked
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_blocked_sessions
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      Queries stop returning while CPU, memory and disk stay flat, so every
+      resource-shaped explanation is wrong. One transaction holds the table and
+      everything else queues behind it. log_lock_waits puts each waiter in the
+      log with the pid it is waiting for, so the blocking session is
+      identifiable from the log alone - the analysis should name it rather than
+      report that the database is slow.
+    naive_answer: "The database is slow - the queries need indexes."
+    command: |
+      # ACCESS EXCLUSIVE blocks readers too, so plain SELECTs queue. Anything
+      # weaker would need writers to demonstrate and the point here is that
+      # read-only traffic can be blocked by one transaction nobody is watching.
+      timeout {{seconds}} runuser -u postgres -- psql -d labdb -c \
+        'begin; lock table lab_accounts in access exclusive mode;
+         select pg_sleep({{seconds}}); commit;' >/dev/null 2>&1 &
+      sleep 5
+      export PGPASSWORD='labapp-not-a-secret'
+      for i in $(seq 1 5); do
+        timeout {{seconds}} psql -h 127.0.0.1 -U labapp -d labdb -tAc \
+          'select count(*) from lab_accounts /* nb-scenario:db_lock_contention */' \
+          >/dev/null 2>&1 &
+      done
+      wait
+    cleanup: |
+      pkill -f 'nb-scenario:db_lock_contention' 2>/dev/null || true
+      # The holder runs as postgres over the local socket, so it is not caught
+      # by the labapp sweep the saturation scenario uses - match the statement.
+      runuser -u postgres -- psql -d labdb -tAc \
+        "select pg_terminate_backend(pid) from pg_stat_activity
+          where query like '%lock table lab_accounts%' and pid <> pg_backend_pid()" \
+        >/dev/null 2>&1 || true
+
 findings:
 
   - id: unattached_ebs_volume

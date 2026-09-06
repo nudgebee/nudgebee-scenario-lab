@@ -236,7 +236,12 @@ def lab_hosts() -> list[dict]:
                     # services-tier hosts carry nb-service (order, payment,
                     # inventory, database); the original lab hosts carry neither
                     "role": tags.get("scenario-role", "") or tags.get("nb-service", ""),
-                    "service": tags.get("nb-service", ""),
+                    # Two tiers spell the same idea differently: services.json
+                    # tags nb-service, db.yaml tags scenario-role. Reading only
+                    # the first made the database host unresolvable, so every
+                    # target_service: database scenario 412'd against a host
+                    # that was sitting right there.
+                    "service": tags.get("nb-service", "") or tags.get("scenario-role", ""),
                     "type": inst.get("InstanceType"),
                     "az": inst.get("Placement", {}).get("AvailabilityZone"),
                     "private_ip": inst.get("PrivateIpAddress"),

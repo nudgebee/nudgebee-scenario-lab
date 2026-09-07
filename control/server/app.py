@@ -549,12 +549,20 @@ def revoke_alb_ingress(params: dict) -> dict:
 
 def restore_alb_ingress(undo: dict) -> None:
     """Put the rule back. Idempotent: a duplicate rule is success, not a failure."""
+    # Description belongs to the group PAIR, not to the permission. At the
+    # permission level botocore rejects it as an unknown parameter, and the
+    # failure surfaces as a 500 on stop - which is the one code path that must
+    # not fail, because nothing else puts the rule back.
     permission = {
         "IpProtocol": "tcp",
         "FromPort": undo["port"],
         "ToPort": undo["port"],
-        "UserIdGroupPairs": [{"GroupId": undo["alb_sg"]}],
-        "Description": "ALB to order service - restored by scenario cleanup",
+        "UserIdGroupPairs": [
+            {
+                "GroupId": undo["alb_sg"],
+                "Description": "ALB to order service - restored by scenario cleanup",
+            }
+        ],
     }
     try:
         ec2.authorize_security_group_ingress(

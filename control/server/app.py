@@ -26,6 +26,7 @@ from pathlib import Path
 
 import boto3
 import yaml
+from botocore.config import Config
 from botocore.exceptions import ClientError, NoCredentialsError
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -58,12 +59,27 @@ def template_path(tier: str) -> Path:
 def stack_name_for(tier: str) -> str:
     return STACK if tier == "lab" else f"{STACK}-waste"
 
-ssm = boto3.client("ssm", region_name=REGION)
-ec2 = boto3.client("ec2", region_name=REGION)
-cw = boto3.client("cloudwatch", region_name=REGION)
-sts = boto3.client("sts", region_name=REGION)
-iam = boto3.client("iam", region_name=REGION)
-cfn = boto3.client("cloudformation", region_name=REGION)
+# The page polls /api/setup, /api/scenarios, /api/alarms and /api/findings on a
+# timer, and most of those make two AWS calls each. FastAPI runs these sync
+# handlers on a 40-thread pool, but botocore defaults to 10 pooled connections
+# per client - so past ~10 concurrent calls the rest queue on the connection
+# pool and the UI looks dead while the process is healthy and idle. Raising the
+# pool to match the thread pool is the fix; the timeouts stop a single wedged
+# AWS call from holding a connection forever.
+_boto = Config(
+    region_name=REGION,
+    max_pool_connections=50,
+    connect_timeout=5,
+    read_timeout=20,
+    retries={"max_attempts": 3, "mode": "standard"},
+)
+
+ssm = boto3.client("ssm", config=_boto)
+ec2 = boto3.client("ec2", config=_boto)
+cw = boto3.client("cloudwatch", config=_boto)
+sts = boto3.client("sts", config=_boto)
+iam = boto3.client("iam", config=_boto)
+cfn = boto3.client("cloudformation", config=_boto)
 
 app = FastAPI(title="NudgeBee Scenario Lab")
 

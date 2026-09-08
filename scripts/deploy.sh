@@ -7,6 +7,13 @@
 #   ./scripts/deploy.sh both       # lab + waste
 #   ./scripts/deploy.sh all        # lab + waste + db
 #
+# Credentials and region come from your environment, exactly as the aws CLI
+# takes them - so a named profile is just AWS_PROFILE:
+#
+#   AWS_PROFILE=sandbox AWS_REGION=eu-west-1 ./scripts/deploy.sh
+#
+# The account being targeted is printed before anything is created.
+#
 # By default the stack creates its own isolated VPC, so you do not need to know
 # or choose a network - and the lab cannot land in one you care about.
 # To use an existing VPC instead:
@@ -32,6 +39,7 @@ ALIAS=$(aws iam list-account-aliases --query 'AccountAliases[0]' --output text 2
 
 c_hd "Target"
 echo "  account : ${ALIAS:+$ALIAS · }$ACCOUNT"
+[ -n "${AWS_PROFILE:-}" ] && echo "  profile : $AWS_PROFILE"
 echo "  region  : $REGION"
 echo "  stack   : $STACK"
 if [ -n "${VPC_ID:-}" ]; then

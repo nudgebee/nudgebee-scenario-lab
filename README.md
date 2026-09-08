@@ -71,6 +71,27 @@ aws sts get-caller-identity
 That should print an account number. If it prints an error, the credentials
 aren't set up yet and nothing else will work.
 
+**If you keep several AWS accounts on one machine** — most people do — put the
+sandbox one in a named profile and point the lab at it with `AWS_PROFILE`:
+
+```bash
+aws configure --profile sandbox      # or: aws sso login --profile sandbox
+export AWS_PROFILE=sandbox
+aws sts get-caller-identity
+```
+
+Set it once, in the terminal you're going to work in, and every command below
+uses it — including the control panel, which reads the same profile your CLI
+does. Same for the region, if the lab shouldn't go in `us-east-1`:
+
+```bash
+export AWS_REGION=eu-west-1
+```
+
+Every script prints the account it's about to act on before it changes
+anything. Read that line. It's the one check that catches "wrong profile" while
+it's still free.
+
 **3. Python 3.9 or newer**, for the control panel:
 
 ```bash
@@ -123,7 +144,8 @@ systems.
 
 Then open **http://127.0.0.1:8080** in your browser.
 
-The panel runs on your own machine, using your own AWS access. Nothing is
+The panel runs on your own machine, using your own AWS access — the same
+profile as the commands above. It prints which one on startup. Nothing is
 hosted by NudgeBee and nothing is sent anywhere.
 
 ### 4. Break something

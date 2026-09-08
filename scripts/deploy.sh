@@ -122,13 +122,54 @@ deploy_db() {
     --output text 2>/dev/null | sed 's/^/  /'
 }
 
+deploy_services() {
+  c_hd "Deploying services tier (about 5 minutes)"
+  aws cloudformation deploy \
+    --template-file "$ROOT/infra/cloudformation/services.json" \
+    --stack-name "${STACK}-services" \
+    --region "$REGION" \
+    --parameter-overrides "LabStackName=${STACK}"
+  c_ok "services tier deployed"
+  c_dim "  The three services call each other every 15s; the dependency map needs a few minutes of that traffic."
+  aws cloudformation describe-stacks --stack-name "${STACK}-services" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`OrderHostId`||OutputKey==`Topology`].[OutputKey,OutputValue]' \
+    --output text 2>/dev/null | sed 's/^/  /'
+}
+
+deploy_lb() {
+  c_hd "Deploying load balancer tier (about 4 minutes)"
+  # The target has to exist before the target group can register it, and the
+  # instance id is an output of the services stack rather than something the
+  # operator should have to look up and paste.
+  local order
+  order=$(aws cloudformation describe-stacks --stack-name "${STACK}-services" --region "$REGION" \
+          --query 'Stacks[0].Outputs[?OutputKey==`OrderHostId`].OutputValue' --output text 2>/dev/null)
+  if [ -z "$order" ] || [ "$order" = "None" ]; then
+    echo "Deploy the services tier first: $0 services"
+    return 1
+  fi
+  aws cloudformation deploy \
+    --template-file "$ROOT/infra/cloudformation/lb.yaml" \
+    --stack-name "${STACK}-lb" \
+    --region "$REGION" \
+    --parameter-overrides "LabStackName=${STACK}" "OrderInstanceId=${order}"
+  c_ok "load balancer tier deployed"
+  c_dim "  This one bills whether or not you run a scenario. Delete it when you are done."
+  aws cloudformation describe-stacks --stack-name "${STACK}-lb" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`AlbDnsName`].[OutputKey,OutputValue]' \
+    --output text 2>/dev/null | sed 's/^/  /'
+}
+
 case "$WHAT" in
-  lab)   deploy_lab ;;
-  waste) deploy_waste ;;
-  db)    deploy_db ;;
-  both)  deploy_lab; deploy_waste ;;
-  all)   deploy_lab; deploy_waste; deploy_db ;;
-  *) echo "usage: $0 [lab|waste|db|both|all]"; exit 1 ;;
+  lab)      deploy_lab ;;
+  waste)    deploy_waste ;;
+  db)       deploy_db ;;
+  services) deploy_services ;;
+  lb)       deploy_lb ;;
+  both)     deploy_lab; deploy_waste ;;
+  # Order matters: services needs the lab's network, lb needs the order host.
+  all)      deploy_lab; deploy_waste; deploy_db; deploy_services; deploy_lb ;;
+  *) echo "usage: $0 [lab|waste|db|services|lb|both|all]"; exit 1 ;;
 esac
 
 c_hd "Next"

@@ -1,7 +1,6 @@
 # Correlation only happens on recognised AWS metric namespaces
 
-Measured on the Rackspace environment, 4 September 2026, account `aws-dev`
-(`00666e9f-3774-4f5d-b86c-60b201ae18c5`).
+Measured on a test AWS account, 4 September 2026.
 
 ## What we saw
 
@@ -47,7 +46,7 @@ metrics by nature. On the current behaviour none of them can participate in
 correlation, no matter how well dimensioned or how accurately they resolve to
 a host.
 
-For the Rackspace Phase 1 use cases this is directly load-bearing. The AppOps
+For the test Phase 1 use cases this is directly load-bearing. The AppOps
 scenario is "the application is unreachable, and the cause is underneath it".
 If the application-level signal is a custom metric, it will arrive as
 `subject_type: alarm` and be excluded from the very correlation the scenario

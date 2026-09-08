@@ -252,17 +252,7 @@ def lab_hosts() -> list[dict]:
                     # services-tier hosts carry nb-service (order, payment,
                     # inventory, database); the original lab hosts carry neither
                     "role": tags.get("scenario-role", "") or tags.get("nb-service", ""),
-                    # Two tiers spell the same idea differently: services.json
-                    # tags nb-service, db.yaml tags scenario-role. Both are kept
-                    # SEPARATE on purpose. Collapsing them into one field made
-                    # both database hosts answer to target_service: database, and
-                    # start() takes the first match in describe_instances order -
-                    # which is not stable. database_outage then stopped PostgreSQL
-                    # on the lab database, which nothing depends on, so the
-                    # cascade it exists to demonstrate never happened and the
-                    # incident's impact was legitimately empty.
                     "service": tags.get("nb-service", ""),
-                    "service_alias": tags.get("scenario-role", ""),
                     "type": inst.get("InstanceType"),
                     "az": inst.get("Placement", {}).get("AvailabilityZone"),
                     "private_ip": inst.get("PrivateIpAddress"),
@@ -626,23 +616,7 @@ def start(req: StartRequest):
     # scenarios declare target_service and we resolve the host ourselves.
     target = scenario.get("target_service")
     if target:
-        # nb-service wins over scenario-role, and it is not a style preference:
-        # the services tier is the one with real dependents, so a cascade
-        # scenario has to land there. Falling back to scenario-role keeps the
-        # standalone database tier addressable when no services tier exists.
-        exact = [h for h in hosts if h.get("service") == target]
-        match = exact[0] if exact else None
-        if not match:
-            aliased = [h for h in hosts if h.get("service_alias") == target]
-            if len(aliased) > 1:
-                names = ", ".join(sorted(h["name"] for h in aliased))
-                raise HTTPException(
-                    409,
-                    f"{req.scenario_id} targets '{target}' and {len(aliased)} hosts claim it "
-                    f"({names}). Pass instance_id to say which - guessing would run the fault "
-                    f"on an arbitrary one.",
-                )
-            match = aliased[0] if aliased else None
+        match = next((h for h in hosts if h.get("service") == target), None)
         if not match:
             raise HTTPException(
                 412,

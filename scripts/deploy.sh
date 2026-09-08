@@ -3,7 +3,9 @@
 #
 #   ./scripts/deploy.sh            # lab tier (hosts + alarms)
 #   ./scripts/deploy.sh waste      # waste tier (cost/security findings)
-#   ./scripts/deploy.sh both
+#   ./scripts/deploy.sh db         # db tier (a PostgreSQL host + its alarms)
+#   ./scripts/deploy.sh both       # lab + waste
+#   ./scripts/deploy.sh all        # lab + waste + db
 #
 # By default the stack creates its own isolated VPC, so you do not need to know
 # or choose a network - and the lab cannot land in one you care about.
@@ -86,11 +88,47 @@ deploy_waste() {
     --query 'Stacks[0].Outputs[?OutputKey==`ManualStepRequired`].OutputValue' --output text 2>/dev/null | sed 's/^/  /'
 }
 
+deploy_db() {
+  c_hd "Deploying db tier (about 5 minutes)"
+  local doverrides=() vpc sub sg
+  if [ -n "${VPC_ID:-}" ]; then
+    vpc="$VPC_ID"; sub="$SUBNET_ID"
+  else
+    vpc=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
+          --query 'Stacks[0].Outputs[?OutputKey==`VpcUsed`].OutputValue' --output text 2>/dev/null)
+    [ -z "$vpc" ] || [ "$vpc" = "None" ] && { echo "Deploy the lab tier first, or set VPC_ID/SUBNET_ID"; return 1; }
+    sub=$(aws ec2 describe-subnets --region "$REGION" \
+          --filters "Name=vpc-id,Values=$vpc" --query 'Subnets[0].SubnetId' --output text 2>/dev/null)
+  fi
+  # Give 5432 to the lab hosts only. Empty is fine - every db scenario runs on
+  # the database host itself over the local socket, so an unreachable port
+  # costs nothing except the cross-host connection scenarios.
+  sg=$(aws ec2 describe-security-groups --region "$REGION" \
+       --filters "Name=vpc-id,Values=$vpc" "Name=group-name,Values=${STACK}-hosts" \
+       --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+  [ "$sg" = "None" ] && sg=""
+  doverrides+=("VpcId=${vpc}" "SubnetId=${sub}" "LabStackName=${STACK}")
+  [ -n "$sg" ] && doverrides+=("ClientSecurityGroupId=${sg}")
+  aws cloudformation deploy \
+    --template-file "$ROOT/infra/cloudformation/db.yaml" \
+    --stack-name "${STACK}-db" \
+    --region "$REGION" \
+    --capabilities CAPABILITY_IAM \
+    --parameter-overrides "${doverrides[@]}"
+  c_ok "db tier deployed"
+  c_dim "  PostgreSQL takes a further minute to initialise and start publishing metrics."
+  aws cloudformation describe-stacks --stack-name "${STACK}-db" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`DbHostId`||OutputKey==`DbPrivateIp`].[OutputKey,OutputValue]' \
+    --output text 2>/dev/null | sed 's/^/  /'
+}
+
 case "$WHAT" in
   lab)   deploy_lab ;;
   waste) deploy_waste ;;
+  db)    deploy_db ;;
   both)  deploy_lab; deploy_waste ;;
-  *) echo "usage: $0 [lab|waste|both]"; exit 1 ;;
+  all)   deploy_lab; deploy_waste; deploy_db ;;
+  *) echo "usage: $0 [lab|waste|db|both|all]"; exit 1 ;;
 esac
 
 c_hd "Next"
@@ -98,3 +136,4 @@ echo "  ./scripts/run-local.sh      then open http://127.0.0.1:8080"
 c_dim "  Hosts take a minute or two to register with SSM; the UI enables Start on its own."
 c_hd "Teardown"
 c_dim "  aws cloudformation delete-stack --stack-name $STACK --region $REGION"
+c_dim "  aws cloudformation delete-stack --stack-name ${STACK}-db --region $REGION      # if deployed"

@@ -31,10 +31,62 @@ But they only ever touch the servers this lab creates, and:
 
 ## What it costs
 
-About **$19 a month** if you leave it running — roughly the price of two
-coffees. Most of that is two small servers.
+You choose how much of the lab to build. Only the first part is required.
 
-You'll almost certainly delete it the same day. A few hours costs cents.
+| Part | What it adds | Cost if left running |
+|---|---|---|
+| **Lab** (required) | Two small servers, eight scenarios | ~$19/month |
+| Database | One PostgreSQL server, six more scenarios | +$15/month |
+| Services | Three servers that depend on each other | +$60/month |
+| Load balancer | A front door that can be cut off | +$18/month |
+
+Everything: about **$110 a month**. Just the lab: about **$19**, roughly two
+coffees.
+
+You'll almost certainly delete it the same day, and a few hours costs cents —
+but the numbers above are what you pay if you forget. Deleting is one command
+and billing stops immediately.
+
+---
+
+## Before you start
+
+You need three things on your machine. If any are missing, the first command
+fails with something like `command not found` — that's this, not a broken lab.
+
+**1. The AWS command line tool.**
+[Install it here](https://aws.amazon.com/cli/), then check it worked:
+
+```bash
+aws --version
+```
+
+**2. AWS credentials.** Run `aws configure` and paste in the access key and
+secret for a **test or sandbox account** — not production. Then check:
+
+```bash
+aws sts get-caller-identity
+```
+
+That should print an account number. If it prints an error, the credentials
+aren't set up yet and nothing else will work.
+
+**3. Python 3.9 or newer**, for the control panel:
+
+```bash
+python3 --version
+```
+
+Macs and most Linux machines already have it.
+
+**On Windows?** Use WSL (Windows Subsystem for Linux) and follow the Linux
+steps inside it. The scripts are shell scripts and won't run in PowerShell.
+
+**One more thing, and it's the one people miss:** this AWS account has to be
+connected to NudgeBee already, or you'll break things correctly and see nothing.
+`./scripts/preflight.sh` checks that for you and says so plainly. If it reports
+the account isn't connected, connect it in NudgeBee first — the lab has no way
+to do that for you.
 
 ---
 
@@ -108,6 +160,21 @@ Everything the lab created disappears. Nothing is left behind and billing stops.
 | Service failure | A service fails to start and keeps retrying forever |
 | Zombie processes | Hundreds of stuck processes pile up |
 
+With the services tier deployed, three more — and these are the ones worth
+showing, because the fault and the symptom are on different machines:
+
+| Scenario | What it looks like |
+|---|---|
+| Service failure cascade | One service stops and two others start failing behind it |
+| Database outage | The database stops; three applications break at once |
+| Order loses its database | One service can't reach its database, and everything downstream burns CPU retrying |
+
+With the load balancer tier, one more:
+
+| Scenario | What it looks like |
+|---|---|
+| Security group blocks the load balancer | Customers get errors while the server sits idle, healthy, and serving perfectly to anything on the box |
+
 With the database tier deployed, six more:
 
 | Scenario | What it looks like |
@@ -149,6 +216,42 @@ One thing to know: the oversized-server finding needs a few days of history
 before it appears. That's expected, not a fault.
 
 ---
+
+## The services tier (optional)
+
+```bash
+./scripts/deploy.sh services
+```
+
+Three servers that genuinely depend on each other — order, payment and
+inventory — plus a database they all use. Adds about $60/month.
+
+**This is the tier that shows the hardest thing.** Everything in the base lab
+breaks one server, and the answer is on that server. Here, breaking the database
+makes three *other* machines start alarming, and the machine you need to fix is
+the one that isn't complaining loudest. Three CPU alarms, one cause.
+
+The obvious wrong answer is "three servers are overloaded, give them more CPU".
+They're overloaded because they're retrying something that isn't answering.
+
+## The load balancer tier (optional)
+
+```bash
+./scripts/deploy.sh lb
+```
+
+Puts a load balancer in front of the order service, so there's a front door that
+can be cut off. Adds about $18/month — this one bills whether or not you run
+anything, so delete it when you're done.
+
+Deploy the services tier first.
+
+**Why it's worth the extra step.** The single scenario here removes one firewall
+rule. Customers immediately get errors. Meanwhile the server is idle, healthy,
+and answering perfectly to anything already on it — every health check you'd
+normally run says fine. Nothing is wrong with the machine; the path to it is
+gone. Restarting the service, which is what most people try first, changes
+nothing at all.
 
 ## The database tier (optional)
 

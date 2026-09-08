@@ -18,11 +18,40 @@ export CATALOGUE_PATH="$ROOT/scenarios/catalogue.yaml"
 export WEB_DIR="$ROOT/control/web"
 export INFRA_DIR="$ROOT/infra/cloudformation"
 
+PY="${PYTHON:-python3}"
+
+if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+  echo "This needs Python 3.9 or newer. Found: $("$PY" --version 2>&1)"
+  echo "Set PYTHON=/path/to/python3 if you have another one installed."
+  exit 1
+fi
+
+# A virtualenv is bound to the interpreter that made it. Upgrading Python leaves
+# .venv pointing at an interpreter that may no longer exist, and the failure is a
+# missing-module error from inside the venv rather than anything naming Python -
+# so rebuild instead of making someone work that out.
+if [ -d "$VENV" ] && ! "$VENV/bin/python" --version >/dev/null 2>&1; then
+  echo "Existing .venv was built with a Python that no longer works. Rebuilding."
+  rm -rf "$VENV"
+fi
+
 if [ ! -d "$VENV" ]; then
-  echo "Creating virtualenv at .venv"
-  python3 -m venv "$VENV"
+  echo "Creating virtualenv at .venv ($("$PY" --version 2>&1))"
+  "$PY" -m venv "$VENV"
   "$VENV/bin/pip" install --quiet --upgrade pip
-  "$VENV/bin/pip" install --quiet -r "$ROOT/control/requirements.txt"
+  # Not --quiet: when a dependency has no wheel for this interpreter, pip falls
+  # back to building from source and the compiler error is the only useful
+  # explanation. Swallowing it leaves "install failed" and nothing to act on.
+  if ! "$VENV/bin/pip" install -r "$ROOT/control/requirements.txt"; then
+    echo
+    echo "Dependency install failed on $("$PY" --version 2>&1)."
+    echo "Usually this means a package has no prebuilt wheel for this Python yet."
+    echo "Either use an older Python (PYTHON=python3.12 ./scripts/run-local.sh)"
+    echo "or report it - the requirements take minimum versions, so a newer"
+    echo "release that supports this interpreter should be picked up on its own."
+    rm -rf "$VENV"
+    exit 1
+  fi
 fi
 
 echo "Stack:  $SCENARIO_LAB_STACK"

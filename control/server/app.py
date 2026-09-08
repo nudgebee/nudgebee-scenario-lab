@@ -26,6 +26,7 @@ from pathlib import Path
 
 import boto3
 import yaml
+from botocore.config import Config
 from botocore.exceptions import ClientError, NoCredentialsError
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -58,12 +59,27 @@ def template_path(tier: str) -> Path:
 def stack_name_for(tier: str) -> str:
     return STACK if tier == "lab" else f"{STACK}-waste"
 
-ssm = boto3.client("ssm", region_name=REGION)
-ec2 = boto3.client("ec2", region_name=REGION)
-cw = boto3.client("cloudwatch", region_name=REGION)
-sts = boto3.client("sts", region_name=REGION)
-iam = boto3.client("iam", region_name=REGION)
-cfn = boto3.client("cloudformation", region_name=REGION)
+# The page polls /api/setup, /api/scenarios, /api/alarms and /api/findings on a
+# timer, and most of those make two AWS calls each. FastAPI runs these sync
+# handlers on a 40-thread pool, but botocore defaults to 10 pooled connections
+# per client - so past ~10 concurrent calls the rest queue on the connection
+# pool and the UI looks dead while the process is healthy and idle. Raising the
+# pool to match the thread pool is the fix; the timeouts stop a single wedged
+# AWS call from holding a connection forever.
+_boto = Config(
+    region_name=REGION,
+    max_pool_connections=50,
+    connect_timeout=5,
+    read_timeout=20,
+    retries={"max_attempts": 3, "mode": "standard"},
+)
+
+ssm = boto3.client("ssm", config=_boto)
+ec2 = boto3.client("ec2", config=_boto)
+cw = boto3.client("cloudwatch", config=_boto)
+sts = boto3.client("sts", config=_boto)
+iam = boto3.client("iam", config=_boto)
+cfn = boto3.client("cloudformation", config=_boto)
 
 app = FastAPI(title="NudgeBee Scenario Lab")
 
@@ -470,6 +486,116 @@ def findings_endpoint():
     }
 
 
+def lab_security_group(name_suffix: str) -> str:
+    """Resolve a lab security group by its Name tag. Returns the group id.
+
+    Looked up rather than configured because the stack is redeployable: a hardcoded
+    id survives exactly until someone rebuilds the lab, and then the scenario
+    revokes a rule on a group that no longer exists - or worse, on one that has been
+    reissued to something else.
+    """
+    resp = ec2.describe_security_groups(
+        Filters=[
+            {"Name": "tag:nudgebee-scenario-lab", "Values": ["true"]},
+            {"Name": "tag:Name", "Values": [name_suffix]},
+        ]
+    )
+    groups = resp.get("SecurityGroups", [])
+    if len(groups) != 1:
+        raise HTTPException(
+            412,
+            f"expected exactly one security group tagged Name={name_suffix}, found "
+            f"{len(groups)} - is the load balancer tier deployed "
+            f"(infra/cloudformation/lb.yaml)?",
+        )
+    return groups[0]["GroupId"]
+
+
+def revoke_alb_ingress(params: dict) -> dict:
+    """Remove the ALB -> service ingress rule and return what is needed to restore it.
+
+    The undo is computed BEFORE the change and stored in state, not reconstructed at
+    cleanup time. Reconstructing it means re-reading a group whose rule has already
+    been deleted and guessing what it used to be; if that guess is wrong the lab is
+    left broken in a way nobody notices until the next demo.
+    """
+    host_sg = lab_security_group(params.get("host_sg_name", f"{STACK}-hosts"))
+    alb_sg = lab_security_group(params.get("alb_sg_name", f"{STACK}-alb"))
+    port = int(params.get("port", 8081))
+
+    permission = {
+        "IpProtocol": "tcp",
+        "FromPort": port,
+        "ToPort": port,
+        "UserIdGroupPairs": [{"GroupId": alb_sg}],
+    }
+    try:
+        ec2.revoke_security_group_ingress(GroupId=host_sg, IpPermissions=[permission])
+    except ClientError as exc:
+        raise HTTPException(502, f"failed to revoke ALB ingress: {exc}") from exc
+
+    return {"host_sg": host_sg, "alb_sg": alb_sg, "port": port}
+
+
+def restore_alb_ingress(undo: dict) -> None:
+    """Put the rule back. Idempotent: a duplicate rule is success, not a failure."""
+    # Description belongs to the group PAIR, not to the permission. At the
+    # permission level botocore rejects it as an unknown parameter, and the
+    # failure surfaces as a 500 on stop - which is the one code path that must
+    # not fail, because nothing else puts the rule back.
+    permission = {
+        "IpProtocol": "tcp",
+        "FromPort": undo["port"],
+        "ToPort": undo["port"],
+        "UserIdGroupPairs": [
+            {
+                "GroupId": undo["alb_sg"],
+                "Description": "ALB to order service - restored by scenario cleanup",
+            }
+        ],
+    }
+    try:
+        ec2.authorize_security_group_ingress(
+            GroupId=undo["host_sg"], IpPermissions=[permission]
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "InvalidPermission.Duplicate":
+            return
+        raise
+
+
+# Cloud-config faults, by name. Each returns the state needed to undo it.
+CLOUD_SCENARIOS = {
+    "revoke_alb_ingress": (revoke_alb_ingress, restore_alb_ingress),
+}
+
+
+def start_cloud_scenario(scenario_id: str, scenario: dict, seconds: int, state: dict):
+    action = scenario.get("action")
+    if action not in CLOUD_SCENARIOS:
+        raise HTTPException(400, f"{scenario_id}: unknown cloud action {action!r}")
+    apply_fn, _ = CLOUD_SCENARIOS[action]
+
+    undo = apply_fn(scenario.get("params") or {})
+
+    started = now()
+    state[scenario_id] = {
+        "kind": "aws",
+        "action": action,
+        "undo": undo,
+        # No instance: the fault is in the network, not on a machine. Recorded
+        # explicitly so the sweeper and /api/stop do not try to cancel an SSM
+        # command that was never sent.
+        "instance_id": None,
+        "command_id": None,
+        "started": started.isoformat(),
+        "expires": (started + timedelta(seconds=seconds + 60)).isoformat(),
+        "seconds": seconds,
+    }
+    write_state(state)
+    return {"started": scenario_id, "instance_id": None, "seconds": seconds, "kind": "aws"}
+
+
 @app.post("/api/start")
 def start(req: StartRequest):
     cat = load_catalogue()
@@ -509,6 +635,17 @@ def start(req: StartRequest):
     state = read_state()
     if req.scenario_id in state:
         raise HTTPException(409, f"{req.scenario_id} is already running")
+
+    # A cloud-config fault is not something a host can do to itself, and it should
+    # not be. Breaking a security group from inside the instance would mean giving
+    # every lab host permission to rewrite the network it sits in - a genuinely bad
+    # pattern to leave lying around in an environment customers look at, and one
+    # that would be the most alarming thing in the template.
+    #
+    # These run here instead, against the control plane's own credentials: the same
+    # place a human would make the change, and the same audit trail.
+    if scenario.get("kind") == "aws":
+        return start_cloud_scenario(req.scenario_id, scenario, seconds, state)
 
     body = scenario["command"].replace("{{seconds}}", str(seconds))
     try:
@@ -572,6 +709,19 @@ def stop(scenario_id: str):
     entry = state.pop(scenario_id, None)
     if not entry:
         raise HTTPException(404, f"{scenario_id} is not running")
+
+    # A cloud fault has no SSM command to cancel and no host to clean up; its undo
+    # is the stored inverse of what was applied. Writing state back only after the
+    # undo succeeds matters here in a way it does not for the SSM path: an SSM
+    # scenario self-terminates on its own timer even if we lose track of it, but a
+    # revoked security group stays revoked forever. Dropping it from state while
+    # the rule is still missing would strand the lab silently.
+    if entry.get("kind") == "aws":
+        _, undo_fn = CLOUD_SCENARIOS[entry["action"]]
+        undo_fn(entry["undo"])
+        write_state(state)
+        return {"stopped": scenario_id, "cleanup_dispatched": True, "kind": "aws"}
+
     try:
         ssm.cancel_command(CommandId=entry["command_id"], InstanceIds=[entry["instance_id"]])
     except ClientError:
@@ -604,6 +754,20 @@ def reset():
     state = read_state()
     stopped = []
     for sid, entry in list(state.items()):
+        # Reset means "put the lab back", and the host sweep below cannot do that
+        # for a fault that is not on a host. Without this, Reset reports success
+        # while the security group stays revoked - the lab looks clean and is not.
+        if entry.get("kind") == "aws":
+            try:
+                _, undo_fn = CLOUD_SCENARIOS[entry["action"]]
+                undo_fn(entry["undo"])
+            except Exception:
+                pass
+            stopped.append(sid)
+            continue
+        # command_id/instance_id are None for cloud entries, and passing None
+        # raises ParamValidationError rather than ClientError - which the handler
+        # below would not catch, taking the whole reset down with it.
         try:
             ssm.cancel_command(CommandId=entry["command_id"], InstanceIds=[entry["instance_id"]])
         except ClientError:
@@ -829,6 +993,21 @@ def sweeper() -> None:
             for sid, entry in list(state.items()):
                 expires = entry.get("expires")
                 if expires and now() >= datetime.fromisoformat(expires):
+                    # A cloud fault has no self-terminating command behind it. An SSM
+                    # scenario ends on its own timer even if this sweeper never runs;
+                    # a revoked security group does not. This is the only thing that
+                    # puts the rule back if the operator closes the tab, so it drops
+                    # the entry only once the undo has actually succeeded - otherwise
+                    # a transient AWS error would lose the undo and strand the lab.
+                    if entry.get("kind") == "aws":
+                        try:
+                            _, undo_fn = CLOUD_SCENARIOS[entry["action"]]
+                            undo_fn(entry["undo"])
+                        except Exception:
+                            continue
+                        state.pop(sid, None)
+                        changed = True
+                        continue
                     try:
                         ssm.cancel_command(
                             CommandId=entry["command_id"],

@@ -511,6 +511,41 @@ scenarios:
 # ---------------------------------------------------------------------------
 
 
+  # The first scenario whose fault is not on a machine. `kind: aws` runs it through
+  # the control plane's own credentials instead of SSM, so no lab host needs
+  # permission to rewrite the network it sits in.
+  - id: alb_sg_block
+    name: Security group blocks the load balancer
+    tier: services
+    kind: aws
+    action: revoke_alb_ingress
+    params:
+      port: 8081
+    signal: alb-unhealthy
+    requires:
+      iam: [ec2:RevokeSecurityGroupIngress, ec2:AuthorizeSecurityGroupIngress, ec2:DescribeSecurityGroups]
+      binaries: []
+      metric: AWS/ApplicationELB UnHealthyHostCount
+    default_seconds: 600
+    expect_alarm_secs: 120
+    teaches: >
+      The case every host-level check gets wrong. The order host is untouched: CPU
+      flat, memory fine, the process up, /health returning 200 to anything on the
+      box. Nothing is wrong with the machine. But the security group no longer
+      admits the load balancer, so the ALB has no healthy target and clients get
+      5xx from the balancer itself - no application ever logs an error, because no
+      request reaches an application.
+
+      An investigation that only reads the instance will conclude the service is
+      healthy and stop. Reaching the answer requires noticing that the failing
+      component is the path, and the evidence is a security group rule that used
+      to exist. Contrast the host's own alarms, which stay green throughout, with
+      the ALB alarms, which do not.
+    naive_answer: "The order service is down - restart it."
+    # No command and no cleanup: an SSM scenario self-terminates on its own timer,
+    # but a revoked rule stays revoked. The undo is computed before the change,
+    # stored in state, and applied by /api/stop or the expiry sweeper.
+
 findings:
 
   - id: unattached_ebs_volume

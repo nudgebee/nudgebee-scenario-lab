@@ -197,6 +197,13 @@ Resources:
           runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
           CREATE DATABASE labdb;
           SQL
+          # NOT the same database as the services tier. That tier builds its own
+          # PostgreSQL host with a role also called labapp, a different password
+          # and an `orders` table; this one has `lab_accounts`. They are separate
+          # on purpose and are not interchangeable - pointing a services host at
+          # this database fails authentication and then fails on a missing table,
+          # and the services would burn CPU retrying forever without ever saying
+          # why.
           runuser -u postgres -- psql -d labdb -v ON_ERROR_STOP=1 <<'SQL'
           CREATE TABLE IF NOT EXISTS lab_accounts (id int PRIMARY KEY, balance numeric NOT NULL);
           INSERT INTO lab_accounts VALUES (1, 100), (2, 100)

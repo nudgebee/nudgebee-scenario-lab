@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  NudgeBee scenario lab - load balancer tier.
+
+  Puts an ALB in front of the order service so the lab has a network path that can
+  break independently of the hosts. Every existing scenario breaks something ON a
+  machine: CPU, memory, disk, a process, a database. Those are all answered by
+  looking at the machine. A security group is the opposite case - the host stays
+  perfectly healthy, every host-level check passes, and the service is still
+  unreachable. That is the case operators get wrong, and the lab could not
+  produce it.
+
+  SEPARATE STACK ON PURPOSE. An ALB bills whether or not anyone runs a scenario
+  (~$16/mo + LCU); everything else in this lab is instance-hours already being
+  paid for. Keeping it apart means `delete-stack` on this one stops that cost
+  without taking order, payment and inventory down with it. It also means
+  deploying it cannot update the stack that holds the running service hosts.
+
+Parameters:
+  LabStackName:
+    Type: String
+    Default: nudgebee-scenario-lab
+    Description: >
+      LOAD-BEARING. Imports VpcId/SubnetId/SecurityGroupId from this stack, and
+      names the alarms '<LabStackName>-host-alb-<signal>' so the control panel
+      finds them - it lists alarms by the prefix '<STACK>-host-' and matches a
+      scenario's `signal` as a NAME SUFFIX.
+
+  OrderInstanceId:
+    Type: AWS::EC2::Instance::Id
+    Description: >
+      The order host, from the services tier's OrderHostId output. Passed as a
+      parameter rather than imported so the services stack needs no edit - it
+      holds four running instances and there is no reason to update it to add a
+      load balancer in front.
+
+  SecondSubnetCidr:
+    Type: String
+    Default: 10.42.1.0/24
+    Description: >
+      An ALB requires subnets in two availability zones. The lab is single-subnet,
+      so this adds the second. No instance goes in it - it exists only to satisfy
+      that requirement, and the targets all stay in the original AZ.
+
+  SecondAvailabilityZone:
+    Type: String
+    Default: us-east-1b
+    Description: Must differ from the AZ the lab subnet is in.
+
+  AllowedClientCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      Who may reach the load balancer on port 80. Open by default because the
+      point is a reachable front door to demonstrate losing. Narrow it to an
+      office range if this lab is long-lived.
+
+  OrderServicePort:
+    Type: Number
+    Default: 8081
+    Description: The port the order service listens on. Its /health returns 503 when its own dependencies are down, so the target group tracks real health rather than "is the process alive".
+
+Resources:
+
+  # ---------------------------------------------------------------- Network
+
+  SecondSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: { 'Fn::ImportValue': !Sub '${LabStackName}-VpcId' }
+      CidrBlock: !Ref SecondSubnetCidr
+      AvailabilityZone: !Ref SecondAvailabilityZone
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${LabStackName}-subnet-b' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # No explicit route table association: the lab's subnet uses the VPC's MAIN
+  # route table (which carries the 0.0.0.0/0 -> IGW route), and a new subnet
+  # associates with the main table by default. Creating a second table here would
+  # give the ALB a subnet with no internet route and it would never come up.
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NudgeBee scenario lab ALB - public 80 in, order service out
+      VpcId: { 'Fn::ImportValue': !Sub '${LabStackName}-VpcId' }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedClientCidr
+          Description: HTTP from clients
+      Tags:
+        - { Key: Name, Value: !Sub '${LabStackName}-alb' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # THE BREAKABLE DEPENDENCY. This single rule is the whole point of the tier:
+  # revoke it and the ALB can no longer reach the order service, targets go
+  # unhealthy, clients get 5xx - while the host itself is untouched and every
+  # host-level check keeps passing. Kept as its own resource, separate from the
+  # host security group in lab.yaml, so a scenario can remove and restore it
+  # without CloudFormation drift on another stack.
+  HostIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: { 'Fn::ImportValue': !Sub '${LabStackName}-SecurityGroupId' }
+      IpProtocol: tcp
+      FromPort: !Ref OrderServicePort
+      ToPort: !Ref OrderServicePort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: !Sub 'ALB to order service on ${OrderServicePort} - scenario alb_sg_block revokes this'
+
+  # ---------------------------------------------------------------- Load balancer
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${LabStackName}-order'
+      VpcId: { 'Fn::ImportValue': !Sub '${LabStackName}-VpcId' }
+      Port: !Ref OrderServicePort
+      Protocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref OrderInstanceId
+          Port: !Ref OrderServicePort
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      # Deliberately fast. The default 30s interval with 5 unhealthy checks means
+      # two and a half minutes before a fault is visible, which is long enough for
+      # someone watching a demo to assume nothing happened.
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${LabStackName}-alb'
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [ !Ref AlbSecurityGroup ]
+      Subnets:
+        - { 'Fn::ImportValue': !Sub '${LabStackName}-SubnetId' }
+        - !Ref SecondSubnet
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------- Alarms
+
+  # UnHealthyHostCount is the signal that distinguishes this fault class from a
+  # host fault: it says the load balancer cannot get a healthy answer, which is
+  # true whether the service died OR the path to it was closed. The host's own
+  # alarms stay green throughout an SG block, and that contrast is the lesson.
+  AlbUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LabStackName}-host-alb-unhealthy'
+      AlarmDescription: The load balancer has no healthy target for the order service
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # A target with no healthy hosts answers 5xx from the balancer itself, not from
+  # the application - so this fires even though no application logged an error.
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LabStackName}-host-alb-5xx'
+      AlarmDescription: The load balancer is returning 5xx for the order service
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  AlbDnsName:
+    Description: Front door for the lab application - curl this to see the fault as a client does
+    Value: !GetAtt Alb.DNSName
+  AlbSecurityGroupId:
+    Description: Source group in the rule that alb_sg_block revokes
+    Value: !Ref AlbSecurityGroup
+  HostSecurityGroupId:
+    Description: Group the rule lives on - the scenario revokes ALB->order here
+    Value: { 'Fn::ImportValue': !Sub '${LabStackName}-SecurityGroupId' }
+  OrderServicePort:
+    Value: !Ref OrderServicePort
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  AlarmPrefix:
+    Description: Alarms are named after the lab stack so the control panel finds them
+    Value: !Sub '${LabStackName}-host-alb-'

@@ -1,0 +1,187 @@
+{
+  "name": "DB Diagnostics PostgreSQL EC2",
+  "ai_invocable": true,
+  "definition": {
+    "inputs": [
+      {
+        "id": "integration_name",
+        "type": "string",
+        "default": "",
+        "description": "Name of the database integration to query (resolved by name, not id). Create it in NudgeBee against the lab database on the db tier host (database labdb, user labapp)."
+      },
+      {
+        "id": "event_id",
+        "type": "string",
+        "default": "",
+        "description": "Event to attach to on a manual run. Empty on an event-triggered run — the triggering event is used."
+      }
+    ],
+    "tasks": [
+      {
+        "id": "check_connectivity",
+        "type": "dbms.query",
+        "layout": {
+          "x": -500,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT 1 AS ok,\n       current_database()                       AS database,\n       current_user                             AS connected_as,\n       pg_is_in_recovery()                      AS in_recovery,\n       pg_postmaster_start_time()               AS started_at,\n       date_trunc('second', now() - pg_postmaster_start_time()) AS uptime,\n       substring(version() from 'PostgreSQL [0-9.]+') AS server_version,\n       pg_has_role(current_user, 'pg_monitor', 'member') AS has_pg_monitor",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "check_resource_utilisation",
+        "type": "dbms.query",
+        "layout": {
+          "x": -140,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections,\n       count(*)                                                        AS total_connections,\n       count(*) FILTER (WHERE state = 'active')                        AS active,\n       count(*) FILTER (WHERE state = 'idle')                          AS idle,\n       count(*) FILTER (WHERE state = 'idle in transaction')           AS idle_in_transaction,\n       count(*) FILTER (WHERE wait_event_type = 'Lock')                AS waiting_on_lock,\n       round(100.0 * count(*)\n             / (SELECT setting::numeric FROM pg_settings WHERE name = 'max_connections'), 1)\n                                                                       AS pct_of_max\nFROM pg_stat_activity",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "check_blocking_sessions",
+        "type": "dbms.query",
+        "layout": {
+          "x": 220,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT pid,\n       usename                                   AS username,\n       application_name,\n       client_addr,\n       state,\n       wait_event_type,\n       wait_event,\n       date_trunc('second', now() - xact_start)  AS transaction_age,\n       date_trunc('second', now() - query_start) AS query_age,\n       cardinality(pg_blocking_pids(pid))        AS blocker_count,\n       pg_blocking_pids(pid)                     AS blocked_by,\n       left(regexp_replace(query, '\\s+', ' ', 'g'), 200) AS query\nFROM pg_stat_activity\nWHERE pid <> pg_backend_pid()\n  AND state <> 'idle'\n  AND (now() - query_start > interval '30 seconds'\n       OR cardinality(pg_blocking_pids(pid)) > 0)\nORDER BY blocker_count DESC, query_age DESC NULLS LAST\nLIMIT 20",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "check_replication",
+        "type": "dbms.query",
+        "layout": {
+          "x": 580,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT pg_is_in_recovery() AS is_replica,\n       (SELECT count(*) FROM pg_stat_replication)                    AS connected_standbys,\n       (SELECT count(*) FROM pg_replication_slots WHERE NOT active)  AS inactive_slots,\n       (SELECT coalesce(max(round(EXTRACT(epoch FROM write_lag)::numeric, 2)), 0)\n          FROM pg_stat_replication)                                  AS max_write_lag_s,\n       (SELECT coalesce(max(round(EXTRACT(epoch FROM replay_lag)::numeric, 2)), 0)\n          FROM pg_stat_replication)                                  AS max_replay_lag_s,\n       CASE WHEN pg_is_in_recovery()\n            THEN round(EXTRACT(epoch FROM (now() - pg_last_xact_replay_timestamp()))::numeric, 2)\n       END                                                           AS replica_lag_s",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "check_storage",
+        "type": "dbms.query",
+        "layout": {
+          "x": 940,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT current_setting('data_directory')                      AS data_directory,\n       pg_size_pretty(pg_database_size(current_database()))    AS database_size,\n       pg_database_size(current_database())                    AS database_size_bytes,\n       (SELECT count(*) FROM pg_ls_waldir())                   AS wal_file_count,\n       (SELECT pg_size_pretty(coalesce(sum(size), 0)) FROM pg_ls_waldir()) AS wal_size,\n       current_setting('max_wal_size')                         AS max_wal_size,\n       (SELECT string_agg(t, ', ' ORDER BY t)\n          FROM (SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname)\n                       || ' (' || pg_size_pretty(c.relpages::bigint\n                                * current_setting('block_size')::bigint)\n                       || ', estimated)' AS t\n                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n                WHERE c.relkind IN ('r','m')\n                  AND n.nspname NOT IN ('pg_catalog','information_schema')\n                ORDER BY c.relpages DESC\n                LIMIT 5) s)                                    AS largest_tables",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "check_database_errors",
+        "type": "dbms.query",
+        "layout": {
+          "x": 1300,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT datname                                   AS database,\n       xact_commit,\n       xact_rollback,\n       deadlocks,\n       conflicts,\n       temp_files,\n       pg_size_pretty(temp_bytes)                AS temp_bytes,\n       blks_read,\n       blks_hit,\n       round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2) AS cache_hit_pct,\n       round(100.0 * xact_rollback / nullif(xact_commit + xact_rollback, 0), 2) AS rollback_pct,\n       stats_reset\nFROM pg_stat_database\nWHERE datname = current_database()",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "attach_evidence",
+        "if": "{% if Inputs.event_id or Inputs.event %}true{% else %}false{% endif %}",
+        "type": "events.add_evidence",
+        "layout": {
+          "x": 400,
+          "y": 460
+        },
+        "params": {
+          "event_id": "{% if Inputs.event_id %}{{ Inputs.event_id }}{% else %}{{ Inputs.event.id }}{% endif %}",
+          "evidences": [
+            {
+              "data": "## PostgreSQL diagnostics — {{ Inputs.integration_name }}\n\n**Connectivity and server identity**\n\n```json\n{{ Tasks.check_connectivity.output.data | default('(check failed)') }}\n```\n\n**Connection pressure and session mix**\n\n```json\n{{ Tasks.check_resource_utilisation.output.data | default('(check failed)') }}\n```\n\n**Blocking chains and long-running queries**\n\n```json\n{{ Tasks.check_blocking_sessions.output.data | default('(check failed)') }}\n```\n\n**Replication role and lag**\n\n```json\n{{ Tasks.check_replication.output.data | default('(check failed)') }}\n```\n\n**Database, WAL and largest relations**\n\n```json\n{{ Tasks.check_storage.output.data | default('(check failed)') }}\n```\n\n**Error, deadlock and contention counters**\n\n```json\n{{ Tasks.check_database_errors.output.data | default('(check failed)') }}\n```\n",
+              "type": "markdown",
+              "title": "Database diagnostics",
+              "insight": [],
+              "additional_info": {
+                "title": "Database diagnostics",
+                "action_name": "db_diagnostics",
+                "actual_action_name": "text_enricher"
+              }
+            }
+          ]
+        },
+        "depends_on": [
+          "check_connectivity",
+          "check_resource_utilisation",
+          "check_blocking_sessions",
+          "check_replication",
+          "check_storage",
+          "check_database_errors"
+        ]
+      }
+    ],
+    "layout": {
+      "viewport": {
+        "x": 349.5,
+        "y": 132.25,
+        "zoom": 0.75
+      }
+    },
+    "timeout": "5m",
+    "version": "v1",
+    "triggers": [
+      {
+        "type": "event",
+        "layout": {
+          "x": 210,
+          "y": 100
+        },
+        "params": {
+          "on": "event.created",
+          "filter": "{{ event.subject_type == \"compute-instance\" and event.labels.aws_event_state == \"ALARM\" and event.labels.aws_event_metric_name in [\"pg_up\", \"pg_connections_pct\", \"pg_blocked_sessions\"] }}"
+        }
+      },
+      {
+        "type": "manual",
+        "layout": {
+          "x": 590,
+          "y": 100
+        }
+      }
+    ],
+    "retry_policy": {
+      "initial_interval": "1s",
+      "maximum_attempts": 3,
+      "maximum_interval": "1m",
+      "backoff_coefficient": 2
+    },
+    "llm_description": "Deterministic six-category diagnostic for a self-managed PostgreSQL host on EC2."
+  }
+}

@@ -26,6 +26,43 @@ Prefer them over composing CloudWatch, SSM or CloudTrail CLI calls by hand.
 For EC2 prefer ec2-investigation: CloudTrail cannot see what ran inside
 the instance.
 
+For a self-managed PostgreSQL host on EC2 there are three more. Host
+metrics cannot see inside a database, so neither of the two above will
+explain a pg_ alarm on their own.
+
+  DB Diagnostics PostgreSQL EC2
+    Six categories in one pass: connectivity, resource use, blocking
+    sessions, replication, storage, recent database errors. Start here
+    when the database itself is suspected.
+    Input: integration_name.
+
+  DB Connection Troubleshooting PostgreSQL EC2
+    For "cannot connect" specifically. Runs DNS and TCP from the client
+    host, evaluates security group and NACL rules, then checks server
+    availability, connection headroom and authentication failures, and
+    ranks a likely cause. Use it whenever the symptom is a failed
+    connection rather than a slow or erroring query.
+    Inputs: integration_name, db_host, db_port, db_instance_id,
+    client_instance_id, region, ssh_integration.
+
+  DB Log Analysis PostgreSQL EC2
+    PostgreSQL log lines for the incident window, errors grouped by
+    SQLSTATE and compared against a baseline period.
+    Inputs: log_group, region, incident_time.
+
+Reading a connection failure:
+Refused instantly and hanging until timeout are different faults with
+different owners. A refusal means something answered - the database is
+down or the port is closed on the host. A hang means the packets are not
+arriving, which is a network or firewall question and no amount of
+looking at the database will show it. Do not report both as
+"unreachable"; that discards the only detail that decides who fixes it.
+
+Two database faults raise no alarm at all: a filtered port and a rejected
+password are invisible to every host metric, and the server looks
+perfectly healthy throughout. "No alarm" is not evidence that the
+database is fine when a client is reporting connection errors.
+
 Choosing the window:
 The tool returns exactly the window you ask for. Nothing outside it is
 fetched. A cause precedes its effect, so start the window before the alarm

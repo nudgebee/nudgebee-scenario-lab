@@ -1,0 +1,358 @@
+{
+  "name": "DB Connection Troubleshooting PostgreSQL EC2",
+  "ai_invocable": true,
+  "definition": {
+    "inputs": [
+      {
+        "id": "integration_name",
+        "type": "string",
+        "default": "",
+        "description": "Database integration name (resolved by name, not id). Create it in NudgeBee against the lab database on the db tier host (database labdb, user labapp)."
+      },
+      {
+        "id": "db_host",
+        "type": "string",
+        "default": "",
+        "description": "Hostname or address the CLIENT uses to reach the database. The db tier stack's DbPrivateIp output."
+      },
+      {
+        "id": "db_port",
+        "type": "string",
+        "default": "5432",
+        "description": "Database port."
+      },
+      {
+        "id": "db_instance_id",
+        "type": "string",
+        "default": "",
+        "description": "EC2 instance id of the database host. The db tier stack's DbHostId output."
+      },
+      {
+        "id": "client_instance_id",
+        "type": "string",
+        "default": "",
+        "description": "EC2 instance id of the client that cannot connect. A lab host that connects to it - the lab stack's Host1Id output."
+      },
+      {
+        "id": "region",
+        "type": "string",
+        "default": "us-east-1",
+        "description": "AWS region."
+      },
+      {
+        "id": "ssh_integration",
+        "type": "string",
+        "default": "",
+        "description": "SSH integration on the CLIENT host. Empty disables client-vantage checks, and the verdict then says so rather than assuming the network is fine."
+      },
+      {
+        "id": "incident_time",
+        "type": "string",
+        "default": "",
+        "description": "Override incident time (ISO-8601) for manual runs."
+      },
+      {
+        "id": "event_id",
+        "type": "string",
+        "default": "",
+        "description": "Event to attach to on a manual run. Empty on an event-triggered run — the triggering event is used."
+      }
+    ],
+    "tasks": [
+      {
+        "id": "context",
+        "type": "aws.cli",
+        "layout": {
+          "x": -1040,
+          "y": 280
+        },
+        "params": {
+          "command": "ec2 describe-instances --instance-ids {{ Inputs.db_instance_id }} {{ Inputs.client_instance_id }} --query 'Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress,SubnetId:SubnetId,VpcId:VpcId,SGs:SecurityGroups[].GroupId,Profile:IamInstanceProfile.Arn}' --output json"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "ids",
+        "if": "true",
+        "type": "data.transform",
+        "layout": {
+          "x": 160,
+          "y": 460
+        },
+        "params": {
+          "input": "{\n  \"context\": {{ Tasks.context.output.data | default('') | to_json }},\n  \"db_instance_id\": \"{{ Inputs.db_instance_id }}\",\n  \"client_instance_id\": \"{{ Inputs.client_instance_id }}\"\n}",
+          "inputType": "json",
+          "expression": "function parse(s) { try { return JSON.parse(s); } catch (e) { return null; } }\n\nvar raw = parse(data.context) || [];\n// --query with a projection returns a flat list; tolerate the un-projected\n// Reservations shape too so a hand-edited command still works.\nvar list = [];\nif (raw.Reservations) {\n  for (var r = 0; r < raw.Reservations.length; r++) {\n    list = list.concat(raw.Reservations[r].Instances || []);\n  }\n} else { list = raw; }\n\nfunction find(id) {\n  for (var i = 0; i < list.length; i++) { if (list[i].InstanceId === id) { return list[i]; } }\n  return null;\n}\nfunction sgIds(inst) {\n  if (!inst) { return []; }\n  var g = inst.SGs || inst.SecurityGroups || [];\n  var out = [];\n  for (var i = 0; i < g.length; i++) { out.push(typeof g[i] === 'string' ? g[i] : g[i].GroupId); }\n  return out;\n}\n\nvar db = find(data.db_instance_id);\nvar client = find(data.client_instance_id);\nvar dbSgs = sgIds(db);\n\n({\n  found_db: !!db,\n  found_client: !!client,\n  db_state: db ? (db.State || db.StateName || '') : '',\n  db_ip: db ? (db.PrivateIp || db.PrivateIpAddress || '') : '',\n  db_subnet: db ? (db.SubnetId || '') : '',\n  db_sgs: dbSgs,\n  // Space-separated for the --group-ids argument; empty string would make the\n  // CLI list every group in the account, so a sentinel keeps it scoped to none.\n  db_sgs_arg: dbSgs.length ? dbSgs.join(' ') : 'sg-none',\n  db_subnet_arg: db && db.SubnetId ? db.SubnetId : 'subnet-none',\n  // Absent instance profile is the EC2 stand-in for \"IAM auth failure\": with no\n  // role the host cannot read its database credential out of Secrets Manager.\n  db_instance_profile: db ? (db.Profile || '') : '',\n  client_ip: client ? (client.PrivateIp || client.PrivateIpAddress || '') : '',\n  client_sgs: sgIds(client)\n})",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        },
+        "depends_on": [
+          "context"
+        ]
+      },
+      {
+        "id": "sg_rules",
+        "type": "aws.cli",
+        "layout": {
+          "x": 220,
+          "y": 640
+        },
+        "params": {
+          "command": "ec2 describe-security-groups --group-ids {{ Tasks.ids.output.data.db_sgs_arg }} --output json"
+        },
+        "depends_on": [
+          "ids"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "nacl_rules",
+        "type": "aws.cli",
+        "layout": {
+          "x": 580,
+          "y": 640
+        },
+        "params": {
+          "command": "ec2 describe-network-acls --filters Name=association.subnet-id,Values={{ Tasks.ids.output.data.db_subnet_arg }} --output json"
+        },
+        "depends_on": [
+          "ids"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "probe_dns",
+        "if": "{% if Inputs.ssh_integration %}true{% else %}false{% endif %}",
+        "type": "integrations.ssh",
+        "layout": {
+          "x": -560,
+          "y": 280
+        },
+        "params": {
+          "command": "getent hosts '{{ Inputs.db_host }}' 2>/dev/null || echo \"NXDOMAIN {{ Inputs.db_host }}\"",
+          "integration_id": "{{ Inputs.ssh_integration }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "probe_tcp",
+        "if": "{% if Inputs.ssh_integration %}true{% else %}false{% endif %}",
+        "type": "integrations.ssh",
+        "layout": {
+          "x": 400,
+          "y": 280
+        },
+        "params": {
+          "command": "rc=0; timeout 5 bash -c 'cat < /dev/null > /dev/tcp/{{ Inputs.db_host }}/{{ Inputs.db_port }}' 2>/dev/null || rc=$?\nif [ \"$rc\" -eq 0 ]; then echo TCP_OPEN\nelif [ \"$rc\" -eq 124 ]; then echo TCP_TIMEOUT\nelse echo TCP_REFUSED; fi",
+          "integration_id": "{{ Inputs.ssh_integration }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "db_availability",
+        "type": "dbms.query",
+        "layout": {
+          "x": 880,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT 1 AS ok,\n       current_database()                       AS database,\n       current_user                             AS connected_as,\n       pg_is_in_recovery()                      AS in_recovery,\n       pg_postmaster_start_time()               AS started_at,\n       date_trunc('second', now() - pg_postmaster_start_time()) AS uptime,\n       substring(version() from 'PostgreSQL [0-9.]+') AS server_version,\n       pg_has_role(current_user, 'pg_monitor', 'member') AS has_pg_monitor",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "db_capacity",
+        "type": "dbms.query",
+        "layout": {
+          "x": 1360,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT (SELECT setting::int FROM pg_settings WHERE name = 'max_connections')                AS max_connections,\n       (SELECT setting::int FROM pg_settings WHERE name = 'superuser_reserved_connections') AS superuser_reserved,\n       count(*)                                                                             AS total_connections,\n       count(*) FILTER (WHERE state = 'active')                                             AS active,\n       count(*) FILTER (WHERE state = 'idle')                                               AS idle,\n       count(*) FILTER (WHERE state = 'idle in transaction')                                AS idle_in_transaction,\n       (SELECT setting::int FROM pg_settings WHERE name = 'max_connections')\n         - (SELECT setting::int FROM pg_settings WHERE name = 'superuser_reserved_connections')\n         - count(*)                                                                         AS headroom_for_normal_users\nFROM pg_stat_activity",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "db_clients",
+        "type": "dbms.query",
+        "layout": {
+          "x": 1840,
+          "y": 280
+        },
+        "params": {
+          "command": "SELECT coalesce(host(client_addr), 'local') AS client_host,\n       usename                              AS username,\n       count(*)                             AS connections,\n       count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_transaction\nFROM pg_stat_activity\nWHERE backend_type = 'client backend'\nGROUP BY 1, 2\nORDER BY 3 DESC\nLIMIT 10",
+          "dbms_type": "postgresql",
+          "integration_id": "{{ Inputs.integration_name }}"
+        },
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "window",
+        "type": "data.transform",
+        "layout": {
+          "x": -80,
+          "y": 280
+        },
+        "params": {
+          "input": "{\"starts_at\": \"{{ Inputs.event.starts_at | default('') }}\", \"override\": \"{{ Inputs.incident_time | default('') }}\", \"lead_minutes\": 15}",
+          "inputType": "json",
+          "expression": "var lead = (data.lead_minutes || 15) * 60000;\nvar raw = data.override || data.starts_at || '';\nvar anchor = raw ? new Date(raw) : new Date();\nif (isNaN(anchor.getTime())) { anchor = new Date(); }\nvar now = new Date();\nvar incidentStart = new Date(anchor.getTime() - lead);\nvar incidentEnd = new Date(Math.min(now.getTime(), anchor.getTime() + 30 * 60000));\nfunction iso(d) { return d.toISOString().replace(/\\.\\d{3}Z$/, 'Z'); }\n({\n  anchor: iso(anchor),\n  incident_start: iso(incidentStart),\n  incident_end: iso(incidentEnd),\n  searched: 'incident ' + iso(incidentStart) + ' to ' + iso(incidentEnd)\n})",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        }
+      },
+      {
+        "id": "auth_log",
+        "type": "observability.logs",
+        "layout": {
+          "x": 640,
+          "y": 460
+        },
+        "params": {
+          "query": "fields @timestamp, @message\n| filter @message like /(28000|28P01|28[0-9A-Z]{3}|no pg_hba\\.conf entry|password authentication failed|role .* does not exist)/\n| sort @timestamp desc\n| limit 50",
+          "region": "{{ Inputs.region }}",
+          "duration": "",
+          "end_time": "{{ Tasks.window.output.data.incident_end }}",
+          "log_group": "/nudgebee/db/postgresql",
+          "start_time": "{{ Tasks.window.output.data.incident_start }}",
+          "account_provider_type": "aws"
+        },
+        "depends_on": [
+          "window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "consolidate",
+        "if": "true",
+        "type": "data.transform",
+        "layout": {
+          "x": 400,
+          "y": 820
+        },
+        "params": {
+          "input": "{\n  \"port\": \"5432\",\n  \"ranking\": [{\"id\": \"dns_failure\", \"all\": [\"dns_ran\", \"dns_failed\"], \"verdict\": \"critical\", \"cause\": \"DNS resolution failed on the client host\", \"remediation\": \"The client cannot resolve the database hostname. Check the VPC DHCP option set, the Route 53 private hosted zone association, and /etc/resolv.conf on the client.\"}, {\"id\": \"security_group_blocks_client\", \"all\": [\"sg_evaluated\", \"sg_denies_client\"], \"verdict\": \"critical\", \"cause\": \"No security group rule permits this client on the database port\", \"remediation\": \"Add an ingress rule to the database security group for the port, sourced from the client's security group (preferred) or its address.\"}, {\"id\": \"filtered_path\", \"all\": [\"tcp_ran\", \"tcp_timeout\", \"sg_allows_client\"], \"verdict\": \"critical\", \"cause\": \"Packets are dropped despite a permissive security group\", \"remediation\": \"The security group allows the client, so the drop is further out: check the subnet network ACL (NACLs are stateless and need the ephemeral return range), the route table, and any host firewall on the database.\"}, {\"id\": \"nothing_listening\", \"all\": [\"tcp_ran\", \"tcp_refused\"], \"verdict\": \"critical\", \"cause\": \"The port is reachable but refusing connections\", \"remediation\": \"The network path is fine and something actively refused. Check that PostgreSQL is running, and that listen_addresses and the port in postgresql.conf match what the client is dialing.\"}, {\"id\": \"server_saturated\", \"all\": [\"capacity_ran\", \"capacity_exhausted\"], \"verdict\": \"critical\", \"cause\": \"The server is at its connection limit\", \"remediation\": \"New non-superuser connections are being refused. See the per-client breakdown for the host holding them; a large idle-in-transaction count there is a leaked application pool, not a database problem.\"}, {\"id\": \"authentication_rejected\", \"all\": [\"auth_log_ran\", \"auth_errors_found\"], \"verdict\": \"warning\", \"cause\": \"The network path works and the server is rejecting credentials\", \"remediation\": \"Check the pg_hba.conf entry covering this client address and method, that the role exists, and that the credential the client is using matches the one in Secrets Manager.\"}, {\"id\": \"client_side_pool\", \"all\": [\"server_side_healthy\", \"client_vantage\"], \"verdict\": \"warning\", \"cause\": \"Every server-side check passed, so the fault is most likely in the client's connection pool\", \"remediation\": \"The database is reachable, accepting connections and has headroom, and the client can reach it. Look at the application's pool (max size, leak detection, acquisition timeout) \\u2014 pool exhaustion inside the application is invisible from the database.\"}, {\"id\": \"inconclusive_no_client_vantage\", \"all\": [\"server_side_healthy\"], \"verdict\": \"warning\", \"cause\": \"Server side is healthy; client-side checks did not run\", \"remediation\": \"No SSH integration was supplied, so DNS and reachability were never tested from the client. Install the agent on the client host and re-run before concluding the database is at fault.\"}],\n  \"ids\": {{ Tasks.ids.output.data | default('') | to_json }},\n  \"sg_rules\": {{ Tasks.sg_rules.output.data | default('') | to_json }},\n  \"dns\": {{ Tasks.probe_dns.output.data | default('') | to_json }},\n  \"tcp\": {{ Tasks.probe_tcp.output.data | default('') | to_json }},\n  \"availability\": {{ Tasks.db_availability.output.data | default('') | to_json }},\n  \"capacity\": {{ Tasks.db_capacity.output.data | default('') | to_json }},\n  \"clients\": {{ Tasks.db_clients.output.data | default('') | to_json }},\n  \"auth_log\": {{ Tasks.auth_log.output | default('') | to_json }},\n  \"searched\": \"{{ Tasks.window.output.data.searched | default('') }}\"\n}",
+          "inputType": "json",
+          "expression": "// to_json renders a STRING task output as a JSON string, but an OBJECT output\n// (observability.logs) as a JSON object — so by the time this runs, some inputs\n// are already decoded. JSON.parse on an object stringifies it to\n// \"[object Object]\" and throws, which silently reported a query that ran fine\n// as \"did not run\". Accept both shapes.\nfunction parse(s) {\n  if (s === null || s === undefined) { return null; }\n  if (typeof s === 'object') { return s; }\n  try { return JSON.parse(s); } catch (e) { return null; }\n}\n\n// A task that ran and one that was skipped by failure_policy=continue both\n// arrive as a value; only a non-empty parse means it actually produced data.\n// Conflating \"query failed\" with \"no rows\" is what turns a broken check into a\n// confident wrong verdict, so every fact below carries its own *_ran flag.\nfunction txt(s) { return (s === null || s === undefined) ? '' : String(s); }\n\nvar ids = data.ids || {};\nvar facts = {};\nvar notes = [];\n\n// ---- client vantage -------------------------------------------------------\nvar dns = txt(data.dns);\nfacts.dns_ran = dns.length > 0;\nvar addresses = [];\nif (facts.dns_ran) {\n  var lines = dns.split('\\n');\n  for (var i = 0; i < lines.length; i++) {\n    var m = lines[i].match(/^\\s*([0-9a-fA-F:.]+)\\s+\\S/);\n    if (m) { addresses.push(m[1]); }\n  }\n}\nfacts.dns_failed = facts.dns_ran && (dns.indexOf('NXDOMAIN') >= 0 || addresses.length === 0);\nfacts.dns_ok = facts.dns_ran && !facts.dns_failed;\n\nvar tcp = txt(data.tcp);\nfacts.tcp_ran = tcp.length > 0;\nfacts.tcp_open = tcp.indexOf('TCP_OPEN') >= 0;\nfacts.tcp_timeout = tcp.indexOf('TCP_TIMEOUT') >= 0;\nfacts.tcp_refused = tcp.indexOf('TCP_REFUSED') >= 0;\nfacts.client_vantage = facts.dns_ran || facts.tcp_ran;\n\n// ---- security group evaluation -------------------------------------------\n// Deliberately evaluating RULES rather than trusting the probe: this is the\n// only step that can say WHY the path is closed.\nfunction ipToInt(ip) {\n  var p = ip.split('.');\n  if (p.length !== 4) { return null; }\n  var n = 0;\n  for (var i = 0; i < 4; i++) {\n    var o = parseInt(p[i], 10);\n    if (isNaN(o) || o < 0 || o > 255) { return null; }\n    n = n * 256 + o;\n  }\n  return n;\n}\nfunction inCidr(ip, cidr) {\n  var parts = cidr.split('/');\n  if (parts.length !== 2) { return false; }\n  var base = ipToInt(parts[0]);\n  var addr = ipToInt(ip);\n  if (base === null || addr === null) { return false; }\n  var bits = parseInt(parts[1], 10);\n  if (isNaN(bits) || bits < 0 || bits > 32) { return false; }\n  if (bits === 0) { return true; }\n  var mask = (-1 << (32 - bits)) >>> 0;\n  return ((base & mask) >>> 0) === ((addr & mask) >>> 0);\n}\n\nvar port = parseInt(data.port, 10);\nvar sgDoc = parse(data.sg_rules);\nvar groups = sgDoc ? (sgDoc.SecurityGroups || sgDoc) : null;\nvar clientIp = ids.client_ip || '';\nvar clientSgs = ids.client_sgs || [];\nvar matched = [];\n\nfacts.sg_evaluated = !!(groups && groups.length && (clientIp || clientSgs.length));\nif (facts.sg_evaluated) {\n  for (var g = 0; g < groups.length; g++) {\n    var perms = groups[g].IpPermissions || [];\n    for (var p = 0; p < perms.length; p++) {\n      var perm = perms[p];\n      var proto = String(perm.IpProtocol);\n      if (proto !== 'tcp' && proto !== '-1') { continue; }\n      // -1 means all protocols and all ports; FromPort/ToPort are absent.\n      var covers = proto === '-1' ||\n                   (perm.FromPort <= port && port <= perm.ToPort);\n      if (!covers) { continue; }\n      var ranges = perm.IpRanges || [];\n      for (var r = 0; r < ranges.length; r++) {\n        if (clientIp && inCidr(clientIp, ranges[r].CidrIp)) {\n          matched.push(groups[g].GroupId + ' allows ' + ranges[r].CidrIp);\n        }\n      }\n      var pairs = perm.UserIdGroupPairs || [];\n      for (var q = 0; q < pairs.length; q++) {\n        for (var c = 0; c < clientSgs.length; c++) {\n          if (pairs[q].GroupId === clientSgs[c]) {\n            matched.push(groups[g].GroupId + ' allows sg ' + pairs[q].GroupId);\n          }\n        }\n      }\n    }\n  }\n}\nfacts.sg_allows_client = facts.sg_evaluated && matched.length > 0;\nfacts.sg_denies_client = facts.sg_evaluated && matched.length === 0;\nif (!facts.sg_evaluated) {\n  notes.push('security group rules were not evaluated (missing rules or client identity)');\n}\n\n// ---- database side --------------------------------------------------------\nvar avail = parse(data.availability);\nfacts.db_query_ran = !!(avail && avail.length);\nfacts.db_reachable = facts.db_query_ran;\n\nvar cap = parse(data.capacity);\nvar capRow = (cap && cap.length) ? cap[0] : null;\nfacts.capacity_ran = !!capRow;\nvar headroom = null;\nif (capRow) {\n  headroom = Number(capRow.headroom_for_normal_users);\n  if (isNaN(headroom)) { headroom = null; }\n}\nfacts.capacity_exhausted = headroom !== null && headroom <= 0;\n\n// ---- authentication -------------------------------------------------------\nvar authDoc = parse(data.auth_log);\n// A CloudWatch Insights failure is a hard error, not an empty result set, so\n// the presence of metadata is what distinguishes \"ran, found nothing\" from\n// \"never ran\". Treating those as the same produced a false critical once.\nvar authRan = !!(authDoc && authDoc.metadata);\n// observability.logs returns its rows under \"logs\"; \"data\" is the shape other\n// tasks use, kept as a fallback so a provider change does not silently zero it.\nvar authRows = [];\nif (authDoc) { authRows = authDoc.logs || authDoc.data || []; }\nif (!authRan && authRows.length) { authRan = true; }\nfacts.auth_log_ran = authRan;\nfacts.auth_errors_found = authRan && authRows.length > 0;\nif (!authRan) { notes.push('database log query for authentication failures did not run'); }\n\nfacts.server_side_healthy =\n  facts.db_reachable && facts.capacity_ran && !facts.capacity_exhausted &&\n  !facts.auth_errors_found &&\n  (!facts.sg_evaluated || facts.sg_allows_client) &&\n  (!facts.tcp_ran || facts.tcp_open);\n\n// ---- ordered cause ranking (data, from the pack) --------------------------\nvar ranking = data.ranking || [];\nvar conclusion = null;\nfor (var i = 0; i < ranking.length; i++) {\n  var rule = ranking[i];\n  var all = rule.all || [];\n  var ok = all.length > 0;\n  for (var j = 0; j < all.length; j++) {\n    if (!facts[all[j]]) { ok = false; break; }\n  }\n  if (ok) { conclusion = rule; break; }\n}\nif (!conclusion) {\n  conclusion = {\n    id: 'no_fault_found',\n    verdict: 'info',\n    cause: 'No check produced a failing signal',\n    remediation: 'Nothing in the collected evidence explains a connection failure. Confirm the incident window is right, then look at the application side.'\n  };\n}\n\n({\n  verdict: conclusion.verdict,\n  likely_cause: conclusion.cause,\n  matched_rule: conclusion.id,\n  remediation: conclusion.remediation,\n  facts: facts,\n  evidence: {\n    dns_answer: addresses,\n    dns_raw: dns.slice(0, 400),\n    tcp_result: tcp.replace(/\\s+$/, ''),\n    security_group_matches: matched,\n    db_security_groups: ids.db_sgs || [],\n    client_ip: clientIp,\n    client_security_groups: clientSgs,\n    db_instance_profile: ids.db_instance_profile || '(none)',\n    connection_headroom: headroom,\n    capacity: capRow,\n    top_clients: parse(data.clients) || [],\n    auth_failure_count: authRows.length,\n    auth_samples: authRows.slice(0, 5)\n  },\n  checks_ran: {\n    dns: facts.dns_ran,\n    tcp: facts.tcp_ran,\n    security_groups: facts.sg_evaluated,\n    db_availability: facts.db_query_ran,\n    capacity: facts.capacity_ran,\n    auth_log: facts.auth_log_ran\n  },\n  notes: notes,\n  window: data.searched || ''\n})",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        },
+        "depends_on": [
+          "ids",
+          "sg_rules",
+          "probe_dns",
+          "probe_tcp",
+          "db_availability",
+          "db_capacity",
+          "db_clients",
+          "auth_log"
+        ]
+      },
+      {
+        "id": "interpret",
+        "if": "true",
+        "type": "llm.summary",
+        "layout": {
+          "x": 400,
+          "y": 1000
+        },
+        "params": {
+          "message": "You are helping an engineer who cannot connect to a postgresql database on EC2. The findings below were collected deterministically and a rule engine already ranked the likely cause.\n\nDo NOT overturn the verdict and do NOT introduce numbers that are not present below. Explain, in at most eight lines: what the evidence shows, why that cause is the leading one, and the single next action. If checks_ran shows a check did not run, say plainly which conclusions are therefore unavailable.\n\n{{ Tasks.consolidate.output.data | to_json }}"
+        },
+        "depends_on": [
+          "consolidate"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "attach_evidence",
+        "if": "{% if Inputs.event_id or Inputs.event %}true{% else %}false{% endif %}",
+        "type": "events.add_evidence",
+        "layout": {
+          "x": 400,
+          "y": 1180
+        },
+        "params": {
+          "event_id": "{% if Inputs.event_id %}{{ Inputs.event_id }}{% else %}{{ Inputs.event.id }}{% endif %}",
+          "evidences": [
+            {
+              "data": "## Connection diagnostics — {{ Inputs.db_host }}\n\n**Verdict:** {{ Tasks.consolidate.output.data.verdict | default('unknown') }} — {{ Tasks.consolidate.output.data.likely_cause | default('(consolidation failed)') }}\n\n**Next action:** {{ Tasks.consolidate.output.data.remediation | default('n/a') }}\n\n**Window:** {{ Tasks.consolidate.output.data.window | default('n/a') }}\n\n**Checks that ran**\n\n```json\n{{ Tasks.consolidate.output.data.checks_ran | default('{}') | to_json }}\n```\n\n**Evidence**\n\n```json\n{{ Tasks.consolidate.output.data.evidence | default('{}') | to_json }}\n```\n\n**Interpretation**\n\n{{ Tasks.interpret.output.data | default('(not available)') }}",
+              "type": "markdown",
+              "title": "Connection diagnostics",
+              "insight": [],
+              "additional_info": {
+                "title": "Connection diagnostics",
+                "action_name": "db_connection_diagnostics",
+                "actual_action_name": "text_enricher"
+              }
+            }
+          ]
+        },
+        "depends_on": [
+          "consolidate",
+          "interpret"
+        ]
+      }
+    ],
+    "layout": {
+      "viewport": {
+        "x": 349.5,
+        "y": -10.549999999999965,
+        "zoom": 0.75
+      }
+    },
+    "timeout": "5m",
+    "version": "v1",
+    "triggers": [
+      {
+        "type": "event",
+        "layout": {
+          "x": 210,
+          "y": 100
+        },
+        "params": {
+          "on": "event.created",
+          "filter": "{{ event.subject_type == \"compute-instance\" and event.labels.aws_event_state == \"ALARM\" and event.labels.aws_event_metric_name in [\"pg_up\", \"pg_connections_pct\", \"pg_blocked_sessions\"] }}"
+        }
+      },
+      {
+        "type": "manual",
+        "layout": {
+          "x": 590,
+          "y": 100
+        }
+      }
+    ],
+    "retry_policy": {
+      "initial_interval": "1s",
+      "maximum_attempts": 3,
+      "maximum_interval": "1m",
+      "backoff_coefficient": 2
+    },
+    "llm_description": "Progressive deterministic diagnosis of PostgreSQL-on-EC2 connection failures: client-vantage DNS and TCP run by the agent, security-group and NACL rule evaluation, server availability, connection headroom and authentication failures, consolidated into a ranked likely cause."
+  }
+}

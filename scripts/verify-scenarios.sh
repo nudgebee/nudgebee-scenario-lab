@@ -4,6 +4,9 @@
 #   ./scripts/verify-scenarios.sh            # static checks only, free, no AWS writes
 #   ./scripts/verify-scenarios.sh --live     # also runs every scenario briefly
 #
+# Credentials and region come from your environment, exactly as the aws CLI
+# takes them:  AWS_PROFILE=sandbox ./scripts/verify-scenarios.sh
+#
 # Why this exists
 # ---------------
 # Two defects shipped that shared one signature: a component reported success

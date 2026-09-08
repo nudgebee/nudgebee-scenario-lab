@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Run the control UI locally without Docker.
 #
-# Uses your existing AWS credentials (env vars, AWS_PROFILE, or ~/.aws).
+# Uses your existing AWS credentials (env vars, AWS_PROFILE, or ~/.aws), the
+# same ones the aws CLI picks up.
 # Binds to 127.0.0.1 only - this is an operator tool, not a service.
 #
 #   ./scripts/run-local.sh
-#   SCENARIO_LAB_STACK=my-stack AWS_PROFILE=sandbox ./scripts/run-local.sh
+#   AWS_PROFILE=sandbox ./scripts/run-local.sh
+#   SCENARIO_LAB_STACK=my-stack AWS_REGION=eu-west-1 ./scripts/run-local.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,9 +56,16 @@ if [ ! -d "$VENV" ]; then
   fi
 fi
 
-echo "Stack:  $SCENARIO_LAB_STACK"
-echo "Region: $AWS_REGION"
-echo "UI:     http://127.0.0.1:$PORT"
+if [ -n "${AWS_PROFILE:-}" ]; then
+  echo "Profile: $AWS_PROFILE"
+else
+  # No profile set is fine - it means env credentials or [default] in ~/.aws.
+  # Saying so beats leaving someone to wonder which account the UI will act on.
+  echo "Profile: (none set - using AWS_ACCESS_KEY_ID or the default profile)"
+fi
+echo "Stack:   $SCENARIO_LAB_STACK"
+echo "Region:  $AWS_REGION"
+echo "UI:      http://127.0.0.1:$PORT"
 echo
 
 cd "$ROOT/control"

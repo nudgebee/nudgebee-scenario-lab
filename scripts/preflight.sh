@@ -12,6 +12,11 @@
 #
 #   ./scripts/preflight.sh              # check deploy + runtime
 #   ./scripts/preflight.sh --runtime    # skip deploy checks (already deployed)
+#
+# Credentials and region come from your environment, exactly as the aws CLI
+# takes them:
+#
+#   AWS_PROFILE=sandbox AWS_REGION=eu-west-1 ./scripts/preflight.sh
 set -uo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
@@ -59,12 +64,13 @@ command -v python3 >/dev/null 2>&1 || { bad "python3 not found (used to parse AW
 
 IDENT=$(aws sts get-caller-identity --output json 2>/dev/null) || {
   bad "aws sts get-caller-identity failed - configure credentials (aws configure / aws sso login)"
+  note "for a named profile: AWS_PROFILE=sandbox ./scripts/preflight.sh"
   exit 1
 }
 ACCOUNT=$(echo "$IDENT" | python3 -c 'import sys,json;print(json.load(sys.stdin)["Account"])')
 CALLER=$(echo "$IDENT"  | python3 -c 'import sys,json;print(json.load(sys.stdin)["Arn"])')
 ok "$CALLER"
-note "account $ACCOUNT, region $REGION"
+note "account $ACCOUNT, region $REGION${AWS_PROFILE:+, profile $AWS_PROFILE}"
 
 # SimulatePrincipalPolicy needs the ROLE arn, not the assumed-role session arn.
 POLICY_ARN="$CALLER"

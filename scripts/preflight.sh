@@ -215,7 +215,7 @@ printf '\n'
 if [ "$FAIL" -gt 0 ]; then
   printf '\033[31m%d check(s) failed' "$FAIL"
   [ "$WARN" -gt 0 ] && printf ', %d warning(s)' "$WARN"
-  printf '\033[0m\n\nFix these before deploying - see docs/01-prerequisites.md\n'
+  printf '\033[0m\n\nFix these before deploying - see "Before you start" in the README\n'
   exit 1
 fi
 printf '\033[32mReady'

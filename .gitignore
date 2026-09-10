@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 *.tar.gz
 .DS_Store
+.claude/

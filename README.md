@@ -26,8 +26,17 @@ But they only ever touch the servers this lab creates, and:
 
 - Every scenario stops on its own after a few minutes
 - **Reset everything** stops them all immediately and cleans up
-- Nothing is opened to the internet — no inbound access at all
+- The lab, database and services tiers open nothing to the internet — no
+  inbound access at all
 - Nothing here reads or touches anything else in your account
+
+The one exception is the optional **load balancer tier**, and it is inherent to
+what that tier demonstrates: a front door has to be reachable before losing it
+means anything, so it puts an internet-facing load balancer on port 80 and
+accepts traffic from anywhere by default. What's behind it is a health endpoint
+that returns a single line of text. Narrow `AllowedClientCidr` to your own
+address range when you deploy it if you'd rather not have that open, or skip the
+tier — everything else works without it.
 
 ## What it costs
 
@@ -267,6 +276,11 @@ can be cut off. Adds about $18/month — this one bills whether or not you run
 anything, so delete it when you're done.
 
 Deploy the services tier first.
+
+This is the only tier that is reachable from the internet: the load balancer is
+internet-facing and its `AllowedClientCidr` parameter defaults to `0.0.0.0/0`,
+because a front door nobody can knock on demonstrates nothing. Pass your own
+address range instead if you want it closed to everyone else.
 
 **Why it's worth the extra step.** The single scenario here removes one firewall
 rule. Customers immediately get errors. Meanwhile the server is idle, healthy,

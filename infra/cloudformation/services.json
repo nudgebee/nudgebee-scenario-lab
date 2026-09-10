@@ -1,0 +1,512 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "NudgeBee Scenario Lab - services tier. Four hosts running an order/payment/inventory application over PostgreSQL, wired so a failure in one genuinely breaks the others. Deploy the lab tier first; this reuses its VPC, security group and instance profile.",
+  "Parameters": {
+    "LabStackName": {
+      "Type": "String",
+      "Default": "nudgebee-scenario-lab",
+      "Description": "Lab-tier stack whose network and instance profile these hosts reuse."
+    },
+    "InstanceType": {
+      "Type": "String",
+      "Default": "t3.small",
+      "AllowedValues": [
+        "t3.micro",
+        "t3.small",
+        "t3.medium"
+      ],
+      "Description": "t3.micro is tight once PostgreSQL is on the box."
+    },
+    "DetailedMonitoring": {
+      "Type": "String",
+      "Default": "true",
+      "AllowedValues": [
+        "true",
+        "false"
+      ],
+      "Description": "One-minute EC2 metrics alongside the per-minute service health metric."
+    }
+  },
+  "Conditions": {
+    "MinuteMetrics": {
+      "Fn::Equals": [
+        {
+          "Ref": "DetailedMonitoring"
+        },
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "DbHost": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}",
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "SubnetId": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-SubnetId"
+          }
+        },
+        "SecurityGroupIds": [
+          {
+            "Fn::ImportValue": {
+              "Fn::Sub": "${LabStackName}-SecurityGroupId"
+            }
+          }
+        ],
+        "IamInstanceProfile": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-InstanceProfile"
+          }
+        },
+        "Monitoring": {
+          "Fn::If": [
+            "MinuteMetrics",
+            true,
+            false
+          ]
+        },
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": "#!/bin/bash\nset -x\ndnf install -y postgresql15-server postgresql15 awscli-2 cronie || yum install -y postgresql-server postgresql cronie || true\nsystemctl enable --now crond || true\nPGSETUP_INITDB_OPTIONS=\"--auth-host=md5\" postgresql-setup --initdb || true\nPGDATA=$(ls -d /var/lib/pgsql/*/data 2>/dev/null | head -1)\n[ -z \"$PGDATA\" ] && PGDATA=/var/lib/pgsql/data\nsed -i \"s/^#*listen_addresses.*/listen_addresses = '*'/\" \"$PGDATA/postgresql.conf\"\ngrep -q 'nudgebee-scenario-lab' \"$PGDATA/pg_hba.conf\" || echo \"host all all 10.42.0.0/16 md5  # nudgebee-scenario-lab\" >> \"$PGDATA/pg_hba.conf\"\nsystemctl enable --now postgresql\nsleep 5\nsudo -u postgres psql -c \"CREATE USER labapp WITH PASSWORD 'labapp';\" || true\nsudo -u postgres psql -c \"CREATE DATABASE labdb OWNER labapp;\" || true\nsudo -u postgres psql -d labdb -c \"CREATE TABLE IF NOT EXISTS orders (id serial primary key, note text);\" || true\nsudo -u postgres psql -d labdb -c \"INSERT INTO orders (note) SELECT 'seed' WHERE NOT EXISTS (SELECT 1 FROM orders);\" || true\n# The table is created by the postgres superuser, so labapp owns the database\n# but not the table inside it - the app connects fine and then cannot read.\nsudo -u postgres psql -d labdb -c \"ALTER TABLE orders OWNER TO labapp;\" || true\nsudo -u postgres psql -d labdb -c \"GRANT ALL ON SCHEMA public TO labapp;\" || true\nsudo -u postgres psql -d labdb -c \"GRANT ALL ON ALL TABLES IN SCHEMA public TO labapp;\" || true\n\ncat >/usr/local/bin/nb-health.sh <<'HEALTH'\n#!/bin/bash\nROLE=\"$1\"; PORT=\"$2\"\n# Amazon Linux 2023 enforces IMDSv2, so an unauthenticated metadata GET\n# returns 401 and REGION ends up empty - which fails as\n# \"Invalid endpoint: https://monitoring..amazonaws.com\" and publishes nothing,\n# leaving every alarm breaching on missing data. CloudFormation knows the\n# region, so take it from there and skip the metadata service entirely.\nREGION=\"${AWS::Region}\"\n# IMDSv2 is enforced on AL2023 - an unauthenticated GET returns 401, so the\n# token call is required, not optional.\nIMDS_TOKEN=$(curl -s -m 3 -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")\nIID=$(curl -s -m 3 -H \"X-aws-ec2-metadata-token: $IMDS_TOKEN\" http://169.254.169.254/latest/meta-data/instance-id)\nif [ \"$ROLE\" = \"database\" ]; then\n  pg_isready -q -h 127.0.0.1 && UP=1 || UP=0\nelse\n  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \"http://127.0.0.1:${!PORT}/health\")\n  [ \"$code\" = \"200\" ] && UP=1 || UP=0\nfi\n# InstanceId matters as much as the value. Without it the event NudgeBee\n# builds has subject_type \"alarm\" and subject_name \"order\", resolving to no\n# cloud resource - so no graph node, no correlation and no analysis. With it\n# the event resolves to the EC2 instance, exactly like a native alarm does.\naws cloudwatch put-metric-data --region \"$REGION\" \\\n  --namespace NudgebeeScenarioLab --metric-name ServiceHealthy \\\n  --dimensions InstanceId=\"$IID\" --value \"$UP\" --unit None\nHEALTH\nchmod +x /usr/local/bin/nb-health.sh\ncat >/etc/systemd/system/nb-health.service <<UNIT\n[Unit]\nDescription=NudgeBee scenario lab health metric\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/nb-health.sh database 0\nUNIT\ncat >/etc/systemd/system/nb-health.timer <<'TIMER'\n[Unit]\nDescription=Publish service health every minute\n[Timer]\nOnBootSec=90\n# OnUnitInactiveSec, not OnUnitActiveSec. This service is Type=oneshot: it runs\n# for under a second and exits, so \"60s after it became active\" never produces\n# a next trigger and the timer fires exactly once, then shows NEXT as blank.\n# Measuring from when it went inactive is what actually repeats.\nOnUnitInactiveSec=60\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now nb-health.timer\n"
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-database"
+            }
+          },
+          {
+            "Key": "nudgebee-scenario-lab",
+            "Value": "true"
+          },
+          {
+            "Key": "nb-service",
+            "Value": "database"
+          }
+        ]
+      }
+    },
+    "OrderHost": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}",
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "SubnetId": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-SubnetId"
+          }
+        },
+        "SecurityGroupIds": [
+          {
+            "Fn::ImportValue": {
+              "Fn::Sub": "${LabStackName}-SecurityGroupId"
+            }
+          }
+        ],
+        "IamInstanceProfile": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-InstanceProfile"
+          }
+        },
+        "Monitoring": {
+          "Fn::If": [
+            "MinuteMetrics",
+            true,
+            false
+          ]
+        },
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": [
+              "#!/bin/bash\nset -x\ndnf install -y python3 postgresql15 awscli-2 cronie || yum install -y python3 postgresql cronie || true\nsystemctl enable --now crond || true\n\n# /health is what makes the cascade real: it returns 200 only when this\n# service's own upstreams answer, so stopping an upstream genuinely fails\n# everything downstream of it instead of us faking three alerts.\n\ncat >/opt/nb-service.py <<'APPPY'\nimport os, signal, subprocess, threading, time, urllib.request\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nROLE = os.environ.get(\"NB_ROLE\", \"service\")\nPORT = int(os.environ.get(\"NB_PORT\", \"8080\"))\nUPSTREAMS = [u for u in os.environ.get(\"NB_UPSTREAMS\", \"\").split(\",\") if u]\nDB_HOST = os.environ.get(\"NB_DB_HOST\", \"\")\nRETRY_BURN = float(os.environ.get(\"NB_RETRY_BURN\", \"12\"))\n\ndef db_ok():\n    if not DB_HOST:\n        return True\n    env = dict(os.environ, PGPASSWORD=\"labapp\", PGCONNECT_TIMEOUT=\"3\")\n    try:\n        r = subprocess.run([\"psql\", \"-h\", DB_HOST, \"-U\", \"labapp\", \"-d\", \"labdb\",\n                            \"-tAc\", \"select count(*) from orders\"],\n                           capture_output=True, timeout=6, env=env)\n        return r.returncode == 0\n    except Exception:\n        return False\n\nBURN = {\"proc\": None}\n\ndef burn_start():\n    # Continuous while the dependency is down, not one shot per health check.\n    # A service retrying a dead upstream does not pause politely between\n    # attempts, and one-shot bursts measured 6-15% - too low to alarm on.\n    # Real processes, not threads: the GIL serialises CPU-bound Python.\n    if BURN[\"proc\"] and BURN[\"proc\"].poll() is None:\n        return\n    BURN[\"proc\"] = subprocess.Popen(\n        [\"bash\", \"-c\", \"n=$(nproc); for i in $(seq 1 $n); do (while :; do :; done) & done; wait\"],\n        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)\n\ndef burn_stop():\n    p = BURN[\"proc\"]\n    if p and p.poll() is None:\n        try:\n            os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n        except Exception:\n            pass\n    BURN[\"proc\"] = None\n\ndef supervise():\n    # Independent of request traffic: the retry pressure exists because the\n    # dependency is down, not because someone called us.\n    while True:\n        try:\n            up_ok, _ = probe_upstreams()\n            # Any dead dependency, not just an upstream service. order has no\n            # upstreams at all, so keying on those alone meant it never\n            # reacted to losing its own database - the one host whose\n            # dependency was actually broken stayed silent.\n            healthy = up_ok and db_ok()\n            burn_start() if not healthy else burn_stop()\n        except Exception:\n            pass\n        time.sleep(5)\n\ndef probe_upstreams():\n    for u in UPSTREAMS:\n        try:\n            with urllib.request.urlopen(\"http://%s/health\" % u, timeout=4) as r:\n                if r.status != 200:\n                    return False, u\n        except Exception:\n            return False, u\n    return True, \"\"\n\ndef upstreams_ok():\n    return probe_upstreams()\n\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if self.path.startswith(\"/health\"):\n            up_ok, bad = upstreams_ok()\n            d_ok = db_ok()\n            body = \"service=%s upstreams_ok=%s db_ok=%s\" % (ROLE, up_ok, d_ok)\n            if not up_ok:\n                body += \" failing_upstream=%s\" % bad\n            self.send_response(200 if (up_ok and d_ok) else 503)\n        else:\n            self.send_response(200)\n            body = \"service=%s\" % ROLE\n        self.send_header(\"Content-Type\", \"text/plain\")\n        self.end_headers()\n        self.wfile.write((body + \"\\n\").encode())\n    def log_message(self, *a):\n        pass\n\nthreading.Thread(target=supervise, daemon=True).start()\nHTTPServer((\"0.0.0.0\", PORT), H).serve_forever()\nAPPPY\n\ncat >/etc/systemd/system/order.service <<UNIT\n[Unit]\nDescription=order service (NudgeBee scenario lab)\nAfter=network-online.target\n[Service]\nEnvironment=NB_ROLE=order\nEnvironment=NB_PORT=8081\nEnvironment=NB_UPSTREAMS=\nEnvironment=NB_DB_HOST=${DbIp}\nExecStart=/usr/bin/python3 /opt/nb-service.py\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now order\n\n# Steady calls to upstreams. This is the traffic the VPC flow-log service map\n# is built from - with no calls between hosts the graph has nothing to see.\necho \"NB_UPSTREAMS=\" > /etc/nb-traffic.env\ncat >/etc/systemd/system/nb-traffic.service <<'UNIT'\n[Unit]\nDescription=Steady call traffic to upstreams\n[Service]\nType=oneshot\nEnvironmentFile=/etc/nb-traffic.env\nExecStart=/bin/bash -c 'for u in $(echo \"$NB_UPSTREAMS\" | tr \",\" \" \"); do [ -n \"$u\" ] && curl -s -m 3 -o /dev/null \"http://$u/health\"; done'\nUNIT\ncat >/etc/systemd/system/nb-traffic.timer <<'TIMER'\n[Unit]\nDescription=Call upstreams every 15s\n[Timer]\nOnBootSec=100\nOnUnitActiveSec=15\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now nb-traffic.timer\n\ncat >/usr/local/bin/nb-health.sh <<'HEALTH'\n#!/bin/bash\nROLE=\"$1\"; PORT=\"$2\"\n# Amazon Linux 2023 enforces IMDSv2, so an unauthenticated metadata GET\n# returns 401 and REGION ends up empty - which fails as\n# \"Invalid endpoint: https://monitoring..amazonaws.com\" and publishes nothing,\n# leaving every alarm breaching on missing data. CloudFormation knows the\n# region, so take it from there and skip the metadata service entirely.\nREGION=\"${AWS::Region}\"\n# IMDSv2 is enforced on AL2023 - an unauthenticated GET returns 401, so the\n# token call is required, not optional.\nIMDS_TOKEN=$(curl -s -m 3 -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")\nIID=$(curl -s -m 3 -H \"X-aws-ec2-metadata-token: $IMDS_TOKEN\" http://169.254.169.254/latest/meta-data/instance-id)\nif [ \"$ROLE\" = \"database\" ]; then\n  pg_isready -q -h 127.0.0.1 && UP=1 || UP=0\nelse\n  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \"http://127.0.0.1:${!PORT}/health\")\n  [ \"$code\" = \"200\" ] && UP=1 || UP=0\nfi\n# InstanceId matters as much as the value. Without it the event NudgeBee\n# builds has subject_type \"alarm\" and subject_name \"order\", resolving to no\n# cloud resource - so no graph node, no correlation and no analysis. With it\n# the event resolves to the EC2 instance, exactly like a native alarm does.\naws cloudwatch put-metric-data --region \"$REGION\" \\\n  --namespace NudgebeeScenarioLab --metric-name ServiceHealthy \\\n  --dimensions InstanceId=\"$IID\" --value \"$UP\" --unit None\nHEALTH\nchmod +x /usr/local/bin/nb-health.sh\ncat >/etc/systemd/system/nb-health.service <<UNIT\n[Unit]\nDescription=NudgeBee scenario lab health metric\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/nb-health.sh order 8081\nUNIT\ncat >/etc/systemd/system/nb-health.timer <<'TIMER'\n[Unit]\nDescription=Publish service health every minute\n[Timer]\nOnBootSec=90\n# OnUnitInactiveSec, not OnUnitActiveSec. This service is Type=oneshot: it runs\n# for under a second and exits, so \"60s after it became active\" never produces\n# a next trigger and the timer fires exactly once, then shows NEXT as blank.\n# Measuring from when it went inactive is what actually repeats.\nOnUnitInactiveSec=60\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now nb-health.timer\n",
+              {
+                "DbIp": {
+                  "Fn::GetAtt": [
+                    "DbHost",
+                    "PrivateIp"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-order"
+            }
+          },
+          {
+            "Key": "nudgebee-scenario-lab",
+            "Value": "true"
+          },
+          {
+            "Key": "nb-service",
+            "Value": "order"
+          }
+        ]
+      },
+      "DependsOn": "DbHost"
+    },
+    "PaymentHost": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}",
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "SubnetId": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-SubnetId"
+          }
+        },
+        "SecurityGroupIds": [
+          {
+            "Fn::ImportValue": {
+              "Fn::Sub": "${LabStackName}-SecurityGroupId"
+            }
+          }
+        ],
+        "IamInstanceProfile": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-InstanceProfile"
+          }
+        },
+        "Monitoring": {
+          "Fn::If": [
+            "MinuteMetrics",
+            true,
+            false
+          ]
+        },
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": [
+              "#!/bin/bash\nset -x\ndnf install -y python3 postgresql15 awscli-2 cronie || yum install -y python3 postgresql cronie || true\nsystemctl enable --now crond || true\n\n# /health is what makes the cascade real: it returns 200 only when this\n# service's own upstreams answer, so stopping an upstream genuinely fails\n# everything downstream of it instead of us faking three alerts.\n\ncat >/opt/nb-service.py <<'APPPY'\nimport os, signal, subprocess, threading, time, urllib.request\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nROLE = os.environ.get(\"NB_ROLE\", \"service\")\nPORT = int(os.environ.get(\"NB_PORT\", \"8080\"))\nUPSTREAMS = [u for u in os.environ.get(\"NB_UPSTREAMS\", \"\").split(\",\") if u]\nDB_HOST = os.environ.get(\"NB_DB_HOST\", \"\")\nRETRY_BURN = float(os.environ.get(\"NB_RETRY_BURN\", \"12\"))\n\ndef db_ok():\n    if not DB_HOST:\n        return True\n    env = dict(os.environ, PGPASSWORD=\"labapp\", PGCONNECT_TIMEOUT=\"3\")\n    try:\n        r = subprocess.run([\"psql\", \"-h\", DB_HOST, \"-U\", \"labapp\", \"-d\", \"labdb\",\n                            \"-tAc\", \"select count(*) from orders\"],\n                           capture_output=True, timeout=6, env=env)\n        return r.returncode == 0\n    except Exception:\n        return False\n\nBURN = {\"proc\": None}\n\ndef burn_start():\n    # Continuous while the dependency is down, not one shot per health check.\n    # A service retrying a dead upstream does not pause politely between\n    # attempts, and one-shot bursts measured 6-15% - too low to alarm on.\n    # Real processes, not threads: the GIL serialises CPU-bound Python.\n    if BURN[\"proc\"] and BURN[\"proc\"].poll() is None:\n        return\n    BURN[\"proc\"] = subprocess.Popen(\n        [\"bash\", \"-c\", \"n=$(nproc); for i in $(seq 1 $n); do (while :; do :; done) & done; wait\"],\n        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)\n\ndef burn_stop():\n    p = BURN[\"proc\"]\n    if p and p.poll() is None:\n        try:\n            os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n        except Exception:\n            pass\n    BURN[\"proc\"] = None\n\ndef supervise():\n    # Independent of request traffic: the retry pressure exists because the\n    # dependency is down, not because someone called us.\n    while True:\n        try:\n            up_ok, _ = probe_upstreams()\n            # Any dead dependency, not just an upstream service. order has no\n            # upstreams at all, so keying on those alone meant it never\n            # reacted to losing its own database - the one host whose\n            # dependency was actually broken stayed silent.\n            healthy = up_ok and db_ok()\n            burn_start() if not healthy else burn_stop()\n        except Exception:\n            pass\n        time.sleep(5)\n\ndef probe_upstreams():\n    for u in UPSTREAMS:\n        try:\n            with urllib.request.urlopen(\"http://%s/health\" % u, timeout=4) as r:\n                if r.status != 200:\n                    return False, u\n        except Exception:\n            return False, u\n    return True, \"\"\n\ndef upstreams_ok():\n    return probe_upstreams()\n\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if self.path.startswith(\"/health\"):\n            up_ok, bad = upstreams_ok()\n            d_ok = db_ok()\n            body = \"service=%s upstreams_ok=%s db_ok=%s\" % (ROLE, up_ok, d_ok)\n            if not up_ok:\n                body += \" failing_upstream=%s\" % bad\n            self.send_response(200 if (up_ok and d_ok) else 503)\n        else:\n            self.send_response(200)\n            body = \"service=%s\" % ROLE\n        self.send_header(\"Content-Type\", \"text/plain\")\n        self.end_headers()\n        self.wfile.write((body + \"\\n\").encode())\n    def log_message(self, *a):\n        pass\n\nthreading.Thread(target=supervise, daemon=True).start()\nHTTPServer((\"0.0.0.0\", PORT), H).serve_forever()\nAPPPY\n\ncat >/etc/systemd/system/payment.service <<UNIT\n[Unit]\nDescription=payment service (NudgeBee scenario lab)\nAfter=network-online.target\n[Service]\nEnvironment=NB_ROLE=payment\nEnvironment=NB_PORT=8082\nEnvironment=NB_UPSTREAMS=${OrderIp}:8081\nEnvironment=NB_DB_HOST=${DbIp}\nExecStart=/usr/bin/python3 /opt/nb-service.py\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now payment\n\n# Steady calls to upstreams. This is the traffic the VPC flow-log service map\n# is built from - with no calls between hosts the graph has nothing to see.\necho \"NB_UPSTREAMS=${OrderIp}:8081\" > /etc/nb-traffic.env\ncat >/etc/systemd/system/nb-traffic.service <<'UNIT'\n[Unit]\nDescription=Steady call traffic to upstreams\n[Service]\nType=oneshot\nEnvironmentFile=/etc/nb-traffic.env\nExecStart=/bin/bash -c 'for u in $(echo \"$NB_UPSTREAMS\" | tr \",\" \" \"); do [ -n \"$u\" ] && curl -s -m 3 -o /dev/null \"http://$u/health\"; done'\nUNIT\ncat >/etc/systemd/system/nb-traffic.timer <<'TIMER'\n[Unit]\nDescription=Call upstreams every 15s\n[Timer]\nOnBootSec=100\nOnUnitActiveSec=15\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now nb-traffic.timer\n\ncat >/usr/local/bin/nb-health.sh <<'HEALTH'\n#!/bin/bash\nROLE=\"$1\"; PORT=\"$2\"\n# Amazon Linux 2023 enforces IMDSv2, so an unauthenticated metadata GET\n# returns 401 and REGION ends up empty - which fails as\n# \"Invalid endpoint: https://monitoring..amazonaws.com\" and publishes nothing,\n# leaving every alarm breaching on missing data. CloudFormation knows the\n# region, so take it from there and skip the metadata service entirely.\nREGION=\"${AWS::Region}\"\n# IMDSv2 is enforced on AL2023 - an unauthenticated GET returns 401, so the\n# token call is required, not optional.\nIMDS_TOKEN=$(curl -s -m 3 -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")\nIID=$(curl -s -m 3 -H \"X-aws-ec2-metadata-token: $IMDS_TOKEN\" http://169.254.169.254/latest/meta-data/instance-id)\nif [ \"$ROLE\" = \"database\" ]; then\n  pg_isready -q -h 127.0.0.1 && UP=1 || UP=0\nelse\n  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \"http://127.0.0.1:${!PORT}/health\")\n  [ \"$code\" = \"200\" ] && UP=1 || UP=0\nfi\n# InstanceId matters as much as the value. Without it the event NudgeBee\n# builds has subject_type \"alarm\" and subject_name \"order\", resolving to no\n# cloud resource - so no graph node, no correlation and no analysis. With it\n# the event resolves to the EC2 instance, exactly like a native alarm does.\naws cloudwatch put-metric-data --region \"$REGION\" \\\n  --namespace NudgebeeScenarioLab --metric-name ServiceHealthy \\\n  --dimensions InstanceId=\"$IID\" --value \"$UP\" --unit None\nHEALTH\nchmod +x /usr/local/bin/nb-health.sh\ncat >/etc/systemd/system/nb-health.service <<UNIT\n[Unit]\nDescription=NudgeBee scenario lab health metric\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/nb-health.sh payment 8082\nUNIT\ncat >/etc/systemd/system/nb-health.timer <<'TIMER'\n[Unit]\nDescription=Publish service health every minute\n[Timer]\nOnBootSec=90\n# OnUnitInactiveSec, not OnUnitActiveSec. This service is Type=oneshot: it runs\n# for under a second and exits, so \"60s after it became active\" never produces\n# a next trigger and the timer fires exactly once, then shows NEXT as blank.\n# Measuring from when it went inactive is what actually repeats.\nOnUnitInactiveSec=60\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now nb-health.timer\n",
+              {
+                "DbIp": {
+                  "Fn::GetAtt": [
+                    "DbHost",
+                    "PrivateIp"
+                  ]
+                },
+                "OrderIp": {
+                  "Fn::GetAtt": [
+                    "OrderHost",
+                    "PrivateIp"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-payment"
+            }
+          },
+          {
+            "Key": "nudgebee-scenario-lab",
+            "Value": "true"
+          },
+          {
+            "Key": "nb-service",
+            "Value": "payment"
+          }
+        ]
+      },
+      "DependsOn": "OrderHost"
+    },
+    "InventoryHost": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}",
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "SubnetId": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-SubnetId"
+          }
+        },
+        "SecurityGroupIds": [
+          {
+            "Fn::ImportValue": {
+              "Fn::Sub": "${LabStackName}-SecurityGroupId"
+            }
+          }
+        ],
+        "IamInstanceProfile": {
+          "Fn::ImportValue": {
+            "Fn::Sub": "${LabStackName}-InstanceProfile"
+          }
+        },
+        "Monitoring": {
+          "Fn::If": [
+            "MinuteMetrics",
+            true,
+            false
+          ]
+        },
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": [
+              "#!/bin/bash\nset -x\ndnf install -y python3 postgresql15 awscli-2 cronie || yum install -y python3 postgresql cronie || true\nsystemctl enable --now crond || true\n\n# /health is what makes the cascade real: it returns 200 only when this\n# service's own upstreams answer, so stopping an upstream genuinely fails\n# everything downstream of it instead of us faking three alerts.\n\ncat >/opt/nb-service.py <<'APPPY'\nimport os, signal, subprocess, threading, time, urllib.request\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nROLE = os.environ.get(\"NB_ROLE\", \"service\")\nPORT = int(os.environ.get(\"NB_PORT\", \"8080\"))\nUPSTREAMS = [u for u in os.environ.get(\"NB_UPSTREAMS\", \"\").split(\",\") if u]\nDB_HOST = os.environ.get(\"NB_DB_HOST\", \"\")\nRETRY_BURN = float(os.environ.get(\"NB_RETRY_BURN\", \"12\"))\n\ndef db_ok():\n    if not DB_HOST:\n        return True\n    env = dict(os.environ, PGPASSWORD=\"labapp\", PGCONNECT_TIMEOUT=\"3\")\n    try:\n        r = subprocess.run([\"psql\", \"-h\", DB_HOST, \"-U\", \"labapp\", \"-d\", \"labdb\",\n                            \"-tAc\", \"select count(*) from orders\"],\n                           capture_output=True, timeout=6, env=env)\n        return r.returncode == 0\n    except Exception:\n        return False\n\nBURN = {\"proc\": None}\n\ndef burn_start():\n    # Continuous while the dependency is down, not one shot per health check.\n    # A service retrying a dead upstream does not pause politely between\n    # attempts, and one-shot bursts measured 6-15% - too low to alarm on.\n    # Real processes, not threads: the GIL serialises CPU-bound Python.\n    if BURN[\"proc\"] and BURN[\"proc\"].poll() is None:\n        return\n    BURN[\"proc\"] = subprocess.Popen(\n        [\"bash\", \"-c\", \"n=$(nproc); for i in $(seq 1 $n); do (while :; do :; done) & done; wait\"],\n        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)\n\ndef burn_stop():\n    p = BURN[\"proc\"]\n    if p and p.poll() is None:\n        try:\n            os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n        except Exception:\n            pass\n    BURN[\"proc\"] = None\n\ndef supervise():\n    # Independent of request traffic: the retry pressure exists because the\n    # dependency is down, not because someone called us.\n    while True:\n        try:\n            up_ok, _ = probe_upstreams()\n            # Any dead dependency, not just an upstream service. order has no\n            # upstreams at all, so keying on those alone meant it never\n            # reacted to losing its own database - the one host whose\n            # dependency was actually broken stayed silent.\n            healthy = up_ok and db_ok()\n            burn_start() if not healthy else burn_stop()\n        except Exception:\n            pass\n        time.sleep(5)\n\ndef probe_upstreams():\n    for u in UPSTREAMS:\n        try:\n            with urllib.request.urlopen(\"http://%s/health\" % u, timeout=4) as r:\n                if r.status != 200:\n                    return False, u\n        except Exception:\n            return False, u\n    return True, \"\"\n\ndef upstreams_ok():\n    return probe_upstreams()\n\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        if self.path.startswith(\"/health\"):\n            up_ok, bad = upstreams_ok()\n            d_ok = db_ok()\n            body = \"service=%s upstreams_ok=%s db_ok=%s\" % (ROLE, up_ok, d_ok)\n            if not up_ok:\n                body += \" failing_upstream=%s\" % bad\n            self.send_response(200 if (up_ok and d_ok) else 503)\n        else:\n            self.send_response(200)\n            body = \"service=%s\" % ROLE\n        self.send_header(\"Content-Type\", \"text/plain\")\n        self.end_headers()\n        self.wfile.write((body + \"\\n\").encode())\n    def log_message(self, *a):\n        pass\n\nthreading.Thread(target=supervise, daemon=True).start()\nHTTPServer((\"0.0.0.0\", PORT), H).serve_forever()\nAPPPY\n\ncat >/etc/systemd/system/inventory.service <<UNIT\n[Unit]\nDescription=inventory service (NudgeBee scenario lab)\nAfter=network-online.target\n[Service]\nEnvironment=NB_ROLE=inventory\nEnvironment=NB_PORT=8083\nEnvironment=NB_UPSTREAMS=${OrderIp}:8081\nEnvironment=NB_DB_HOST=${DbIp}\nExecStart=/usr/bin/python3 /opt/nb-service.py\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now inventory\n\n# Steady calls to upstreams. This is the traffic the VPC flow-log service map\n# is built from - with no calls between hosts the graph has nothing to see.\necho \"NB_UPSTREAMS=${OrderIp}:8081\" > /etc/nb-traffic.env\ncat >/etc/systemd/system/nb-traffic.service <<'UNIT'\n[Unit]\nDescription=Steady call traffic to upstreams\n[Service]\nType=oneshot\nEnvironmentFile=/etc/nb-traffic.env\nExecStart=/bin/bash -c 'for u in $(echo \"$NB_UPSTREAMS\" | tr \",\" \" \"); do [ -n \"$u\" ] && curl -s -m 3 -o /dev/null \"http://$u/health\"; done'\nUNIT\ncat >/etc/systemd/system/nb-traffic.timer <<'TIMER'\n[Unit]\nDescription=Call upstreams every 15s\n[Timer]\nOnBootSec=100\nOnUnitActiveSec=15\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now nb-traffic.timer\n\ncat >/usr/local/bin/nb-health.sh <<'HEALTH'\n#!/bin/bash\nROLE=\"$1\"; PORT=\"$2\"\n# Amazon Linux 2023 enforces IMDSv2, so an unauthenticated metadata GET\n# returns 401 and REGION ends up empty - which fails as\n# \"Invalid endpoint: https://monitoring..amazonaws.com\" and publishes nothing,\n# leaving every alarm breaching on missing data. CloudFormation knows the\n# region, so take it from there and skip the metadata service entirely.\nREGION=\"${AWS::Region}\"\n# IMDSv2 is enforced on AL2023 - an unauthenticated GET returns 401, so the\n# token call is required, not optional.\nIMDS_TOKEN=$(curl -s -m 3 -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")\nIID=$(curl -s -m 3 -H \"X-aws-ec2-metadata-token: $IMDS_TOKEN\" http://169.254.169.254/latest/meta-data/instance-id)\nif [ \"$ROLE\" = \"database\" ]; then\n  pg_isready -q -h 127.0.0.1 && UP=1 || UP=0\nelse\n  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \"http://127.0.0.1:${!PORT}/health\")\n  [ \"$code\" = \"200\" ] && UP=1 || UP=0\nfi\n# InstanceId matters as much as the value. Without it the event NudgeBee\n# builds has subject_type \"alarm\" and subject_name \"order\", resolving to no\n# cloud resource - so no graph node, no correlation and no analysis. With it\n# the event resolves to the EC2 instance, exactly like a native alarm does.\naws cloudwatch put-metric-data --region \"$REGION\" \\\n  --namespace NudgebeeScenarioLab --metric-name ServiceHealthy \\\n  --dimensions InstanceId=\"$IID\" --value \"$UP\" --unit None\nHEALTH\nchmod +x /usr/local/bin/nb-health.sh\ncat >/etc/systemd/system/nb-health.service <<UNIT\n[Unit]\nDescription=NudgeBee scenario lab health metric\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/nb-health.sh inventory 8083\nUNIT\ncat >/etc/systemd/system/nb-health.timer <<'TIMER'\n[Unit]\nDescription=Publish service health every minute\n[Timer]\nOnBootSec=90\n# OnUnitInactiveSec, not OnUnitActiveSec. This service is Type=oneshot: it runs\n# for under a second and exits, so \"60s after it became active\" never produces\n# a next trigger and the timer fires exactly once, then shows NEXT as blank.\n# Measuring from when it went inactive is what actually repeats.\nOnUnitInactiveSec=60\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now nb-health.timer\n",
+              {
+                "DbIp": {
+                  "Fn::GetAtt": [
+                    "DbHost",
+                    "PrivateIp"
+                  ]
+                },
+                "OrderIp": {
+                  "Fn::GetAtt": [
+                    "OrderHost",
+                    "PrivateIp"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-inventory"
+            }
+          },
+          {
+            "Key": "nudgebee-scenario-lab",
+            "Value": "true"
+          },
+          {
+            "Key": "nb-service",
+            "Value": "inventory"
+          }
+        ]
+      },
+      "DependsOn": "OrderHost"
+    },
+    "OrderAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-order-down"
+        },
+        "AlarmDescription": "Order service health check failing",
+        "Namespace": "NudgebeeScenarioLab",
+        "MetricName": "ServiceHealthy",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "OrderHost"
+            }
+          }
+        ],
+        "Statistic": "Minimum",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 1,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "breaching"
+      }
+    },
+    "PaymentAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-payment-down"
+        },
+        "AlarmDescription": "Payment service health check failing",
+        "Namespace": "NudgebeeScenarioLab",
+        "MetricName": "ServiceHealthy",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "PaymentHost"
+            }
+          }
+        ],
+        "Statistic": "Minimum",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 1,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "breaching"
+      }
+    },
+    "InventoryAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-inventory-down"
+        },
+        "AlarmDescription": "Inventory service health check failing",
+        "Namespace": "NudgebeeScenarioLab",
+        "MetricName": "ServiceHealthy",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "InventoryHost"
+            }
+          }
+        ],
+        "Statistic": "Minimum",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 1,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "breaching"
+      }
+    },
+    "DatabaseAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-database-down"
+        },
+        "AlarmDescription": "PostgreSQL not accepting connections",
+        "Namespace": "NudgebeeScenarioLab",
+        "MetricName": "ServiceHealthy",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "DbHost"
+            }
+          }
+        ],
+        "Statistic": "Minimum",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 1,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "breaching"
+      }
+    },
+    "OrderCpuAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-order-cpu"
+        },
+        "AlarmDescription": "order host CPU - retry pressure when a dependency fails",
+        "Namespace": "AWS/EC2",
+        "MetricName": "CPUUtilization",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "OrderHost"
+            }
+          }
+        ],
+        "Statistic": "Average",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 40,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "PaymentCpuAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-payment-cpu"
+        },
+        "AlarmDescription": "payment host CPU - retry pressure when a dependency fails",
+        "Namespace": "AWS/EC2",
+        "MetricName": "CPUUtilization",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "PaymentHost"
+            }
+          }
+        ],
+        "Statistic": "Average",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 40,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "InventoryCpuAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${AWS::StackName}-inventory-cpu"
+        },
+        "AlarmDescription": "inventory host CPU - retry pressure when a dependency fails",
+        "Namespace": "AWS/EC2",
+        "MetricName": "CPUUtilization",
+        "Dimensions": [
+          {
+            "Name": "InstanceId",
+            "Value": {
+              "Ref": "InventoryHost"
+            }
+          }
+        ],
+        "Statistic": "Average",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 40,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "DbHostId": {
+      "Value": {
+        "Ref": "DbHost"
+      }
+    },
+    "DbPrivateIp": {
+      "Value": {
+        "Fn::GetAtt": [
+          "DbHost",
+          "PrivateIp"
+        ]
+      }
+    },
+    "OrderHostId": {
+      "Value": {
+        "Ref": "OrderHost"
+      }
+    },
+    "PaymentHostId": {
+      "Value": {
+        "Ref": "PaymentHost"
+      }
+    },
+    "InventoryHostId": {
+      "Value": {
+        "Ref": "InventoryHost"
+      }
+    },
+    "Topology": {
+      "Description": "What depends on what",
+      "Value": "payment -> order, inventory -> order, all three -> postgres"
+    }
+  }
+}

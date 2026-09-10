@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scenario Lab · Control</title>
+<style>
+/* ---------------------------------------------------------------- tokens */
+:root{
+  --bg:#0a0c10; --bg-2:#0e1117; --panel:#12161e; --panel-2:#161b25;
+  --line:#1f2733; --line-2:#2a3441;
+  --fg:#dfe6f0; --fg-2:#8b97a8; --fg-3:#5a6577;
+  --amber:#e8a33d; --amber-dim:#7a5a20;
+  --green:#3ecf8e; --red:#ff5c5c; --blue:#5b9dff; --violet:#a97bff;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,sans-serif;
+  --grid:rgba(255,255,255,.022);
+}
+:root[data-theme="light"]{
+  --bg:#f2f3f5; --bg-2:#eceef1; --panel:#fff; --panel-2:#f7f8fa;
+  --line:#dde1e7; --line-2:#c9d0da;
+  --fg:#10141b; --fg-2:#5a6577; --fg-3:#8b97a8;
+  --amber:#a86a00; --amber-dim:#e8d3ac;
+  --green:#0f8f5b; --red:#c62828; --blue:#2563c9; --violet:#6b3fd4;
+  --grid:rgba(0,0,0,.025);
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){
+    --bg:#f2f3f5; --bg-2:#eceef1; --panel:#fff; --panel-2:#f7f8fa;
+    --line:#dde1e7; --line-2:#c9d0da;
+    --fg:#10141b; --fg-2:#5a6577; --fg-3:#8b97a8;
+    --amber:#a86a00; --amber-dim:#e8d3ac;
+    --green:#0f8f5b; --red:#c62828; --blue:#2563c9; --violet:#6b3fd4;
+    --grid:rgba(0,0,0,.025);
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg); font:14px/1.5 var(--sans);
+  background-image:linear-gradient(var(--grid) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+  background-size:44px 44px;
+  min-height:100vh; -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:var(--mono)}
+
+/* ---------------------------------------------------------------- chrome */
+header{
+  border-bottom:1px solid var(--line); background:var(--bg-2);
+  position:sticky; top:0; z-index:20;
+}
+.bar{display:flex; align-items:stretch; gap:0; flex-wrap:wrap}
+.brand{
+  padding:14px 18px; border-right:1px solid var(--line);
+  display:flex; align-items:center; gap:10px; min-width:210px;
+}
+.mark{
+  width:9px; height:9px; background:var(--amber); flex:none;
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--amber) 18%,transparent);
+}
+.brand b{font-size:13px; letter-spacing:.14em; text-transform:uppercase; font-weight:650}
+.brand span{display:block; font-size:10.5px; color:var(--fg-3); letter-spacing:.1em}
+
+.ctx{display:flex; flex:1; flex-wrap:wrap}
+.ctx div{
+  padding:11px 16px; border-right:1px solid var(--line);
+  min-width:0; flex:1 1 auto; white-space:nowrap;
+}
+.ctx{min-width:0}
+.ctx dt{font-size:9.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--fg-3)}
+.ctx dd{font-family:var(--mono); font-size:12.5px; margin-top:3px; color:var(--fg)}
+.ctx dd.warnv{color:var(--amber)} .ctx dd.badv{color:var(--red)} .ctx dd.okv{color:var(--green)}
+
+.acts{display:flex; align-items:center; gap:8px; padding:10px 16px; margin-left:auto}
+
+button{
+  font:600 12px/1 var(--sans); letter-spacing:.02em;
+  border:1px solid var(--line-2); background:var(--panel);
+  color:var(--fg); padding:9px 14px; cursor:pointer; border-radius:3px;
+  transition:border-color .12s, background .12s, color .12s;
+}
+button:hover:not(:disabled){border-color:var(--amber); color:var(--amber)}
+
+button.go{background:var(--amber); border-color:var(--amber); color:#12161e}
+:root[data-theme="light"] button.go{color:#fff}
+button.go:hover:not(:disabled){filter:brightness(1.08); color:#12161e}
+button.stop{border-color:var(--red); color:var(--red)}
+button.ghost{background:transparent}
+button:disabled,button.go:disabled{
+  opacity:1; cursor:not-allowed; background:transparent;
+  border:1px dashed var(--line-2); color:var(--fg-3); font-weight:500;
+}
+button:disabled:hover,button.go:disabled:hover{
+  border-color:var(--line-2); color:var(--fg-3); filter:none;
+}
+
+/* ---------------------------------------------------------------- banner */
+.warn{
+  display:flex; gap:11px; align-items:flex-start;
+  padding:11px 20px; font-size:12.5px; color:var(--amber);
+  background:color-mix(in srgb,var(--amber) 9%,transparent);
+  border-bottom:1px solid var(--amber-dim);
+}
+.warn b{color:var(--amber)}
+
+/* ---------------------------------------------------------------- layout */
+main{
+  display:grid; grid-template-columns:minmax(0,1fr) 330px;
+  gap:0; align-items:start;
+}
+@media (max-width:1080px){ main{grid-template-columns:1fr} }
+.col-l{padding:20px; min-width:0; min-height:calc(100vh - 104px)}
+.col-r{
+  padding:20px; border-left:1px solid var(--line);
+  min-height:calc(100vh - 104px);
+}
+@media (max-width:1080px){ .col-r{border-left:0; border-top:1px solid var(--line); min-height:0} }
+
+h2{
+  font-size:10px; letter-spacing:.18em; text-transform:uppercase;
+  color:var(--fg-3); margin:0 0 12px; display:flex; gap:9px; align-items:center;
+}
+h2::after{content:""; flex:1; height:1px; background:var(--line)}
+h2 .n{color:var(--fg-2); font-family:var(--mono); letter-spacing:0}
+
+/* ---------------------------------------------------------------- cards */
+.card{
+  background:var(--panel); border:1px solid var(--line);
+  border-radius:4px; margin-bottom:11px; overflow:hidden;
+  transition:border-color .14s;
+}
+.card:hover{border-color:var(--line-2)}
+.card.live{border-color:var(--amber); box-shadow:0 0 0 1px color-mix(in srgb,var(--amber) 22%,transparent)}
+.card.blocked{background:var(--panel-2)}
+
+.chead{display:flex; align-items:flex-start; gap:13px; padding:13px 15px}
+.led{
+  width:8px; height:8px; border-radius:50%; margin-top:6px; flex:none;
+  background:var(--fg-3);
+}
+.led.ok{background:var(--green); box-shadow:0 0 7px color-mix(in srgb,var(--green) 65%,transparent)}
+.led.live{background:var(--amber); box-shadow:0 0 8px var(--amber); animation:pulse 1.5s ease-in-out infinite}
+.led.bad{background:var(--red); box-shadow:0 0 7px color-mix(in srgb,var(--red) 65%,transparent)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.cmain{flex:1; min-width:0}
+.ctitle{display:flex; align-items:baseline; gap:9px; flex-wrap:wrap}
+.ctitle b{font-size:14.5px; font-weight:600}
+.chip{
+  font-family:var(--mono); font-size:10px; padding:2px 6px; border-radius:2px;
+  border:1px solid var(--line-2); color:var(--fg-2); white-space:nowrap;
+}
+.chip.sig{color:var(--blue); border-color:color-mix(in srgb,var(--blue) 40%,transparent)}
+.chip.alarm{color:var(--red); border-color:color-mix(in srgb,var(--red) 45%,transparent)}
+.chip.okstate{color:var(--green); border-color:color-mix(in srgb,var(--green) 40%,transparent)}
+.desc{color:var(--fg-2); font-size:12.5px; margin-top:6px}
+.naive{
+  color:var(--violet); font-size:12px; margin-top:6px;
+  padding-left:9px; border-left:2px solid color-mix(in srgb,var(--violet) 45%,transparent);
+}
+.cside{text-align:right; min-width:112px; flex:none}
+.count{font-family:var(--mono); font-size:19px; color:var(--amber); font-variant-numeric:tabular-nums}
+.countlbl{font-size:9.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--fg-3); margin-bottom:7px}
+
+.cfoot{
+  border-top:1px solid var(--line); background:var(--panel-2);
+  padding:9px 15px; display:flex; gap:16px; flex-wrap:wrap;
+  font-family:var(--mono); font-size:11px; color:var(--fg-3);
+}
+.cfoot span b{color:var(--fg-2); font-weight:500}
+.block{
+  border-top:1px solid var(--line);
+  padding:9px 15px; font-size:11.5px; color:var(--red);
+  background:color-mix(in srgb,var(--red) 7%,transparent);
+}
+.hint{
+  border-top:1px solid var(--line);
+  padding:9px 15px; font-size:11.5px; color:var(--fg-3);
+}
+.block div,.hint div{display:flex; gap:7px; align-items:flex-start}
+.block div+div,.hint div+div{margin-top:4px}
+
+/* ---------------------------------------------------------------- setup */
+.setup{
+  border:1px solid var(--amber-dim); border-radius:4px; overflow:hidden;
+  margin-bottom:20px; background:color-mix(in srgb,var(--amber) 6%,var(--panel));
+}
+.setup .sh{
+  padding:13px 16px; display:flex; gap:11px; align-items:baseline;
+  border-bottom:1px solid var(--amber-dim);
+}
+.setup .sh b{font-size:14px; color:var(--amber)}
+.setup .sh span{font-size:12.5px; color:var(--fg-2)}
+.setup .sb{padding:14px 16px}
+.step{display:flex; gap:11px; margin-bottom:13px}
+.step:last-child{margin-bottom:0}
+.step .num{
+  width:19px; height:19px; border-radius:50%; flex:none; margin-top:1px;
+  border:1px solid var(--amber); color:var(--amber);
+  font:600 10.5px/17px var(--mono); text-align:center;
+}
+.step .sc{flex:1; min-width:0}
+.step .st2{font-size:12.5px; color:var(--fg); margin-bottom:6px}
+pre{
+  font-family:var(--mono); font-size:11.5px; line-height:1.65;
+  background:var(--bg); border:1px solid var(--line); border-radius:3px;
+  padding:10px 12px; overflow-x:auto; color:var(--fg-2); white-space:pre;
+}
+.copy{
+  font:600 10px/1 var(--sans); letter-spacing:.06em; text-transform:uppercase;
+  padding:5px 9px; margin-top:6px;
+}
+
+/* ---------------------------------------------------------------- deploy */
+.dbtns{display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-top:4px}
+.evts{
+  margin-top:11px; border:1px solid var(--line); border-radius:3px;
+  background:var(--bg); max-height:190px; overflow-y:auto;
+}
+.evt{
+  display:flex; gap:10px; padding:5px 11px; font-family:var(--mono);
+  font-size:11px; border-bottom:1px solid var(--line); align-items:baseline;
+}
+.evt:last-child{border-bottom:0}
+.evt .r{color:var(--fg-2); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.evt .s{font-size:10px; white-space:nowrap}
+.evt .s.done{color:var(--green)} .evt .s.prog{color:var(--amber)}
+.evt .s.fail{color:var(--red)}
+.spin{
+  display:inline-block; width:9px; height:9px; border-radius:50%;
+  border:2px solid var(--amber); border-top-color:transparent;
+  animation:sp .7s linear infinite; vertical-align:-1px; margin-right:7px;
+}
+@keyframes sp{to{transform:rotate(360deg)}}
+.tiny{font-size:11.5px; color:var(--fg-3); margin-top:7px}
+
+/* ---------------------------------------------------------------- right */
+.mini{
+  background:var(--panel); border:1px solid var(--line); border-radius:4px;
+  padding:5px 0; margin-bottom:16px;
+}
+.mrow{
+  display:flex; justify-content:space-between; gap:10px; align-items:center;
+  padding:7px 13px; font-size:12px; border-bottom:1px solid var(--line);
+}
+.mrow:last-child{border-bottom:0}
+.mrow .k{font-family:var(--mono); font-size:11.5px; color:var(--fg-2);
+         overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.st{font-family:var(--mono); font-size:10.5px; font-weight:600; letter-spacing:.04em}
+.st.OK{color:var(--green)} .st.ALARM{color:var(--red)}
+.st.INSUFFICIENT_DATA{color:var(--fg-3)}
+.dot{width:6px;height:6px;border-radius:50%;flex:none;display:inline-block;margin-right:6px}
+.dot.on{background:var(--green)} .dot.off{background:var(--fg-3)}
+
+.empty{color:var(--fg-3); font-size:12px; padding:13px; text-align:center}
+.err{color:var(--red); font-size:12px; margin:10px 0; font-family:var(--mono)}
+select{
+  font:12px var(--mono); background:var(--panel); color:var(--fg);
+  border:1px solid var(--line-2); border-radius:3px; padding:7px 9px;
+  min-width:190px;
+}
+select:disabled,select:has(option:only-child:disabled){color:var(--fg-3)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="bar">
+    <div class="brand">
+      <div class="mark"></div>
+      <div><b>Scenario Lab</b><span id="stackName">—</span></div>
+    </div>
+    <div class="ctx" id="ctx"></div>
+    <div class="acts">
+      <select id="host"></select>
+      <button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button>
+      <button class="stop" onclick="reset()">Reset all</button>
+    </div>
+  </div>
+</header>
+
+<div class="warn">
+  <span>⚠</span>
+  <div><b>These scenarios deliberately degrade the hosts they run on.</b>
+  Never point this at production. Every scenario stops on its own; <b>Reset all</b> stops them now.</div>
+</div>
+
+<main>
+  <div class="col-l">
+    <div id="setup"></div>
+
+    <h2>Scenarios <span class="n" id="scount"></span></h2>
+    <div id="err" class="err"></div>
+    <div id="list"></div>
+
+    <h2 style="margin-top:26px">Findings <span class="n">waste tier · read-only</span></h2>
+    <div id="findings"></div>
+  </div>
+
+  <aside class="col-r">
+    <h2>Alarms</h2>
+    <div class="mini" id="alarms"><div class="empty">loading…</div></div>
+    <h2>Hosts</h2>
+    <div class="mini" id="hosts"><div class="empty">loading…</div></div>
+  </aside>
+</main>
+
+<script>
+let D=null, F=null, S=null;
+
+const api=async(p,o)=>{const r=await fetch(p,o);
+  if(!r.ok){let d=r.statusText;try{d=(await r.json()).detail||d}catch(e){}throw new Error(d)}
+  return r.json()};
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=s=>s<=0?'0:00':Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+const ago=t=>{if(!t)return'never';const d=(Date.now()-new Date(t))/1000;
+  if(d<60)return Math.round(d)+'s ago'; if(d<3600)return Math.round(d/60)+'m ago';
+  if(d<86400)return Math.round(d/3600)+'h ago'; return Math.round(d/86400)+'d ago'};
+
+function toggleTheme(){
+  const cur=document.documentElement.getAttribute('data-theme');
+  const next=cur==='light'?'dark':'light';
+  document.documentElement.setAttribute('data-theme',next);
+  try{localStorage.setItem('sl-theme',next)}catch(e){}
+}
+try{const t=localStorage.getItem('sl-theme'); if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}
+
+function renderCtx(){
+  const id=D.identity||{}, si=D.stack_info||{};
+  const online=D.hosts.filter(h=>h.ssm_online).length;
+  const cells=[
+    ['AWS account', id.account_alias?`${id.account_alias} · ${id.account}`:(id.account||'unknown'),
+      id.account?'':'badv'],
+    ['Identity', id.principal||'—',''],
+    ['Region', D.region,''],
+    ['Stack', si.deployed?si.status:'not deployed', si.deployed?(si.status==='CREATE_COMPLETE'||si.status==='UPDATE_COMPLETE'?'okv':'warnv'):'badv'],
+    ['Hosts', `${online}/${D.hosts.length} SSM online`, D.hosts.length===0?'badv':(online<D.hosts.length?'warnv':'okv')],
+    ['Ceiling', D.max_minutes+' min','']
+  ];
+  document.getElementById('stackName').textContent=D.stack;
+  document.getElementById('ctx').innerHTML=cells.map(([k,v,c])=>
+    `<div><dt>${k}</dt><dd class="${c}">${esc(v)}</dd></div>`).join('');
+}
+
+function renderHostSel(){
+  const sel=document.getElementById('host'), prev=sel.value;
+  sel.innerHTML=D.hosts.length
+    ? D.hosts.map(h=>`<option value="${h.instance_id}" ${h.ssm_online?'':'disabled'}>
+        ${esc(h.name)} · ${h.ssm_online?'online':'offline'}</option>`).join('')
+    : '<option disabled selected>— no hosts —</option>';
+  if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
+}
+
+function renderHosts(){
+  document.getElementById('hosts').innerHTML = D.hosts.length
+    ? D.hosts.map(h=>`<div class="mrow">
+        <span class="k"><span class="dot ${h.ssm_online?'on':'off'}"></span>${esc(h.name)}</span>
+        <span class="st ${h.ssm_online?'OK':'INSUFFICIENT_DATA'}">${h.type||''} ${h.az?'· '+h.az.slice(-2):''}</span>
+      </div>`).join('')
+    : '<div class="empty">deploy lab.yaml to create hosts</div>';
+}
+
+function renderScenarios(){
+  const S=D.scenarios;
+  document.getElementById('scount').textContent =
+    `${S.filter(s=>s.ready).length} ready · ${S.filter(s=>s.running).length} running · ${S.length} total`;
+
+  document.getElementById('list').innerHTML=S.map(s=>{
+    let led='ok', cls='';
+    if(s.running){led='live'; cls='live'}
+    else if(!s.ready){led='bad'; cls='blocked'}
+
+    let side='';
+    if(s.running && s.expires){
+      const left=Math.max(0,Math.round((new Date(s.expires)-new Date())/1000));
+      side=`<div class="countlbl">remaining</div><div class="count">${fmt(left)}</div>`;
+    }else if(s.expect_alarm_secs){
+      side=`<div class="countlbl">alarm in</div><div class="count" style="color:var(--fg-3)">~${fmt(s.expect_alarm_secs)}</div>`;
+    }
+
+    const a=s.alarm;
+    const alarmChip=a?`<span class="chip ${a.state==='ALARM'?'alarm':(a.state==='OK'?'okstate':'')}">${a.state}</span>`:'';
+
+    return `<div class="card ${cls}">
+      <div class="chead">
+        <div class="led ${led}"></div>
+        <div class="cmain">
+          <div class="ctitle">
+            <b>${esc(s.name)}</b>
+            <span class="chip sig">${esc(s.signal||'')}</span>
+            <span class="chip">${s.default_seconds}s</span>
+            ${alarmChip}
+          </div>
+          <div class="desc">${esc(s.teaches)}</div>
+          ${s.naive_answer?`<div class="naive">Naive answer: “${esc(s.naive_answer)}”</div>`:''}
+        </div>
+        <div class="cside">
+          ${side}
+          <div style="margin-top:8px">
+            ${s.running
+              ? `<button class="stop" onclick="stop('${s.id}')">Stop</button>`
+              : `<button class="go" ${s.ready?'':'disabled'} onclick="start('${s.id}')" title="${s.ready?'':esc(s.blockers[0]||'')}">${s.ready?'Start':'Unavailable'}</button>`}
+          </div>
+        </div>
+      </div>
+
+      <div class="cfoot">
+        <span><b>metric</b> ${esc((s.requires&&s.requires.metric)||'—')}</span>
+        <span><b>iam</b> ${esc(((s.requires&&s.requires.iam)||[]).join(', ')||'—')}</span>
+        <span><b>last run</b> ${s.last_run?esc(ago(s.last_run.requested_at))+' · '+esc(s.last_run.status):'never'}</span>
+        ${s.running&&s.host?`<span><b>on</b> ${esc(s.host)}</span>`:''}
+      </div>
+
+      ${s.blockers.length?`<div class="block">${s.blockers.map(b=>`<div>✕ <span>${esc(b)}</span></div>`).join('')}</div>`:''}
+      ${(!s.blockers.length&&s.warnings.length)?`<div class="hint">${s.warnings.map(w=>`<div>• <span>${esc(w)}</span></div>`).join('')}</div>`:''}
+    </div>`;
+  }).join('');
+}
+
+function renderFindings(){
+  const f=(F&&F.findings)||[];
+  document.getElementById('findings').innerHTML = f.length ? f.map(x=>`
+    <div class="card">
+      <div class="chead">
+        <div class="led ${x.deployed?'ok':''}"></div>
+        <div class="cmain">
+          <div class="ctitle"><b>${esc(x.name)}</b>
+            <span class="chip">${esc(x.tag)}</span>
+            <span class="chip ${x.deployed?'okstate':''}">${x.deployed?'deployed':'not deployed'}</span>
+          </div>
+          <div class="desc">${esc(x.expect||'')}</div>
+          ${x.manual_step?`<div class="naive">Manual step: ${esc(x.manual_step)}</div>`:''}
+        </div>
+        <div class="cside"><span class="chip">${(x.resources||[]).length} res</span></div>
+      </div>
+    </div>`).join('')
+    : '<div class="card"><div class="empty">deploy waste.yaml to create findings</div></div>';
+}
+
+function renderAlarms(as){
+  document.getElementById('alarms').innerHTML = as.length
+    ? as.map(a=>`<div class="mrow">
+        <span class="k">${esc(a.name.replace(/^.*?-host-/,'host-'))}</span>
+        <span class="st ${a.state}">${a.state==='INSUFFICIENT_DATA'?'NO DATA':a.state}</span>
+      </div>`).join('')
+    : '<div class="empty">no lab alarms found</div>';
+}
+
+async function load(){
+  try{
+    const host=document.getElementById('host').value;
+    D=await api('/api/scenarios'+(host?('?host='+encodeURIComponent(host)):''));
+    renderCtx(); renderHostSel(); renderHosts(); renderScenarios();
+    document.getElementById('err').textContent='';
+  }catch(e){ document.getElementById('err').textContent='load failed: '+e.message }
+}
+async function loadAlarms(){ try{ renderAlarms((await api('/api/alarms')).alarms) }catch(e){} }
+async function loadFindings(){ try{ F=await api('/api/findings'); renderFindings() }catch(e){} }
+
+function copy(id){
+  const el=document.getElementById(id);
+  navigator.clipboard.writeText(el.textContent).then(()=>{
+    const b=document.getElementById(id+'-btn'); const t=b.textContent;
+    b.textContent='copied'; setTimeout(()=>b.textContent=t,1400);
+  }).catch(()=>{});
+}
+
+let DEPLOYING=null;
+
+function renderSetup(){
+  const box=document.getElementById('setup');
+  if(!S){ box.innerHTML=''; return; }
+
+  if(DEPLOYING){
+    const st=DEPLOYING.status||{};
+    const evts=(st.events||[]).map(e=>{
+      const cls = (e.status||'').includes('FAILED')||(e.status||'').includes('ROLLBACK') ? 'fail'
+                : (e.status||'').endsWith('IN_PROGRESS') ? 'prog' : 'done';
+      return `<div class="evt"><span class="r">${esc(e.resource||'')}</span>
+              <span class="s ${cls}">${esc(e.status||'')}</span></div>`;
+    }).join('');
+    const done=st.complete, failed=st.failed;
+    box.innerHTML=`<div class="setup">
+      <div class="sh">
+        <b>${done?'Deployed':(failed?'Deploy failed':'Deploying '+esc(DEPLOYING.tier)+' tier')}</b>
+        <span>${done?'Hosts are registering with SSM - Start buttons enable themselves.'
+              :(failed?'Rolled back. The events below say which resource failed.'
+              :'<span class="spin"></span>Usually about 4 minutes.')}</span>
+      </div>
+      <div class="sb">
+        <div class="tiny">stack ${esc(DEPLOYING.name)} · ${esc(st.status||'submitting…')}</div>
+        ${evts?`<div class="evts">${evts}</div>`:''}
+        ${(done||failed)?`<div class="dbtns" style="margin-top:11px">
+          <button onclick="DEPLOYING=null;renderSetup();loadSetup();load()">Dismiss</button></div>`:''}
+      </div></div>`;
+    return;
+  }
+
+  if(!S.needs_deploy){ box.innerHTML=''; return; }
+
+  const why = !S.stack_deployed
+    ? 'The lab stack is not deployed in this account yet, so there is nothing to run scenarios on.'
+    : `The stack is ${esc(S.stack_status)} but no running scenario hosts were found.`;
+
+  const blocked = S.permissions_checked && !S.can_deploy;
+  const missing = (S.missing_deploy_permissions||[]).join(', ');
+
+  box.innerHTML=`<div class="setup">
+    <div class="sh"><b>Set up the lab</b><span>${why}</span></div>
+    <div class="sb">
+      <div class="step"><div class="num">1</div><div class="sc">
+        <div class="st2">Deploy the scenario hosts and alarms. No parameters — the stack creates its own
+          isolated VPC, so the lab cannot land in a network you care about. About 4 minutes.</div>
+        <div class="dbtns">
+          <button class="go" ${blocked?'disabled':''}
+            title="${blocked?esc('missing: '+missing):'Creates EC2 hosts, alarms and an isolated VPC'}"
+            onclick="doDeploy('lab')">Deploy lab tier</button>
+          <button ${blocked?'disabled':''} onclick="doDeploy('waste')">Deploy waste tier</button>
+          <span class="tiny" style="margin:0">creates billable resources in
+            ${esc((D&&D.identity&&(D.identity.account_alias||D.identity.account))||'this account')}</span>
+        </div>
+        ${blocked?`<div class="tiny" style="color:var(--red)">Cannot deploy from here — missing ${esc(missing)}</div>`:''}
+      </div></div>
+
+      <div class="step"><div class="num">2</div><div class="sc">
+        <div class="st2">Prefer the terminal? These do the same thing.</div>
+        <pre id="cmd1">${esc(S.deploy_command)}\n${esc(S.waste_command)}</pre>
+        <button class="copy" id="cmd1-btn" onclick="copy('cmd1')">Copy</button>
+      </div></div>
+    </div>
+  </div>`;
+}
+
+async function doDeploy(tier){
+  const acct=(D&&D.identity&&(D.identity.account_alias||D.identity.account))||'this account';
+  const what = tier==='lab'
+    ? 'EC2 hosts, CloudWatch alarms and an isolated VPC'
+    : 'deliberately wasteful resources (an oversized instance costs ~$140/mo)';
+  if(!confirm(`Deploy the ${tier} tier into ${acct}?\n\nThis creates ${what}.\nBillable until you tear it down.`)) return;
+  try{
+    const r=await api('/api/deploy',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tier:tier,confirm:true})});
+    DEPLOYING={tier:tier,name:r.deploying,status:{}};
+    renderSetup(); pollDeploy();
+  }catch(e){ document.getElementById('err').textContent='deploy failed: '+e.message }
+}
+
+async function pollDeploy(){
+  if(!DEPLOYING) return;
+  try{
+    DEPLOYING.status=await api('/api/deploy/status?tier='+encodeURIComponent(DEPLOYING.tier));
+    renderSetup();
+    if(DEPLOYING.status.in_progress){ setTimeout(pollDeploy,5000); }
+    else { load(); loadSetup(); loadAlarms(); }
+  }catch(e){ setTimeout(pollDeploy,8000) }
+}
+
+async function teardown(tier){
+  const name=(tier==='lab')?S.stack_name_lab:S.stack_name_waste;
+  const typed=prompt(`This deletes every resource in the ${tier} tier.\n\nType the stack name to confirm:`);
+  if(!typed) return;
+  try{
+    await api('/api/teardown',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tier:tier,confirm_name:typed})});
+    DEPLOYING={tier:tier,name:typed,status:{}}; renderSetup(); pollDeploy();
+  }catch(e){ document.getElementById('err').textContent='teardown failed: '+e.message }
+}
+
+async function loadSetup(){ try{ S=await api('/api/setup'); renderSetup() }catch(e){} }
+
+async function start(id){
+  document.getElementById('err').textContent='';
+  try{
+    await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({scenario_id:id,instance_id:document.getElementById('host').value})});
+    load();
+  }catch(e){ document.getElementById('err').textContent=e.message }
+}
+async function stop(id){ try{ await api('/api/stop/'+id,{method:'POST'}); load() }
+  catch(e){ document.getElementById('err').textContent=e.message } }
+async function reset(){ try{ await api('/api/reset',{method:'POST'}); load() }
+  catch(e){ document.getElementById('err').textContent=e.message } }
+
+document.getElementById('host').addEventListener('change',load);
+load(); loadAlarms(); loadFindings(); loadSetup();
+setInterval(load,10000); setInterval(loadAlarms,15000);
+setInterval(loadFindings,60000); setInterval(loadSetup,20000);
+setInterval(()=>{ if(D) renderScenarios() },1000);
+</script>
+</body>
+</html>

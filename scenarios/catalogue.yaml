@@ -1,0 +1,598 @@
+# NudgeBee Scenario Lab - scenario catalogue
+#
+# Adding a scenario = adding an entry here. No code change.
+#
+# Every scenario MUST be self-limiting: the command it runs has to terminate on
+# its own within `default_seconds`. The control app also enforces a ceiling and
+# runs a sweeper, but the command itself is the first line of defence.
+#
+# Fields:
+#   id                stable identifier, used by the UI and CLI
+#   name              human label
+#   tier              lab | full
+#   signal            which alarm this should trip (suffix after <stack>-host-N-)
+#   expect_alarm_secs rough time from start to alarm, for the UI countdown
+#   teaches           what this scenario is meant to demonstrate in NudgeBee
+#   naive_answer      the wrong-but-plausible conclusion, if any
+#   command           bash run on the host via SSM. MUST self-terminate.
+
+version: 1
+
+scenarios:
+
+  - id: cpu_high
+    name: CPU saturation
+    tier: lab
+    signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Attribution of a CPU spike to an operator-issued command rather than
+      application load. NudgeBee should name the command, its timestamp and
+      that CPU returned to baseline when it exited.
+    naive_answer: "The instance is undersized and should be scaled up."
+    command: |
+      # nproc is resolved INSIDE the subshell: a variable set out here is not
+      # exported, so the inner shell would see it empty, seq would produce
+      # nothing, and the command would exit instantly reporting Success.
+      timeout {{seconds}} bash -c 'n=$(nproc); for i in $(seq 1 $((n*2))); do (while :; do :; done) & done; wait # nb-scenario:cpu_high' >/dev/null 2>&1
+    cleanup: |
+      pkill -f 'nb-scenario:cpu_high' 2>/dev/null || true
+
+
+  - id: memory_pressure
+    name: Memory pressure
+    tier: lab
+    signal: mem-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [stress-ng]
+      metric: CWAgent MemoryUtilization (needs CloudWatch agent)
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Memory exhaustion without an OOM kill - the process holds allocation but
+      never trips the killer, so the host degrades without a crash to point at.
+    naive_answer: "A memory leak in the application."
+    command: |
+      if command -v stress-ng >/dev/null 2>&1; then
+        timeout {{seconds}} stress-ng --vm 2 --vm-bytes 70% --vm-keep >/dev/null 2>&1
+      else
+        timeout {{seconds}} bash -c 'a=(); while :; do a+=($(head -c 1000000 /dev/zero | tr "\0" "x")); sleep 0.1; done # nb-scenario:memory_pressure' >/dev/null 2>&1
+      fi
+    cleanup: |
+      pkill -f 'nb-scenario:memory_pressure' 2>/dev/null || true
+      pkill stress-ng 2>/dev/null || true
+
+
+  - id: disk_fill
+    name: Disk fill
+    tier: lab
+    signal: disk-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: CWAgent DiskUtilization (needs CloudWatch agent)
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      Disk exhaustion from a single large file. NudgeBee should locate the file
+      and the process that wrote it, not just report percent-used.
+    naive_answer: "The volume needs resizing."
+    command: |
+      TARGET=/var/tmp/nudgebee-scenario-fill.bin
+      AVAIL_MB=$(df -Pm / | awk 'NR==2 {print $4}')
+      ALLOC_MB=$(( AVAIL_MB * 85 / 100 ))
+      fallocate -l ${ALLOC_MB}M "$TARGET" 2>/dev/null || dd if=/dev/zero of="$TARGET" bs=1M count=$ALLOC_MB 2>/dev/null
+      sleep {{seconds}}
+      rm -f "$TARGET"
+    cleanup: |
+      rm -f /var/tmp/nudgebee-scenario-fill.bin 2>/dev/null || true
+
+
+  - id: disk_io_saturation
+    name: Disk I/O saturation
+    tier: lab
+    signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
+    default_seconds: 300
+    expect_alarm_secs: 240
+    teaches: >
+      I/O wait rather than compute. CPU looks busy but the bottleneck is the
+      volume - a distinction a naive reading of CPUUtilization misses.
+    naive_answer: "CPU-bound workload; add vCPUs."
+    command: |
+      timeout {{seconds}} bash -c 'while :; do dd if=/dev/zero of=/var/tmp/nb-io.tmp bs=1M count=256 oflag=direct 2>/dev/null; dd if=/var/tmp/nb-io.tmp of=/dev/null bs=1M iflag=direct 2>/dev/null; done # nb-scenario:disk_io_saturation'
+      rm -f /var/tmp/nb-io.tmp
+    cleanup: |
+      pkill -f 'nb-scenario:disk_io_saturation' 2>/dev/null || true
+      rm -f /var/tmp/nb-io.tmp 2>/dev/null || true
+
+
+  - id: network_spike
+    name: Outbound network spike
+    tier: lab
+    signal: net-out-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [curl]
+      metric: AWS/EC2 NetworkOut
+      egress: true
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Sustained egress from one host. Useful for showing NudgeBee tie a network
+      alarm to the process and destination responsible.
+    naive_answer: "Data exfiltration or a DDoS."
+    command: |
+      timeout {{seconds}} bash -c 'while :; do curl -s -o /dev/null https://speed.cloudflare.com/__down?bytes=100000000 || sleep 2; done # nb-scenario:network_spike'
+    cleanup: |
+      pkill -f 'nb-scenario:network_spike' 2>/dev/null || true
+
+
+  - id: runaway_cron
+    name: Runaway cron job
+    tier: lab
+    signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [crontab]
+      metric: AWS/EC2 CPUUtilization
+    default_seconds: 900
+    expect_alarm_secs: 240
+    teaches: >
+      A RECURRING cause. The spike repeats every minute from a cron entry, so
+      the right answer is the schedule, not the individual process. This is the
+      scenario where the obvious answer is wrong.
+    naive_answer: "A one-off process spiked the CPU; nothing to do."
+    command: |
+      # Amazon Linux 2023 ships without cron - no cronie package, no
+      # /etc/cron.d, crond inactive. Writing the schedule blind fails
+      # silently and the scenario does nothing at all, so install it first.
+      # The lab AMI preinstalls cronie; this covers hosts built before that.
+      if ! systemctl is-active --quiet crond 2>/dev/null; then
+        (dnf install -y cronie || yum install -y cronie) >/dev/null 2>&1
+        systemctl enable --now crond >/dev/null 2>&1 || true
+      fi
+      mkdir -p /etc/cron.d
+      echo '* * * * * root timeout 50 bash -c "for i in 1 2 3 4; do (while :; do :; done) & done; wait # nb-scenario:runaway_cron" >/dev/null 2>&1' > /etc/cron.d/nudgebee-scenario
+      sleep {{seconds}}
+      rm -f /etc/cron.d/nudgebee-scenario
+    cleanup: |
+      # remove the schedule first, then kill whatever it already spawned
+      rm -f /etc/cron.d/nudgebee-scenario 2>/dev/null || true
+      pkill -f 'nb-scenario:runaway_cron' 2>/dev/null || true
+
+
+  - id: service_failure
+    name: Service failure
+    tier: lab
+    signal: status-check
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [systemctl]
+      metric: AWS/EC2 StatusCheckFailed
+    default_seconds: 300
+    expect_alarm_secs: 120
+    teaches: >
+      A systemd unit that fails and stays failed. NudgeBee should surface the
+      unit name and its journal output rather than only the status check.
+    naive_answer: "The instance is unhealthy and should be replaced."
+    command: |
+      cat >/etc/systemd/system/nudgebee-scenario-broken.service <<'UNIT'
+      [Unit]
+      Description=NudgeBee scenario - deliberately failing service
+      [Service]
+      Type=simple
+      ExecStart=/bin/bash -c 'echo "scenario: simulated startup failure" >&2; exit 1'
+      Restart=always
+      RestartSec=5
+      UNIT
+      systemctl daemon-reload
+      systemctl start nudgebee-scenario-broken || true
+      sleep {{seconds}}
+      systemctl stop nudgebee-scenario-broken 2>/dev/null || true
+      systemctl disable nudgebee-scenario-broken 2>/dev/null || true
+      rm -f /etc/systemd/system/nudgebee-scenario-broken.service
+      systemctl daemon-reload
+    cleanup: |
+      systemctl stop nudgebee-scenario-broken 2>/dev/null || true
+      systemctl disable nudgebee-scenario-broken 2>/dev/null || true
+      rm -f /etc/systemd/system/nudgebee-scenario-broken.service 2>/dev/null || true
+      systemctl daemon-reload 2>/dev/null || true
+
+
+  - id: zombie_processes
+    name: Process table pressure
+    tier: lab
+    signal: cpu-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
+    default_seconds: 300
+    expect_alarm_secs: 240
+    teaches: >
+      Process/fork exhaustion. Load climbs without any single process being an
+      obvious culprit - tests whether the investigation looks at process counts.
+    naive_answer: "One runaway process is responsible."
+    command: |
+      timeout {{seconds}} bash -c 'for i in $(seq 1 400); do (sleep 3600) & done; wait # nb-scenario:zombie_processes' >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# Findings (waste tier) — deployed by infra/cloudformation/waste.yaml.
+#
+# These are NOT scenarios. There is nothing to start or stop: the finding is
+# the resource existing. They demonstrate cost, rightsizing and security
+# analysis rather than incident investigation, and need no fault injection.
+#
+# The control UI lists them read-only so an operator can see what NudgeBee
+# should be reporting.
+# ---------------------------------------------------------------------------
+    cleanup: |
+      pkill -f 'nb-scenario:zombie_processes' 2>/dev/null || true
+
+  - id: service_failure_cascade
+    name: Service failure with downstream impact
+    tier: services
+    target_service: order
+    signal: order-down
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: NudgebeeScenarioLab ServiceHealthy
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      Correlating several simultaneous alerts back to one cause. Stopping order
+      on host A also fails payment on host B and inventory on host C, because
+      both call order. Three alarms, one cause. NudgeBee should name order as
+      the parent and the other two as downstream, not report three equal
+      incidents.
+    naive_answer: "Three separate services failed - a network or platform-wide problem."
+    command: |
+      # Stops the service and puts it back. Payment and inventory keep running
+      # throughout; they fail only because their health check calls order, so
+      # the downstream failure is a real consequence rather than a second
+      # injected fault.
+      systemctl stop order
+      sleep {{seconds}}
+      systemctl start order
+    cleanup: |
+      systemctl start order 2>/dev/null || true
+
+  - id: database_outage
+    name: Database down, application impact
+    tier: services
+    target_service: database
+    signal: database-down
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: NudgebeeScenarioLab ServiceHealthy
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      An application failure whose cause is underneath the application. Stopping
+      PostgreSQL fails order, payment and inventory at once, plus the database
+      alarm itself. The investigation should reach the database rather than
+      stopping at "the application is unreachable", and should rule out network
+      and firewall causes rather than asserting them.
+    naive_answer: "The application is down - restart the application servers."
+    command: |
+      systemctl stop postgresql
+      sleep {{seconds}}
+      systemctl start postgresql
+    cleanup: |
+      systemctl start postgresql 2>/dev/null || true
+
+  - id: order_db_connectivity_loss
+    name: Order loses its database, everything downstream follows
+    tier: services
+    target_service: order
+    signal: order-cpu
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: AWS/EC2 CPUUtilization
+    default_seconds: 900
+    expect_alarm_secs: 240
+    teaches: >
+      Correlation and blast radius across three hosts, from native metrics.
+      Order loses database connectivity and starts retrying, which burns CPU.
+      Payment and inventory cannot get a healthy answer from order and retry
+      too. Three CPU alarms, one cause. Order is the parent: it is the only one
+      whose own dependency is broken, and it is upstream of the other two.
+      Blast radius seeded on order should name payment and inventory.
+
+      Prefer this over service_failure_cascade for anything involving
+      correlation. Stopping a service produces no native metric on the host
+      that failed - a stopped process burns nothing - so the parent arrives as
+      an untyped alarm event and cannot be traversed in the graph.
+    naive_answer: "Three servers are overloaded - they need more CPU."
+    command: |
+      # Drop traffic to PostgreSQL from this host only. The database stays
+      # healthy and serves the other two; the fault is genuinely one service's
+      # connectivity, which is what makes order the parent rather than the DB.
+      # Amazon Linux 2023 ships without iptables - third thing it omits after
+      # cron and an unauthenticated metadata endpoint. Install on demand.
+      command -v iptables >/dev/null 2>&1 || dnf install -y iptables-nft >/dev/null 2>&1 || yum install -y iptables >/dev/null 2>&1
+      DB_IP=$(grep -oP 'NB_DB_HOST=\K\S+' /etc/systemd/system/order.service | head -1)
+      iptables -I OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP
+      sleep {{seconds}}
+      iptables -D OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP 2>/dev/null || true
+    cleanup: |
+      DB_IP=$(grep -oP 'NB_DB_HOST=\K\S+' /etc/systemd/system/order.service 2>/dev/null | head -1)
+      # Removing the rule is the whole cleanup. The burn belongs to the
+      # service, not to this scenario, and its supervisor stops it as soon as
+      # the database is reachable again - killing it here would race that.
+      [ -n "$DB_IP" ] && iptables -D OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Database scenarios (db tier) — deployed by infra/cloudformation/db.yaml.
+#
+# These need the db tier: a self-managed PostgreSQL host. Target them at the
+# host tagged scenario-role=database; every one of them runs there and reaches
+# the database over the LOCAL SOCKET, so no scenario needs a password and no
+# credential ever crosses a host boundary.
+#
+# Alarms for these live in db.yaml but are named after the LAB stack
+# (<lab-stack>-host-db-*), because the control panel discovers alarms by that
+# prefix and matches `signal` as a name suffix.
+#
+# Two scenarios below have no `signal` on purpose. Nothing in the alarm
+# catalogue can see a filtered port or a rejected password — that is the point
+# of them, and inventing an alarm that half-resolves would be worse than
+# admitting it. They are for the log- and connection-diagnosis workflows.
+# ---------------------------------------------------------------------------
+
+  - id: db_connection_saturation
+    name: Database connection saturation
+    tier: db
+    signal: db-conn-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_connections_pct (published by the db tier host)
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      Server-side connection exhaustion, and the distinction that matters when
+      an application reports "cannot connect": the database is reachable, up and
+      answering — it has simply run out of connection slots. Note that a normal
+      user is refused once total reaches max_connections minus
+      superuser_reserved_connections, i.e. BELOW 100%, so "92% of max" is
+      already an outage for the application.
+    naive_answer: "The database is down."
+    command: |
+      timeout {{seconds}} runuser -u postgres -- bash -c 'for i in $(seq 1 36); do psql -d labdb -c "SELECT pg_sleep(3600)" >/dev/null 2>&1 & done; wait # nb-scenario:db_connection_saturation'
+    cleanup: |
+      pkill -f 'nb-scenario:db_connection_saturation' 2>/dev/null || true
+      runuser -u postgres -- psql -d labdb -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(3600)%' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+
+
+  - id: db_idle_in_transaction
+    name: Leaked connection pool
+    tier: db
+    signal: db-conn-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_idle_in_transaction
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      The same alarm as saturation with a completely different cause. Sessions
+      sit idle INSIDE a transaction — an application that took a connection,
+      opened a transaction and never gave it back. The database is doing no
+      work at all, so CPU and disk look perfect while connections run out. A
+      good investigation names idle_in_transaction and the client holding them.
+    naive_answer: "The database is overloaded and needs a bigger instance."
+    command: |
+      timeout {{seconds}} runuser -u postgres -- bash -c 'for i in $(seq 1 30); do (printf "BEGIN;\nSELECT 1 FROM lab_accounts LIMIT 1;\n"; sleep 3600) | psql -d labdb >/dev/null 2>&1 & done; wait # nb-scenario:db_idle_in_transaction'
+    cleanup: |
+      pkill -f 'nb-scenario:db_idle_in_transaction' 2>/dev/null || true
+      runuser -u postgres -- psql -d labdb -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+
+
+  - id: db_blocking_chain
+    name: Blocking chain
+    tier: db
+    signal: db-blocked
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: CWAgent pg_blocked_sessions
+    default_seconds: 300
+    expect_alarm_secs: 180
+    teaches: >
+      One transaction holds a row lock and everything behind it queues. Query
+      latency collapses while CPU, memory and disk stay flat, so every
+      utilisation dashboard says the host is healthy. The answer is a single
+      blocking PID, which is only visible in pg_stat_activity.
+    naive_answer: "The database is slow because it is under-provisioned."
+    command: |
+      timeout {{seconds}} runuser -u postgres -- bash -c '(printf "BEGIN;\nUPDATE lab_accounts SET balance = balance + 1 WHERE id = 1;\n"; sleep 3600) | psql -d labdb >/dev/null 2>&1 & sleep 3; for i in $(seq 1 6); do psql -d labdb -c "UPDATE lab_accounts SET balance = balance + 1 WHERE id = 1" >/dev/null 2>&1 & done; wait # nb-scenario:db_blocking_chain'
+    cleanup: |
+      pkill -f 'nb-scenario:db_blocking_chain' 2>/dev/null || true
+      runuser -u postgres -- psql -d labdb -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'labdb' AND pid <> pg_backend_pid() AND (state = 'idle in transaction' OR wait_event_type = 'Lock')" >/dev/null 2>&1 || true
+
+
+  - id: db_service_stopped
+    name: Database stopped
+    tier: db
+    signal: db-down
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: CWAgent pg_up
+    default_seconds: 240
+    expect_alarm_secs: 150
+    teaches: >
+      The unambiguous case, and the control for the two below it: the port
+      REFUSES connections immediately rather than hanging. Refused means the
+      network path is fine and nothing is listening; a hang means something is
+      dropping packets. Any diagnosis that reports both as "unreachable" has
+      thrown away the one bit that decides which team is on the hook.
+    naive_answer: "A network or firewall problem is blocking the database."
+    command: |
+      systemctl stop postgresql
+      sleep {{seconds}}
+      systemctl start postgresql
+    cleanup: |
+      systemctl start postgresql 2>/dev/null || true
+
+
+  - id: db_port_filtered
+    name: Database port filtered
+    tier: db
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [iptables]
+      metric: none - deliberately invisible to the alarm catalogue
+    default_seconds: 300
+    expect_alarm_secs: 0
+    teaches: >
+      A security-group style fault reproduced at the host: packets to 5432 are
+      DROPPED, so clients hang until timeout while the database itself is
+      perfectly healthy and still serving local connections. Nothing alarms —
+      every host metric is normal — which is exactly why connection failures get
+      blamed on the database. The distinguishing evidence is that a client times
+      out (rather than being refused) while the server reports itself up.
+    naive_answer: "The database has crashed or is overloaded."
+    command: |
+      command -v iptables >/dev/null 2>&1 || { echo "iptables not present - cannot inject" >&2; exit 1; }
+      iptables -I INPUT -p tcp --dport 5432 -j DROP
+      sleep {{seconds}}
+      iptables -D INPUT -p tcp --dport 5432 -j DROP 2>/dev/null || true
+    cleanup: |
+      while iptables -D INPUT -p tcp --dport 5432 -j DROP 2>/dev/null; do :; done
+
+
+  - id: db_auth_failures
+    name: Authentication failures
+    tier: db
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [psql]
+      metric: none - visible only in the PostgreSQL log
+    default_seconds: 180
+    expect_alarm_secs: 0
+    teaches: >
+      Repeated password rejections against a database that is up, reachable and
+      has plenty of connection headroom. Note what this is NOT: IAM database
+      authentication does not exist for self-managed PostgreSQL — that is an
+      RDS/Aurora feature — so the failure is pg_hba plus a wrong credential, and
+      it appears as SQLSTATE 28P01 in the log and nowhere else. Exercises the
+      log-analysis path rather than the metric path.
+    naive_answer: "The database is rejecting connections because it is overloaded."
+    command: |
+      timeout {{seconds}} bash -c 'while :; do PGPASSWORD=definitely-the-wrong-password psql -h 127.0.0.1 -U labapp -d labdb -c "SELECT 1" >/dev/null 2>&1; sleep 2; done # nb-scenario:db_auth_failures'
+    cleanup: |
+      pkill -f 'nb-scenario:db_auth_failures' 2>/dev/null || true
+
+
+# ---------------------------------------------------------------------------
+# Findings (waste tier) — deployed by infra/cloudformation/waste.yaml.
+#
+# These are NOT scenarios. There is nothing to start or stop: the finding is
+# the resource existing. They demonstrate cost, rightsizing and security
+# analysis rather than incident investigation, and need no fault injection.
+#
+# The control UI lists them read-only so an operator can see what NudgeBee
+# should be reporting.
+# ---------------------------------------------------------------------------
+
+
+  # The first scenario whose fault is not on a machine. `kind: aws` runs it through
+  # the control plane's own credentials instead of SSM, so no lab host needs
+  # permission to rewrite the network it sits in.
+  - id: alb_sg_block
+    name: Security group blocks the load balancer
+    tier: services
+    kind: aws
+    action: revoke_alb_ingress
+    params:
+      port: 8081
+    signal: alb-unhealthy
+    requires:
+      iam: [ec2:RevokeSecurityGroupIngress, ec2:AuthorizeSecurityGroupIngress, ec2:DescribeSecurityGroups]
+      binaries: []
+      metric: AWS/ApplicationELB UnHealthyHostCount
+    default_seconds: 600
+    expect_alarm_secs: 120
+    teaches: >
+      The case every host-level check gets wrong. The order host is untouched: CPU
+      flat, memory fine, the process up, /health returning 200 to anything on the
+      box. Nothing is wrong with the machine. But the security group no longer
+      admits the load balancer, so the ALB has no healthy target and clients get
+      5xx from the balancer itself - no application ever logs an error, because no
+      request reaches an application.
+
+      An investigation that only reads the instance will conclude the service is
+      healthy and stop. Reaching the answer requires noticing that the failing
+      component is the path, and the evidence is a security group rule that used
+      to exist. Contrast the host's own alarms, which stay green throughout, with
+      the ALB alarms, which do not.
+    naive_answer: "The order service is down - restart it."
+    # No command and no cleanup: an SSM scenario self-terminates on its own timer,
+    # but a revoked rule stays revoked. The undo is computed before the change,
+    # stored in state, and applied by /api/stop or the expiry sweeper.
+
+findings:
+
+  - id: unattached_ebs_volume
+    name: Unattached EBS volume
+    tier: waste
+    tag: unattached-ebs-volume
+    expect: Flagged as unused storage incurring cost with no attachment.
+    teaches: Cost analysis finds orphaned resources without any agent on a host.
+
+  - id: unencrypted_ebs_volume
+    name: Unencrypted EBS volume
+    tier: waste
+    tag: unencrypted-ebs-volume
+    expect: Flagged as not encrypted at rest.
+    teaches: Compliance posture checks against resource configuration.
+
+  - id: over_permissive_security_group
+    name: Security group open to the world
+    tier: waste
+    tag: over-permissive-security-group
+    expect: SSH (22) and RDP (3389) open to 0.0.0.0/0.
+    teaches: >
+      Security findings on configuration. Note the SG is attached to nothing,
+      so this creates a finding without creating an actual exposure.
+
+  - id: oversized_instance
+    name: Oversized instance
+    tier: waste
+    tag: oversized-instance
+    expect: Rightsizing recommendation to downsize after utilisation history builds.
+    teaches: >
+      Rightsizing needs days of CloudWatch history, so this one will not appear
+      immediately after deploy — say so rather than treating it as a failure.
+
+  - id: stopped_instance_with_storage
+    name: Stopped instance still billing for storage
+    tier: waste
+    tag: stopped-instance-with-storage
+    expect: Idle-resource finding — compute stopped, 30GB EBS still charged.
+    teaches: Cost attribution beyond running compute.
+    manual_step: >
+      CloudFormation cannot create an instance in the stopped state. Run the
+      stop command printed in the stack outputs after deploying.
+
+  - id: idle_load_balancer
+    name: Idle load balancer
+    tier: waste
+    tag: idle-load-balancer
+    expect: Load balancer with no healthy targets and no traffic.
+    teaches: Idle managed-service spend. Off by default — costs ~$16/mo.

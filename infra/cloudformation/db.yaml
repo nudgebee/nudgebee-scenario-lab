@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NudgeBee Scenario Lab - db tier. One small self-managed PostgreSQL host so the
+  database scenarios have something real to break: connection saturation, a
+  blocking chain, a leaked pool, authentication failures, a filtered port and a
+  stopped service.
+
+  WHY A HOST AND NOT RDS: the point of these scenarios is the self-managed case.
+  RDS has a managed alarm catalogue, Performance Insights and IAM database
+  authentication; an EC2-hosted database has none of them, so the conditions
+  that matter have no alert source until something publishes them as metrics.
+  That publisher is installed here, which is what lets a database condition
+  raise an alarm rather than merely be diagnosed after a human notices.
+
+  SAFETY: no inbound from the internet. Port 5432 is reachable only from the
+  security group passed in as ClientSecurityGroupId (the lab hosts), and every
+  scenario runs on this host over the local socket via SSM. The database holds
+  nothing but a toy accounts table. Deploy into a sandbox account.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Placement }
+        Parameters: [VpcId, SubnetId, ClientSecurityGroupId]
+      - Label: { default: Discovery by the control panel }
+        Parameters: [LabStackName]
+      - Label: { default: Sizing and thresholds }
+        Parameters: [InstanceType, MaxConnections, ConnectionThreshold, BlockedSessionThreshold]
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Same VPC as the lab tier.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Same subnet as the lab tier.
+  ClientSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >
+      Security group allowed to reach 5432 - the lab tier's host SG. Leave empty
+      to create the database with NO inbound rule at all (scenarios still work,
+      since they run on this host over the local socket).
+  LabStackName:
+    Type: String
+    Default: nudgebee-scenario-lab
+    Description: >
+      LOAD-BEARING, twice over. Alarms are named '<LabStackName>-host-db-<signal>'
+      so the control panel finds them: it lists alarms by the prefix
+      '<STACK>-host-' and matches a scenario's `signal` as a NAME SUFFIX. Naming
+      them after this stack instead would make every database alarm invisible in
+      the UI. The host's Name tag uses it too - this stack is already called
+      '<lab>-db', so '${AWS::StackName}-db-1' would render
+      'nudgebee-scenario-lab-db-db-1', and that tag becomes the resource_name a
+      NudgeBee workflow trigger matches on.
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small, t3.medium]
+    Description: t3.small (~$15/mo) is enough for every scenario here.
+  MaxConnections:
+    Type: Number
+    Default: 40
+    MinValue: 20
+    MaxValue: 200
+    Description: >
+      Deliberately low. Saturation has to be reachable in seconds from one host,
+      and a realistic 100+ would make the scenario slow and expensive to trip.
+  ConnectionThreshold:
+    Type: Number
+    Default: 75
+    Description: Percent of max_connections that raises the db-conn-high alarm.
+  BlockedSessionThreshold:
+    Type: Number
+    Default: 2
+    Description: Sessions waiting on a lock that raise the db-blocked alarm.
+
+Conditions:
+  HasClientSg: !Not [ !Equals [ !Ref ClientSecurityGroupId, '' ] ]
+
+Resources:
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NudgeBee scenario lab database - 5432 from the lab hosts only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound for SSM, CloudWatch and package installs
+      Tags:
+        - { Key: Name, Value: !Sub '${LabStackName}-db-sg' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # Separate resource rather than inline ingress so the template still deploys
+  # when no client SG is supplied.
+  DbIngressFromClients:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasClientSg
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ClientSecurityGroupId
+      Description: PostgreSQL from lab scenario hosts
+
+  DbHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: publish-db-metrics-and-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # PutMetricData cannot be scoped to a namespace by resource, only
+              # by the cloudwatch:namespace condition key.
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: CWAgent
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:PutRetentionPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/nudgebee-scenario-lab/*'
+
+  DbHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref DbHostRole ]
+
+  DbHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [ !Ref DbSecurityGroup ]
+      IamInstanceProfile: !Ref DbHostProfile
+      Monitoring: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          dnf install -y postgresql16 postgresql16-server postgresql16-contrib amazon-cloudwatch-agent || true
+
+          PGDATA=/var/lib/pgsql/data
+          if [ ! -s "${!PGDATA}/PG_VERSION" ]; then
+            postgresql-setup --initdb
+          fi
+
+          # max_connections is set low on purpose so the saturation scenario is
+          # reachable from a single host in seconds.
+          #
+          # log_line_prefix carries %e (SQLSTATE). It is the only stable identity
+          # a PostgreSQL error has - grouping log lines by message text buckets
+          # on the variable data embedded in the message, so "recurring error"
+          # counts come out meaningless without it.
+          cat >>"${!PGDATA}/postgresql.conf" <<'PGCONF'
+          listen_addresses = '*'
+          log_line_prefix = '%m [%p] %e %q%u@%d '
+          log_connections = on
+          log_disconnections = on
+          log_lock_waits = on
+          deadlock_timeout = '1s'
+          PGCONF
+          echo "max_connections = ${MaxConnections}" >>"${!PGDATA}/postgresql.conf"
+
+          # scram over TCP so the authentication-failure scenario produces a real
+          # 28P01 rejection; local peer auth keeps the scenarios credential-free.
+          cat >"${!PGDATA}/pg_hba.conf" <<'PGHBA'
+          local   all             all                                     peer
+          host    all             all             127.0.0.1/32            scram-sha-256
+          host    all             all             10.0.0.0/8              scram-sha-256
+          host    all             all             172.16.0.0/12           scram-sha-256
+          host    all             all             192.168.0.0/16          scram-sha-256
+          PGHBA
+
+          systemctl enable --now postgresql
+          sleep 5
+
+          runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE DATABASE labdb;
+          SQL
+          # NOT the same database as the services tier. That tier builds its own
+          # PostgreSQL host with a role also called labapp, a different password
+          # and an `orders` table; this one has `lab_accounts`. They are separate
+          # on purpose and are not interchangeable - pointing a services host at
+          # this database fails authentication and then fails on a missing table,
+          # and the services would burn CPU retrying forever without ever saying
+          # why.
+          runuser -u postgres -- psql -d labdb -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE IF NOT EXISTS lab_accounts (id int PRIMARY KEY, balance numeric NOT NULL);
+          INSERT INTO lab_accounts VALUES (1, 100), (2, 100)
+            ON CONFLICT (id) DO NOTHING;
+          -- labapp is what a client application would use; the password is a
+          -- fixed lab throwaway and the role owns nothing but the toy table.
+          DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'labapp') THEN
+              CREATE ROLE labapp LOGIN PASSWORD 'labapp-not-a-secret';
+            END IF;
+          END $$;
+          GRANT ALL ON lab_accounts TO labapp;
+          SQL
+
+          # ---- metric publisher -------------------------------------------
+          # NAMESPACE IS LOAD-BEARING: NudgeBee maps CWAgent to ResourceType
+          # compute-instance / ServiceName EC2, so an alarm on these metrics
+          # resolves to this instance exactly like the CPU and disk alarms. An
+          # unknown namespace falls back to ResourceType "alarm" and any
+          # workflow filtering on compute-instance stops matching.
+          mkdir -p /var/lib/nudgebee
+          cat >/usr/local/bin/nb-lab-db-metrics <<'COLLECTOR'
+          #!/bin/bash
+          set -uo pipefail
+          cd /tmp
+          imds() {
+            local t
+            t="$(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token \
+                 -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" || return 1
+            curl -s -m 3 -H "X-aws-ec2-metadata-token: $t" \
+                 "http://169.254.169.254/latest/meta-data/$1"
+          }
+          IID="$(imds instance-id)"; REGION="$(imds placement/region)"
+          [ -n "$IID" ] && [ -n "$REGION" ] || exit 1
+
+          JSON="$(runuser -u postgres -- psql -d labdb -tAX -c "
+            SELECT row_to_json(t) FROM (
+              SELECT 1 AS pg_up,
+                (SELECT setting::int FROM pg_settings WHERE name='max_connections') AS pg_max_connections,
+                count(*) AS pg_connections_total,
+                round(100.0*count(*)/(SELECT setting::numeric FROM pg_settings WHERE name='max_connections'),1) AS pg_connections_pct,
+                count(*) FILTER (WHERE wait_event_type='Lock') AS pg_blocked_sessions,
+                count(*) FILTER (WHERE state='idle in transaction') AS pg_idle_in_transaction
+              FROM pg_stat_activity) t" 2>/dev/null)"
+
+          # A database that is down publishes pg_up=0 rather than going silent,
+          # so the alarm can tell "down" from "collector broken". The db-down
+          # alarm also treats missing data as breaching, covering this script.
+          [ -n "$JSON" ] || JSON='{"pg_up":0}'
+
+          export IID
+          printf '%s' "$JSON" | python3 -c '
+          import json, os, sys
+          d = json.load(sys.stdin)
+          out = []
+          for k, v in d.items():
+              if v is None:
+                  continue
+              try:
+                  v = float(v)
+              except (TypeError, ValueError):
+                  continue
+              out.append({"MetricName": k, "Value": v, "Unit": "None",
+                          "Dimensions": [{"Name": "InstanceId", "Value": os.environ["IID"]}]})
+          json.dump(out, open("/tmp/nb-lab-db-metrics.json", "w"))
+          ' || exit 1
+
+          aws cloudwatch put-metric-data --region "$REGION" --namespace CWAgent \
+              --metric-data file:///tmp/nb-lab-db-metrics.json
+          COLLECTOR
+          chmod 0755 /usr/local/bin/nb-lab-db-metrics
+
+          cat >/etc/systemd/system/nb-lab-db-metrics.service <<'UNIT'
+          [Unit]
+          Description=Publish scenario-lab PostgreSQL metrics to CloudWatch
+          After=postgresql.service network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/nb-lab-db-metrics
+          UNIT
+
+          cat >/etc/systemd/system/nb-lab-db-metrics.timer <<'UNIT'
+          [Unit]
+          Description=Publish scenario-lab PostgreSQL metrics to CloudWatch
+          [Timer]
+          OnBootSec=60
+          OnUnitActiveSec=60
+          AccuracySec=5s
+          Unit=nb-lab-db-metrics.service
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now nb-lab-db-metrics.timer
+
+          # ---- database log shipping --------------------------------------
+          aws logs create-log-group --region ${AWS::Region} \
+              --log-group-name /nudgebee-scenario-lab/postgresql 2>/dev/null || true
+          aws logs put-retention-policy --region ${AWS::Region} \
+              --log-group-name /nudgebee-scenario-lab/postgresql --retention-in-days 3 || true
+
+          cat >/opt/aws/amazon-cloudwatch-agent/etc/nb-db-logs.json <<'CWCFG'
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/lib/pgsql/data/log/*.log",
+                      "log_group_name": "/nudgebee-scenario-lab/postgresql",
+                      "log_stream_name": "{instance_id}",
+                      "timestamp_format": "%Y-%m-%d %H:%M:%S",
+                      "multi_line_start_pattern": "{timestamp_format}"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          CWCFG
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a append-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/nb-db-logs.json || true
+
+          /usr/local/bin/nb-lab-db-metrics || true
+      Tags:
+        # nudgebee-scenario-lab makes this host appear in the control panel's
+        # host list (it filters on this tag alone, not on stack), so database
+        # scenarios can be targeted at it with no change to the control app.
+        - { Key: Name, Value: !Sub '${LabStackName}-db-1' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: scenario-role, Value: database }
+
+  # Alarms are named after the LAB stack on purpose - see LabStackName.
+
+  DbDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LabStackName}-host-db-down'
+      AlarmDescription: PostgreSQL is not answering on the scenario lab database host
+      Namespace: CWAgent
+      MetricName: pg_up
+      Dimensions: [ { Name: InstanceId, Value: !Ref DbHost } ]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # Missing data is the collector itself dying, which is also a failure.
+      TreatMissingData: breaching
+
+  DbConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LabStackName}-host-db-conn-high'
+      AlarmDescription: PostgreSQL connection usage high on the scenario lab database host
+      Namespace: CWAgent
+      MetricName: pg_connections_pct
+      Dimensions: [ { Name: InstanceId, Value: !Ref DbHost } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref ConnectionThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DbBlockedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LabStackName}-host-db-blocked'
+      AlarmDescription: Sessions waiting on locks on the scenario lab database host
+      Namespace: CWAgent
+      MetricName: pg_blocked_sessions
+      Dimensions: [ { Name: InstanceId, Value: !Ref DbHost } ]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref BlockedSessionThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  DbHostId:
+    Description: Instance id of the database host - target scenarios here
+    Value: !Ref DbHost
+  DbPrivateIp:
+    Description: Address a lab host would connect to
+    Value: !GetAtt DbHost.PrivateIp
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+  DbLogGroup:
+    Value: /nudgebee-scenario-lab/postgresql
+  AlarmPrefix:
+    Description: Alarms are named after the lab stack so the control panel finds them
+    Value: !Sub '${LabStackName}-host-db-'

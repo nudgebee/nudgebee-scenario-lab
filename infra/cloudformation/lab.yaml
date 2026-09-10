@@ -1,0 +1,510 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NudgeBee Scenario Lab - lab tier. Deploys SSM-managed EC2 hosts plus
+  CloudWatch alarms so infrastructure incidents can be injected on demand and
+  observed in NudgeBee. NOT for production: scenarios deliberately degrade
+  these hosts.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Placement }
+        Parameters: [VpcId, SubnetId, InstanceType, HostCount]
+      - Label: { default: Alarm thresholds }
+        Parameters: [CpuThreshold, MemoryThreshold, DiskThreshold, DetailedMonitoring]
+      - Label: { default: Safety }
+        Parameters: [MaxScenarioMinutes]
+
+Parameters:
+  VpcId:
+    Type: String
+    Default: ''
+    Description: >
+      OPTIONAL. Leave blank and the stack creates its own isolated VPC - no
+      lookup needed, and no risk of landing in a network you care about.
+      Supply one only if you specifically want the lab inside an existing VPC
+      (it must have outbound internet or SSM VPC endpoints).
+  SubnetId:
+    Type: String
+    Default: ''
+    Description: OPTIONAL. Required only if VpcId is supplied.
+  LabCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    Description: CIDR for the VPC the stack creates when VpcId is left blank.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: Small is fine - scenarios saturate whatever they are given.
+  HostCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 4
+    Description: Number of scenario hosts.
+  CpuThreshold:
+    Type: Number
+    Default: 70
+    Description: CPUUtilization percent that trips the CPU alarm.
+  MemoryThreshold:
+    Type: Number
+    Default: 80
+    Description: Memory percent that trips the memory alarm (needs CW agent).
+  DiskThreshold:
+    Type: Number
+    Default: 80
+    Description: Disk used percent that trips the disk alarm (needs CW agent).
+  MaxScenarioMinutes:
+    Type: Number
+    Default: 30
+    Description: Safety net - the sweeper clears any scenario older than this.
+  DetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Publish EC2 metrics every minute instead of every five. Keep this on.
+      With basic (5-minute) monitoring the CPU and network alarms evaluate
+      against mostly-empty one-minute buckets and take 10+ minutes to fire,
+      if they fire at all - which makes most scenarios look broken. Costs
+      about $2.10 per host per month.
+
+Conditions:
+  CreateNetwork: !Equals [!Ref VpcId, '']
+  UseExistingNetwork: !Not [!Equals [!Ref VpcId, '']]
+  # EC2-published metrics arrive every 60s only with detailed monitoring.
+  # The alarm period has to match the publishing rate or the alarm is
+  # scoring gaps rather than data.
+  MinuteMetrics: !Equals [!Ref DetailedMonitoring, 'true']
+  TwoOrMore:   !Or [ !Equals [!Ref HostCount, 2], !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
+  ThreeOrMore: !Or [ !Equals [!Ref HostCount, 3], !Equals [!Ref HostCount, 4] ]
+  FourHosts:   !Equals [!Ref HostCount, 4]
+
+Mappings:
+  # Amazon Linux 2023 via SSM public parameter is resolved at deploy time
+  # using the AWS::SSM::Parameter::Value type below, so no AMI map needed.
+  Placeholder:
+    Unused:
+      Key: value
+
+Resources:
+
+  # ---------------------------------------------------------------- Network
+  # Created only when VpcId is left blank. A public subnet with an internet
+  # gateway is enough: SSM needs outbound HTTPS, and nothing inbound is opened.
+
+  LabVpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNetwork
+    Properties:
+      CidrBlock: !Ref LabCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabIgw:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-igw' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref LabVpc
+      InternetGatewayId: !Ref LabIgw
+
+  LabSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref LabVpc
+      CidrBlock: !Select [0, !Cidr [!Ref LabCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-subnet' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref LabVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-rt' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    DependsOn: LabIgwAttach
+    Properties:
+      RouteTableId: !Ref LabRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref LabIgw
+
+  LabSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      SubnetId: !Ref LabSubnet
+      RouteTableId: !Ref LabRouteTable
+
+  # ------------------------------------------------------- VPC flow logs
+  # NudgeBee builds its AWS service map from these. It discovers them with
+  # DescribeFlowLogs, so no naming convention is needed - but it keeps only
+  # RFC1918 traffic with log_status OK, so the default format is required
+  # (it carries srcaddr, dstaddr and log-status).
+  #
+  # Only created when the stack made its own VPC. If you pointed the lab at
+  # an existing VPC, enabling flow logs on it is your call, not ours.
+
+  LabFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateNetwork
+    Properties:
+      LogGroupName: !Sub '/aws/vpc-flow-logs/${AWS::StackName}'
+      RetentionInDays: 3
+
+  LabFlowLogRole:
+    Type: AWS::IAM::Role
+    Condition: CreateNetwork
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteFlowLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt LabFlowLogGroup.Arn
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  LabFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateNetwork
+    Properties:
+      ResourceId: !Ref LabVpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref LabFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt LabFlowLogRole.Arn
+      MaxAggregationInterval: 60
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-flowlogs' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # ---------------------------------------------------------------- IAM
+
+  ScenarioHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  ScenarioHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref ScenarioHostRole ]
+
+  # ---------------------------------------------------------------- Network
+
+  ScenarioHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NudgeBee scenario lab hosts - no inbound required (SSM only)
+      VpcId: !If [CreateNetwork, !Ref LabVpc, !Ref VpcId]
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound for SSM, CloudWatch and network scenarios
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-hosts' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # Host-to-host only, and only from this same group - still nothing inbound
+  # from the internet. Needed so lab services can actually call each other:
+  # without accepted traffic between them the VPC flow logs have nothing to
+  # record, and NudgeBee's service map is built from those flows.
+  ScenarioHostSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ScenarioHostSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ScenarioHostSecurityGroup
+      Description: Lab hosts talking to each other
+
+  # ---------------------------------------------------------------- Hosts
+
+  ScenarioHost1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          # cronie is NOT present on Amazon Linux 2023, and runaway_cron needs
+          # a working scheduler or it silently does nothing.
+          dnf install -y stress-ng amazon-cloudwatch-agent cronie || yum install -y stress-ng amazon-cloudwatch-agent cronie || true
+          systemctl enable --now crond || true
+          mkdir -p /opt/nudgebee-scenario
+          cat >/opt/aws/amazon-cloudwatch-agent/etc/cw-agent.json <<'CWCFG'
+          {
+            "metrics": {
+              "append_dimensions": { "InstanceId": "${!aws:InstanceId}" },
+              "metrics_collected": {
+                "mem":  { "measurement": [ { "name": "mem_used_percent", "rename": "MemoryUtilization", "unit": "Percent" } ], "metrics_collection_interval": 60 },
+                "disk": { "measurement": [ { "name": "used_percent", "rename": "DiskUtilization", "unit": "Percent" } ], "resources": [ "/" ], "metrics_collection_interval": 60 }
+              }
+            }
+          }
+          CWCFG
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/cw-agent.json || true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-1' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: scenario-role, Value: primary }
+
+  ScenarioHost2:
+    Type: AWS::EC2::Instance
+    Condition: TwoOrMore
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # cronie is NOT present on Amazon Linux 2023, and runaway_cron needs
+          # a working scheduler or it silently does nothing.
+          dnf install -y stress-ng amazon-cloudwatch-agent cronie || yum install -y stress-ng amazon-cloudwatch-agent cronie || true
+          systemctl enable --now crond || true
+          mkdir -p /opt/nudgebee-scenario
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-2' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+        - { Key: scenario-role, Value: secondary }
+
+  ScenarioHost3:
+    Type: AWS::EC2::Instance
+    Condition: ThreeOrMore
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-3' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  ScenarioHost4:
+    Type: AWS::EC2::Instance
+    Condition: FourHosts
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
+      SecurityGroupIds: [ !Ref ScenarioHostSecurityGroup ]
+      IamInstanceProfile: !Ref ScenarioHostProfile
+      Monitoring: !If [MinuteMetrics, true, false]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-host-4' }
+        - { Key: nudgebee-scenario-lab, Value: 'true' }
+
+  # ---------------------------------------------------------------- Alarms
+  # One set per host. Named <stack>-host-N-<signal> so NudgeBee events carry a
+  # readable aggregation key.
+
+  Host1CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-cpu-high'
+      AlarmDescription: CPU utilization high on scenario host 1
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: !If [MinuteMetrics, 60, 300]
+      EvaluationPeriods: 2
+      Threshold: !Ref CpuThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-mem-high'
+      AlarmDescription: Memory utilization high on scenario host 1 (requires CloudWatch agent)
+      Namespace: CWAgent
+      MetricName: MemoryUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref MemoryThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1DiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-disk-high'
+      AlarmDescription: Disk utilization high on scenario host 1 (requires CloudWatch agent)
+      Namespace: CWAgent
+      MetricName: DiskUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref DiskThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-status-check'
+      AlarmDescription: Status check failed on scenario host 1
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host1NetworkAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-net-out-high'
+      AlarmDescription: Outbound network unusually high on scenario host 1
+      Namespace: AWS/EC2
+      MetricName: NetworkOut
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Average
+      Period: !If [MinuteMetrics, 60, 300]
+      EvaluationPeriods: 2
+      Threshold: 50000000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Host2CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: TwoOrMore
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-2-cpu-high'
+      AlarmDescription: CPU utilization high on scenario host 2
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost2 } ]
+      Statistic: Average
+      Period: !If [MinuteMetrics, 60, 300]
+      EvaluationPeriods: 2
+      Threshold: !Ref CpuThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ---------------------------------------------------------------- State
+
+  ScenarioStateParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/nudgebee-scenario-lab/${AWS::StackName}/active'
+      Type: String
+      Value: '{}'
+      Description: >
+        JSON map of running scenarios written by the control app:
+        {"<scenario_id>": {"host": "...", "started": "...", "expires": "..."}}
+      Tags:
+        nudgebee-scenario-lab: 'true'
+
+  ScenarioMaxMinutesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/nudgebee-scenario-lab/${AWS::StackName}/max_minutes'
+      Type: String
+      Value: !Ref MaxScenarioMinutes
+      Description: Safety ceiling - the control app refuses longer durations.
+
+Outputs:
+  StackNameOut:
+    Description: Pass this to the control app as SCENARIO_LAB_STACK
+    Value: !Ref AWS::StackName
+  Host1Id:
+    Description: Primary scenario host
+    Value: !Ref ScenarioHost1
+  Host2Id:
+    Condition: TwoOrMore
+    Value: !Ref ScenarioHost2
+  AlarmPrefix:
+    Description: All lab alarms share this prefix
+    Value: !Sub '${AWS::StackName}-host-'
+  StateParameter:
+    Value: !Ref ScenarioStateParameter
+  NetworkMode:
+    Description: Whether the stack created its own VPC or used one you supplied
+    Value: !If [CreateNetwork, 'created an isolated VPC for the lab', 'used the VPC you supplied']
+  VpcUsed:
+    Value: !If [CreateNetwork, !Ref LabVpc, !Ref VpcId]
+  NextSteps:
+    Value: !Sub 'Run: SCENARIO_LAB_STACK=${AWS::StackName} ./scripts/run-local.sh  (then open http://127.0.0.1:8080)'
+
+  # Exported so the services tier can reuse this network and instance profile
+  # instead of building a second copy of everything.
+  SubnetIdOut:
+    Description: Subnet the lab hosts run in
+    Value: !If [CreateNetwork, !Ref LabSubnet, !Ref SubnetId]
+    Export: { Name: !Sub '${AWS::StackName}-SubnetId' }
+  SecurityGroupIdOut:
+    Description: Security group for lab hosts (egress plus host-to-host)
+    Value: !Ref ScenarioHostSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-SecurityGroupId' }
+  InstanceProfileOut:
+    Description: Instance profile granting SSM and CloudWatch access
+    Value: !Ref ScenarioHostProfile
+    Export: { Name: !Sub '${AWS::StackName}-InstanceProfile' }
+  VpcIdOut:
+    Description: VPC the lab runs in
+    Value: !If [CreateNetwork, !Ref LabVpc, !Ref VpcId]
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }

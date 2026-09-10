@@ -1,0 +1,246 @@
+{
+  "name": "DB Log Analysis PostgreSQL EC2",
+  "ai_invocable": true,
+  "definition": {
+    "inputs": [
+      {
+        "id": "region",
+        "type": "string",
+        "default": "us-east-1",
+        "description": "AWS region holding the log group."
+      },
+      {
+        "id": "incident_time",
+        "type": "string",
+        "default": "",
+        "description": "RFC3339 incident time for a manual run. Leave empty on an event-triggered run to use the event's own start time."
+      },
+      {
+        "id": "log_group",
+        "type": "string",
+        "default": "/nudgebee-scenario-lab/postgresql",
+        "description": "CloudWatch log group holding the PostgreSQL logs."
+      },
+      {
+        "id": "event_id",
+        "type": "string",
+        "default": "",
+        "description": "Event to attach the analysis to. Leave empty to run standalone."
+      }
+    ],
+    "tasks": [
+      {
+        "id": "window",
+        "type": "data.transform",
+        "layout": {
+          "x": 400,
+          "y": 280
+        },
+        "params": {
+          "input": "{\"starts_at\": \"{{ Inputs.event.starts_at | default('') }}\", \"override\": \"{{ Inputs.incident_time | default('') }}\", \"lead_minutes\": 15, \"baseline_minutes\": 60}",
+          "inputType": "json",
+          "expression": "var lead = (data.lead_minutes || 15) * 60000;\nvar baselineSpan = (data.baseline_minutes || 60) * 60000;\n\n// Prefer an explicit override (manual runs on a past incident), then the\n// triggering event's start, then now.\nvar raw = data.override || data.starts_at || '';\nvar anchor = raw ? new Date(raw) : new Date();\nif (isNaN(anchor.getTime())) { anchor = new Date(); }\n\nvar now = new Date();\nvar incidentStart = new Date(anchor.getTime() - lead);\n// Cap the tail so a manual run against an old incident does not scan for days.\nvar incidentEnd = new Date(Math.min(now.getTime(), anchor.getTime() + 30 * 60000));\nvar baselineStart = new Date(incidentStart.getTime() - baselineSpan);\n\nfunction iso(d) { return d.toISOString().replace(/\\.\\d{3}Z$/, 'Z'); }\n({\n  anchor: iso(anchor),\n  incident_start: iso(incidentStart),\n  incident_end: iso(incidentEnd),\n  baseline_start: iso(baselineStart),\n  baseline_end: iso(incidentStart),\n  searched: 'incident ' + iso(incidentStart) + ' to ' + iso(incidentEnd) +\n            ' (anchor ' + iso(anchor) + ' minus ' + (lead / 60000) + 'm lead), ' +\n            'baseline ' + iso(baselineStart) + ' to ' + iso(incidentStart)\n})",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        }
+      },
+      {
+        "id": "logs_errors",
+        "type": "observability.logs",
+        "layout": {
+          "x": -140,
+          "y": 460
+        },
+        "params": {
+          "query": "fields @timestamp, @message\n| filter @message like /(FATAL|PANIC|ERROR):/\n| parse @message /\\[(?<pid>\\d+)\\]\\s+(?<sqlstate>[0-9A-Z]{5})\\s*(?<ctx>\\S+@\\S+)?\\s*(?<severity>FATAL|PANIC|ERROR):\\s+(?<detail>.*)/\n| sort @timestamp desc\n| limit 200",
+          "region": "{{ Inputs.region }}",
+          "duration": "",
+          "end_time": "{{ Tasks.window.output.data.incident_end }}",
+          "log_group": "{{ Inputs.log_group }}",
+          "start_time": "{{ Tasks.window.output.data.incident_start }}",
+          "account_provider_type": "aws"
+        },
+        "depends_on": [
+          "window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "logs_error_patterns",
+        "type": "observability.logs",
+        "layout": {
+          "x": 220,
+          "y": 460
+        },
+        "params": {
+          "query": "fields @timestamp, @message\n| filter @message like /(FATAL|PANIC|ERROR):/\n| parse @message /\\[(?<pid>\\d+)\\]\\s+(?<sqlstate>[0-9A-Z]{5})\\s*(?<ctx>\\S+@\\S+)?\\s*(?<severity>FATAL|PANIC|ERROR):\\s+(?<detail>.*)/\n| stats count(*) as occurrences,\n        earliest(@timestamp) as first_seen,\n        latest(@timestamp) as last_seen\n        by severity, sqlstate\n| sort occurrences desc\n| limit 50",
+          "region": "{{ Inputs.region }}",
+          "duration": "",
+          "end_time": "{{ Tasks.window.output.data.incident_end }}",
+          "log_group": "{{ Inputs.log_group }}",
+          "start_time": "{{ Tasks.window.output.data.incident_start }}",
+          "account_provider_type": "aws"
+        },
+        "depends_on": [
+          "window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "logs_baseline_patterns",
+        "type": "observability.logs",
+        "layout": {
+          "x": 580,
+          "y": 460
+        },
+        "params": {
+          "query": "fields @timestamp, @message\n| filter @message like /(FATAL|PANIC|ERROR):/\n| parse @message /\\[(?<pid>\\d+)\\]\\s+(?<sqlstate>[0-9A-Z]{5})\\s*(?<ctx>\\S+@\\S+)?\\s*(?<severity>FATAL|PANIC|ERROR):\\s+(?<detail>.*)/\n| stats count(*) as occurrences by severity, sqlstate\n| sort occurrences desc\n| limit 50",
+          "region": "{{ Inputs.region }}",
+          "duration": "",
+          "end_time": "{{ Tasks.window.output.data.baseline_end }}",
+          "log_group": "{{ Inputs.log_group }}",
+          "start_time": "{{ Tasks.window.output.data.baseline_start }}",
+          "account_provider_type": "aws"
+        },
+        "depends_on": [
+          "window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "logs_connection_events",
+        "type": "observability.logs",
+        "layout": {
+          "x": 940,
+          "y": 460
+        },
+        "params": {
+          "query": "fields @timestamp, @message\n| filter @message like /(?i)(too many clients|remaining connection slots|password authentication failed|no pg_hba.conf entry|terminating connection)/\n| sort @timestamp desc\n| limit 100",
+          "region": "{{ Inputs.region }}",
+          "duration": "",
+          "end_time": "{{ Tasks.window.output.data.incident_end }}",
+          "log_group": "{{ Inputs.log_group }}",
+          "start_time": "{{ Tasks.window.output.data.incident_start }}",
+          "account_provider_type": "aws"
+        },
+        "depends_on": [
+          "window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "correlate",
+        "if": "true",
+        "type": "data.transform",
+        "layout": {
+          "x": 400,
+          "y": 640
+        },
+        "params": {
+          "input": "{\"searched\": \"{{ Tasks.window.output.data.searched }}\", \"errors\": {{ Tasks.logs_errors.output | default('') | to_json }}, \"incident_patterns\": {{ Tasks.logs_error_patterns.output | default('') | to_json }}, \"baseline_patterns\": {{ Tasks.logs_baseline_patterns.output | default('') | to_json }}, \"connection_events\": {{ Tasks.logs_connection_events.output | default('') | to_json }}}",
+          "inputType": "json",
+          "expression": "function rows(x) { return (x && x.logs) ? x.logs : []; }\nfunction key(r) {\n  var l = r.labels || {};\n  return (l.severity || '?') + ' ' + (l.sqlstate || 'no-sqlstate');\n}\nfunction count(r) { return parseInt((r.labels || {}).occurrences || '0', 10) || 0; }\n\n// A collection task that FAILED has no output at all, which reaches this\n// script as an empty string and yields zero rows — indistinguishable from a\n// window that genuinely contained no errors. Successful queries always carry a\n// metadata block, so its presence is the proof that the query actually ran.\n//\n// This is not hypothetical: CloudWatch hard-rejects (MalformedQueryException)\n// any window ending before the log group was created, so on a freshly-shipped\n// host the baseline query fails outright and every error would otherwise be\n// reported as brand new.\nfunction ran(x) { return !!(x && x.metadata); }\nvar baselineRan = ran(data.baseline_patterns);\n\nvar incident = rows(data.incident_patterns);\nvar baseline = rows(data.baseline_patterns);\nvar errorRows = rows(data.errors);\nvar connRows = rows(data.connection_events);\n\nvar base = {};\nbaseline.forEach(function (r) { base[key(r)] = count(r); });\n\nvar isNew = [], elevated = [], persistent = [], unclassified = [];\nincident.forEach(function (r) {\n  var k = key(r), c = count(r), b = base[k] || 0;\n  var entry = { pattern: k, incident_count: c, baseline_count: b };\n  if (!baselineRan) { unclassified.push(entry); }\n  else if (b === 0) { isNew.push(entry); }\n  else if (c > b) { elevated.push(entry); }\n  else { persistent.push(entry); }\n});\nisNew.sort(function (a, b2) { return b2.incident_count - a.incident_count; });\nelevated.sort(function (a, b2) { return b2.incident_count - a.incident_count; });\n\nvar md = data.metadata || {};\n({\n  window: data.searched || '',\n  // Row counts make \"no errors\" provably different from \"the query never ran\".\n  collected: {\n    errors: errorRows.length,\n    incident_patterns: incident.length,\n    baseline_patterns: baseline.length,\n    connection_events: connRows.length\n  },\n  queries_ran: {\n    errors: ran(data.errors),\n    incident_patterns: ran(data.incident_patterns),\n    baseline_patterns: baselineRan,\n    connection_events: ran(data.connection_events)\n  },\n  baseline_available: baselineRan,\n  unclassified_patterns: unclassified,\n  new_patterns: isNew,\n  elevated_patterns: elevated,\n  persistent_patterns: persistent,\n  verdict: !baselineRan\n      ? (incident.length > 0\n          ? ('warning: ' + incident.length + ' error class(es) in the incident window, but the '\n             + 'baseline query did not run, so whether they are new is unknown')\n          : 'info: no errors in the incident window; baseline query did not run')\n      : isNew.length > 0\n      ? ('critical: ' + isNew.length + ' error class(es) appear only during the incident')\n      : (elevated.length > 0\n          ? ('warning: ' + elevated.length + ' error class(es) elevated versus baseline')\n          : (errorRows.length > 0\n              ? 'info: errors present but unchanged from baseline'\n              : 'info: no errors logged in the incident window')),\n  sample_errors: errorRows.slice(0, 15).map(function (r) {\n    return { time: r.timestamp || '', message: r.message || '' };\n  }),\n  connection_failures: connRows.slice(0, 10).map(function (r) {\n    return { time: r.timestamp || '', message: r.message || '' };\n  })\n})",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        },
+        "depends_on": [
+          "logs_errors",
+          "logs_error_patterns",
+          "logs_baseline_patterns",
+          "logs_connection_events"
+        ]
+      },
+      {
+        "id": "interpret",
+        "if": "true",
+        "type": "llm.summary",
+        "layout": {
+          "x": 400,
+          "y": 820
+        },
+        "params": {
+          "message": "You are helping an on-call engineer read database log evidence that has already been collected and correlated deterministically. Do not invent causes and do not contradict the counts.\n\nExplain, in at most six sentences: what the error classes mean, whether the new-versus-baseline split points at a cause, and what to check next.\n\nEvidence:\n{{ Tasks.correlate.output.data | default('') | to_json }}"
+        },
+        "depends_on": [
+          "correlate"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "attach_evidence",
+        "if": "{% if Inputs.event_id or Inputs.event %}true{% else %}false{% endif %}",
+        "type": "events.add_evidence",
+        "layout": {
+          "x": 400,
+          "y": 1000
+        },
+        "params": {
+          "event_id": "{% if Inputs.event_id %}{{ Inputs.event_id }}{% else %}{{ Inputs.event.id }}{% endif %}",
+          "evidences": [
+            {
+              "data": "## Database log analysis\n\n**Verdict:** {{ Tasks.correlate.output.data.verdict | default('(correlation failed)') }}\n\n**Searched:** {{ Tasks.correlate.output.data.window | default('unknown') }}\n\n**Collected:** ```{{ Tasks.correlate.output.data.collected | default('') | to_json }}```\n\n### New error classes (incident only)\n\n```json\n{{ Tasks.correlate.output.data.new_patterns | default('') | to_json }}\n```\n\n### Elevated versus baseline\n\n```json\n{{ Tasks.correlate.output.data.elevated_patterns | default('') | to_json }}\n```\n\n### Sample errors\n\n```json\n{{ Tasks.correlate.output.data.sample_errors | default('') | to_json }}\n```\n\n### Interpretation (AI-generated, not authoritative)\n\n{{ Tasks.interpret.output.data | default('(interpretation unavailable)') }}\n",
+              "type": "markdown",
+              "title": "Database log analysis",
+              "insight": [],
+              "additional_info": {
+                "title": "Database log analysis",
+                "action_name": "db_log_analysis",
+                "actual_action_name": "text_enricher"
+              }
+            }
+          ]
+        },
+        "depends_on": [
+          "correlate",
+          "interpret"
+        ]
+      }
+    ],
+    "layout": {
+      "viewport": {
+        "x": 349.5,
+        "y": -70.25,
+        "zoom": 0.75
+      }
+    },
+    "timeout": "5m",
+    "version": "v1",
+    "triggers": [
+      {
+        "type": "event",
+        "layout": {
+          "x": 210,
+          "y": 100
+        },
+        "params": {
+          "on": "event.created",
+          "filter": "{{ event.subject_type == \"compute-instance\" and event.labels.aws_event_state == \"ALARM\" and event.labels.aws_event_metric_name in [\"pg_up\", \"pg_connections_pct\", \"pg_blocked_sessions\"] }}"
+        }
+      },
+      {
+        "type": "manual",
+        "layout": {
+          "x": 590,
+          "y": 100
+        }
+      }
+    ],
+    "retry_policy": {
+      "initial_interval": "1s",
+      "maximum_attempts": 3,
+      "maximum_interval": "1m",
+      "backoff_coefficient": 2
+    },
+    "llm_description": "Deterministic collection, error extraction, pattern grouping and baseline correlation of PostgreSQL logs for an EC2 incident window. AI interprets, it does not decide."
+  }
+}

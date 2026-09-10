@@ -1,127 +1,284 @@
 {
-  "version": "v1",
-  "inputs": [
-    {
-      "id": "account_id",
-      "type": "account",
-      "description": "Cloud account owning the resource. Pick your own AWS account in NudgeBee."
-    },
-    {
-      "id": "instance_id",
-      "type": "string",
-      "description": "EC2 instance id, e.g. i-0f568ef22d52139bb."
-    },
-    {
-      "id": "region",
-      "type": "string",
-      "default": "us-east-1",
-      "description": "AWS region of the instance."
-    },
-    {
-      "id": "namespace",
-      "type": "string",
-      "default": "AWS/EC2",
-      "description": "CloudWatch namespace. AWS/EC2 for CPUUtilization, NetworkOut, NetworkIn, DiskReadBytes, DiskWriteBytes, StatusCheckFailed. CWAgent for MemoryUtilization, DiskUtilization and anything else the CloudWatch agent publishes."
-    },
-    {
-      "id": "metric_name",
-      "type": "string",
-      "default": "CPUUtilization",
-      "description": "Metric that alarmed, e.g. CPUUtilization, MemoryUtilization, DiskUtilization, NetworkOut, StatusCheckFailed."
-    },
-    {
-      "id": "window_start",
-      "type": "string",
-      "description": "ISO8601 UTC start of the window, e.g. 2026-09-03T12:00:00Z. Set this earlier than the alarm if you want to see what preceded it - the tool returns exactly the window you ask for and nothing outside it."
-    },
-    {
-      "id": "window_end",
-      "type": "string",
-      "description": "ISO8601 UTC end of the window, e.g. 2026-09-03T12:30:00Z."
-    },
-    {
-      "id": "host_action",
-      "type": "string",
-      "default": "triage",
-      "description": "What to read from the host. Default triage (load, top CPU/memory processes, disk, boot time). Others: top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes. All read-only."
-    }
-  ],
-  "triggers": [
-    {
-      "type": "manual"
-    }
-  ],
-  "tasks": [
-    {
-      "id": "metrics",
-      "type": "aws.cli",
-      "params": {
-        "account_id": "{{ Inputs.account_id }}",
-        "command": "aws cloudwatch get-metric-statistics --namespace {{ Inputs.namespace }} --metric-name {{ Inputs.metric_name }} --dimensions Name=InstanceId,Value={{ Inputs.instance_id }} --start-time {{ Inputs.window_start }} --end-time {{ Inputs.window_end }} --period 60 --statistics Average Maximum --region {{ Inputs.region }} --output json"
+  "name": "ec2-investigation",
+  "ai_invocable": true,
+  "definition": {
+    "inputs": [
+      {
+        "id": "account_id",
+        "type": "account",
+        "description": "Cloud account owning the instance."
+      },
+      {
+        "id": "instance_id",
+        "type": "string",
+        "description": "EC2 instance id, e.g. i-0123456789abcdef0."
+      },
+      {
+        "id": "region",
+        "type": "string",
+        "default": "us-east-1",
+        "description": "AWS region of the instance."
+      },
+      {
+        "id": "namespace",
+        "type": "string",
+        "default": "AWS/EC2",
+        "description": "CloudWatch namespace. AWS/EC2 for CPUUtilization, NetworkOut, NetworkIn, DiskReadBytes, DiskWriteBytes, StatusCheckFailed. CWAgent for MemoryUtilization, DiskUtilization and anything else the CloudWatch agent publishes."
+      },
+      {
+        "id": "metric_name",
+        "type": "string",
+        "default": "CPUUtilization",
+        "description": "Metric that alarmed, e.g. CPUUtilization, MemoryUtilization, DiskUtilization, NetworkOut, StatusCheckFailed."
+      },
+      {
+        "id": "window_start",
+        "type": "string",
+        "description": "ISO8601 UTC start of the window, e.g. 2026-09-03T12:00:00Z. Set this earlier than the alarm if you want to see what preceded it - the tool returns exactly the window you ask for and nothing outside it."
+      },
+      {
+        "id": "window_end",
+        "type": "string",
+        "description": "ISO8601 UTC end of the window, e.g. 2026-09-03T12:30:00Z."
+      },
+      {
+        "id": "host_action",
+        "type": "string",
+        "default": "triage",
+        "description": "What to read from the host. Default triage (load, top CPU/memory processes, disk, boot time). Others: top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes. All read-only."
+      },
+      {
+        "id": "event_id",
+        "type": "string",
+        "default": "",
+        "description": "Event to attach the analysis to. Leave empty on an event-triggered run — the triggering event is used."
+      }
+    ],
+    "tasks": [
+      {
+        "id": "resolve",
+        "type": "data.transform",
+        "layout": {
+          "x": 399,
+          "y": 120
+        },
+        "params": {
+          "input": "{\"in_instance\":\"{{ Inputs.instance_id }}\",\"ev_instance\":\"{{ Inputs.event.labels.resource_id | default('') }}\",\"in_ns\":\"{{ Inputs.namespace }}\",\"ev_ns\":\"{{ Inputs.event.labels.aws_event_metric_namespace | default('') }}\",\"in_metric\":\"{{ Inputs.metric_name }}\",\"ev_metric\":\"{{ Inputs.event.labels.aws_event_metric_name | default('') }}\",\"in_start\":\"{{ Inputs.window_start }}\",\"in_end\":\"{{ Inputs.window_end }}\",\"ev_start\":\"{{ Inputs.event.starts_at | default('') }}\",\"in_region\":\"{{ Inputs.region }}\",\"ev_region\":\"{{ Inputs.event.labels.aws_region | default('') }}\"}",
+          "inputType": "json",
+          "expression": "function iso(x){ return x.toISOString().replace(/\\.\\d{3}Z$/,'Z'); }\nvar anchor = data.ev_start ? new Date(data.ev_start) : new Date();\nif (isNaN(anchor.getTime())) { anchor = new Date(); }\nvar now = new Date();\n// 30m of lead so the graph shows what preceded the alarm, not just the breach.\nvar start = data.in_start || iso(new Date(anchor.getTime() - 30*60000));\nvar end   = data.in_end   || iso(new Date(Math.min(now.getTime(), anchor.getTime() + 10*60000)));\n({\n  instance_id: data.in_instance || data.ev_instance || '',\n  namespace:   data.ev_ns     || data.in_ns     || 'AWS/EC2',\n  metric_name: data.ev_metric || data.in_metric || 'CPUUtilization',\n  region:      data.in_region || data.ev_region || 'us-east-1',\n  window_start: start, window_end: end,\n  window_label: start + ' to ' + end\n})",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        }
+      },
+      {
+        "id": "metrics",
+        "type": "aws.cli",
+        "layout": {
+          "x": 220,
+          "y": 280
+        },
+        "params": {
+          "command": "aws cloudwatch get-metric-statistics --namespace {{ Tasks['resolve'].output.data.namespace }} --metric-name {{ Tasks['resolve'].output.data.metric_name }} --dimensions Name=InstanceId,Value={{ Tasks['resolve'].output.data.instance_id }} --start-time {{ Tasks['resolve'].output.data.window_start }} --end-time {{ Tasks['resolve'].output.data.window_end }} --period 60 --statistics Average Maximum --region {{ Tasks['resolve'].output.data.region }} --output json",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "resolve"
+        ]
+      },
+      {
+        "id": "ssm-commands",
+        "type": "aws.cli",
+        "layout": {
+          "x": 580,
+          "y": 280
+        },
+        "params": {
+          "command": "aws ssm list-commands --instance-id {{ Tasks['resolve'].output.data.instance_id }} --filters key=InvokedAfter,value={{ Tasks['resolve'].output.data.window_start }} key=InvokedBefore,value={{ Tasks['resolve'].output.data.window_end }} --max-results 50 --region {{ Tasks['resolve'].output.data.region }} --output json",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "resolve"
+        ]
+      },
+      {
+        "id": "collect",
+        "type": "scripting.run_script",
+        "layout": {
+          "x": 400,
+          "y": 460
+        },
+        "params": {
+          "env": {
+            "INSTANCE": "{{ Tasks['resolve'].output.data.instance_id }}",
+            "SSM_JSON": "{{ Tasks['ssm-commands'].output.data }}",
+            "NAMESPACE": "{{ Tasks['resolve'].output.data.namespace }}",
+            "WINDOW_END": "{{ Tasks['resolve'].output.data.window_end }}",
+            "METRIC_JSON": "{{ Tasks['metrics'].output.data }}",
+            "METRIC_NAME": "{{ Tasks['resolve'].output.data.metric_name }}",
+            "WINDOW_START": "{{ Tasks['resolve'].output.data.window_start }}"
+          },
+          "script": "import base64, json, os, re\n\ndef load(name):\n    raw = os.environ.get(name, '') or '{}'\n    try:\n        return json.loads(raw)\n    except Exception:\n        return {}\n\nseries = load('METRIC_JSON')\nssm = load('SSM_JSON')\n\npoints = []\nfor p in series.get('Datapoints', []):\n    points.append({\n        'timestamp': p.get('Timestamp'),\n        'average': p.get('Average'),\n        'maximum': p.get('Maximum'),\n        'unit': p.get('Unit'),\n    })\npoints.sort(key=lambda x: str(x.get('timestamp') or ''))\n\n# Every command in the window is returned, in time order. Which of them\n# relates to the metric is a judgement, and this returns facts.\ncmds = []\n# SSM commands are frequently 'echo <base64> | base64 -d | bash' wrappers, so the raw\n# text is an unreadable blob. Decode it back to the script that actually ran - an\n# operator command nobody can read is the same as no evidence at all.\ndef readable(text):\n    out = []\n    for token in re.findall(r'[A-Za-z0-9+/=]{40,}', text):\n        try:\n            decoded = base64.b64decode(token + '=' * (-len(token) % 4)).decode('utf-8', 'replace')\n        except Exception:\n            continue\n        if decoded.count(chr(65533)) > len(decoded) / 10:\n            continue\n        out.append(decoded)\n    if not out:\n        return text\n    return chr(10).join(out)\n\n# Three different things arrive through this same channel and they answer different\n# questions. Counting them together is what made an untouched host look worked-on.\n#   operator   - somebody did something, the only entry that explains a metric change\n#   fault      - the scenario lab injecting a known fault, self-marked nb-scenario:\n#   diagnostic - Nudgebee reading the host, self-marked nb-workflow:\ndef classify(c, decoded):\n    comment = (c.get('Comment') or '').lower()\n    if 'nb-workflow:' in decoded:\n        return 'diagnostic'\n    if 'nb-scenario:' in decoded or 'scenario-lab' in comment:\n        return 'fault'\n    return 'operator'\nfor c in ssm.get('Commands', []):\n    text = (c.get('Parameters') or {}).get('commands') or []\n    if isinstance(text, list):\n        text = ' ; '.join(str(x) for x in text)\n    entry = {\n        'requested_at': c.get('RequestedDateTime'),\n        'command_id': c.get('CommandId'),\n        'document': c.get('DocumentName'),\n        'status': c.get('Status'),\n        'comment': c.get('Comment'),\n        'command': readable(text),\n    }\n    entry['issued_by'] = classify(c, entry['command'])\n    cmds.append(entry)\ncmds.sort(key=lambda c: str(c.get('requested_at') or ''))\noperator_cmds = [c for c in cmds if c.get('issued_by') == 'operator']\nfault_cmds = [c for c in cmds if c.get('issued_by') == 'fault']\ndiagnostic_cmds = [c for c in cmds if c.get('issued_by') == 'diagnostic']\n\nprint(json.dumps({\n    'instance_id': os.environ.get('INSTANCE', ''),\n    'metric_name': os.environ.get('METRIC_NAME', ''),\n    'namespace': os.environ.get('NAMESPACE', ''),\n    'window_start': os.environ.get('WINDOW_START', ''),\n    'window_end': os.environ.get('WINDOW_END', ''),\n    'datapoint_count': len(points),\n    'datapoints': points,\n    'ssm_command_count': len(cmds),\n    'operator_commands': operator_cmds,\n    'fault_commands': fault_cmds,\n    'diagnostic_count': len(diagnostic_cmds),\n    'operator_count': len(operator_cmds),\n    'fault_count': len(fault_cmds),\n    'ssm_commands': cmds,\n    'operator_commands': operator_cmds,\n    'fault_commands': fault_cmds,\n    'diagnostic_count': len(diagnostic_cmds),\n    'operator_count': len(operator_cmds),\n    'fault_count': len(fault_cmds),\n}, default=str))",
+          "os_type": "linux",
+          "language": "python",
+          "account_id": "{{ Inputs.account_id }}",
+          "parser_type": "json"
+        },
+        "depends_on": [
+          "metrics",
+          "ssm-commands",
+          "resolve"
+        ]
+      },
+      {
+        "id": "inspect-host",
+        "type": "scripting.run_script",
+        "layout": {
+          "x": 400,
+          "y": 640
+        },
+        "params": {
+          "env": {
+            "ACTION": "{{ Inputs.host_action }}"
+          },
+          "region": "{{ Tasks['resolve'].output.data.region }}",
+          "script": "#!/bin/bash\n# nb-workflow:ec2-investigation read-only host inspection\nset -o pipefail\nACTION=\"${ACTION:-triage}\"\nhr() { echo; echo \"===== $1 =====\"; }\ncase \"$ACTION\" in\n  triage)\n    hr \"uptime / load\"; uptime\n    hr \"top 10 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -11\n    hr \"top 10 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,cmd --sort=-pmem 2>/dev/null | head -11\n    hr \"memory\"; free -m 2>/dev/null\n    hr \"disk\"; df -hP 2>/dev/null\n    hr \"boot time\"; who -b 2>/dev/null; uptime -s 2>/dev/null ;;\n  top_cpu)    hr \"top 20 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -21 ;;\n  top_memory) hr \"top 20 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pmem 2>/dev/null | head -21 ;;\n  disk_usage) hr \"filesystems\"; df -hP 2>/dev/null; hr \"largest dirs under /var\"; du -xh --max-depth=2 /var 2>/dev/null | sort -rh | head -20 ;;\n  memory_usage) hr \"free\"; free -m 2>/dev/null; hr \"meminfo\"; head -20 /proc/meminfo 2>/dev/null ;;\n  network_connections) hr \"listening\"; ss -tulpn 2>/dev/null | head -60; hr \"established\"; ss -tnp state established 2>/dev/null | head -60 ;;\n  running_services) hr \"running units\"; systemctl list-units --type=service --state=running --no-pager 2>/dev/null | head -60 ;;\n  failed_services) hr \"failed units\"; systemctl --failed --no-pager 2>/dev/null ;;\n  recent_logins) hr \"last logins\"; last -a -n 40 2>/dev/null; hr \"logged in now\"; w 2>/dev/null ;;\n  shell_history)\n    hr \"shell history (most recent 100 per user)\"\n    for f in /root/.bash_history /home/*/.bash_history; do\n      [ -r \"$f\" ] || continue; echo \"--- $f\"; tail -100 \"$f\" 2>/dev/null\n    done ;;\n  cron_jobs)\n    hr \"system crontab\"; cat /etc/crontab 2>/dev/null\n    hr \"cron.d\"; ls -la /etc/cron.d 2>/dev/null\n    hr \"per-user crontabs\"\n    for u in $(cut -d: -f1 /etc/passwd 2>/dev/null); do\n      out=$(crontab -l -u \"$u\" 2>/dev/null); [ -n \"$out\" ] && { echo \"--- $u\"; echo \"$out\"; }\n    done\n    hr \"systemd timers\"; systemctl list-timers --all --no-pager 2>/dev/null | head -30 ;;\n  recent_syslog) hr \"journal (warning+, last 200)\"; journalctl -p warning -n 200 --no-pager 2>/dev/null ;;\n  process_tree) hr \"process tree\"; ps -ejH -o pid,ppid,user,pcpu,etime,cmd 2>/dev/null | head -120 ;;\n  boot_time) hr \"boot\"; who -b 2>/dev/null; uptime -s 2>/dev/null; uptime ;;\n  package_changes)\n    hr \"recent package activity\"\n    if command -v rpm >/dev/null 2>&1; then rpm -qa --last 2>/dev/null | head -40; fi\n    if command -v dpkg >/dev/null 2>&1; then grep -h ' install \\| upgrade ' /var/log/dpkg.log 2>/dev/null | tail -40; fi ;;\n  *) echo \"ERROR: unknown host_action '$ACTION'\"; exit 2 ;;\nesac\n",
+          "os_type": "linux",
+          "language": "bash",
+          "target_id": "{{ Tasks['resolve'].output.data.instance_id }}",
+          "account_id": "{{ Inputs.account_id }}",
+          "executor_type": "aws_ssm"
+        },
+        "depends_on": [
+          "collect",
+          "resolve"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "report",
+        "type": "core.print",
+        "layout": {
+          "x": 400,
+          "y": 820
+        },
+        "params": {
+          "message": "EC2 data — {{ Tasks['resolve'].output.data.instance_id }} ({{ Tasks['resolve'].output.data.region }})\nMetric: {{ Tasks['resolve'].output.data.namespace }} / {{ Tasks['resolve'].output.data.metric_name }}   Window: {{ Tasks['resolve'].output.data.window_start }} to {{ Tasks['resolve'].output.data.window_end }}\n\nDatapoints ({{ Tasks['collect'].output.data.datapoint_count }}):\n{{ Tasks['collect'].output.data.datapoints }}\n\nSSM commands in window ({{ Tasks['collect'].output.data.ssm_command_count }}):\n{{ Tasks['collect'].output.data.ssm_commands }}\n\nHost inspection ({{ Inputs.host_action }}):\n{{ Tasks['inspect-host'].output.data }}\n"
+        },
+        "depends_on": [
+          "collect",
+          "inspect-host",
+          "resolve"
+        ]
+      },
+      {
+        "id": "attach_evidence",
+        "if": "{% if Inputs.event_id or Inputs.event %}true{% else %}false{% endif %}",
+        "type": "events.add_evidence",
+        "layout": {
+          "x": 400,
+          "y": 960
+        },
+        "params": {
+          "event_id": "{% if Inputs.event_id %}{{ Inputs.event_id }}{% else %}{{ Inputs.event.id }}{% endif %}",
+          "evidences": [
+            {
+              "data": "{{ Tasks['chart'].output.data | to_json }}",
+              "type": "json",
+              "insight": [],
+              "additional_info": {
+                "title": "CPU over the alarm window",
+                "action_name": "ec2_metric_window",
+                "action_type": "metrics",
+                "actual_action_name": "metrics"
+              }
+            },
+            {
+              "data": "**{{ Tasks['collect'].output.data.operator_count }} operator command(s)** ran on this host inside the window.\n\nThis is the number that matters: a metric change that coincides with one of these is\nattributable to it. Nudgebee's own diagnostic reads are counted separately below and\nare never operator activity.\n\n```\n{{ Tasks['collect'].output.data.operator_commands }}\n```\n\n### Injected faults ({{ Tasks['collect'].output.data.fault_count }})\n\nScenario-lab commands, self-marked. Present only in the lab.\n\n```\n{{ Tasks['collect'].output.data.fault_commands }}\n```\n\n### Nudgebee diagnostics: {{ Tasks['collect'].output.data.diagnostic_count }}\n\nRead-only inspections run by this automation. Listed for completeness, excluded from\nthe operator count.\n",
+              "type": "markdown",
+              "title": "Did anyone change this host?",
+              "insight": [],
+              "additional_info": {
+                "title": "Did anyone change this host?",
+                "action_name": "ec2_operator_commands",
+                "actual_action_name": "text_enricher"
+              }
+            },
+            {
+              "data": "Read from the instance over SSM at analysis time ({{ Inputs.host_action }}), not from a metric.\n\n```\n{{ Tasks['inspect-host'].output.data }}\n```\n",
+              "type": "markdown",
+              "title": "What the host is doing right now",
+              "insight": [],
+              "additional_info": {
+                "title": "What the host is doing right now",
+                "action_name": "ec2_host_state",
+                "actual_action_name": "text_enricher"
+              }
+            }
+          ]
+        },
+        "depends_on": [
+          "collect",
+          "inspect-host",
+          "chart"
+        ]
+      },
+      {
+        "id": "chart",
+        "type": "data.transform",
+        "layout": {
+          "x": 700,
+          "y": 560
+        },
+        "params": {
+          "input": "{\"raw\": {{ Tasks['metrics'].output.data | to_json }}, \"name\": \"{{ Tasks['resolve'].output.data.metric_name }}\", \"ns\": \"{{ Tasks['resolve'].output.data.namespace }}\", \"instance\": \"{{ Tasks['resolve'].output.data.instance_id }}\", \"region\": \"{{ Tasks['resolve'].output.data.region }}\", \"start\": \"{{ Tasks['resolve'].output.data.window_start }}\", \"end\": \"{{ Tasks['resolve'].output.data.window_end }}\"}",
+          "inputType": "json",
+          "expression": "var src = data.raw;\nif (typeof src === 'string') { try { src = JSON.parse(src); } catch (e) { src = {}; } }\nvar pts = (src && src.Datapoints) || [];\npts.sort(function (a, b) { return new Date(a.Timestamp) - new Date(b.Timestamp); });\nvar values = [], stamps = [];\npts.forEach(function (p) {\n  var v = (p.Average !== undefined && p.Average !== null) ? p.Average : p.Maximum;\n  var ms = new Date(p.Timestamp).getTime();\n  if (v === undefined || v === null || isNaN(ms)) { return; }\n  values.push(v);\n  // Epoch SECONDS as a number. The chart renders each label with\n  // convertNumberToTimestamp(e * 1000), so an ISO string multiplies to NaN and every\n  // tick prints NaN-NaN-aN - the series still draws, so it looks like a formatting\n  // quirk rather than the wrong data type.\n  stamps.push(Math.floor(ms / 1000));\n});\n({ results: [ { payload: [ {\n  metric: { instance: data.instance, metric: data.name, namespace: data.ns },\n  timestamps: stamps, values: values\n} ] } ] })",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        },
+        "depends_on": [
+          "metrics",
+          "resolve"
+        ]
+      }
+    ],
+    "layout": {
+      "viewport": {
+        "x": 340.5,
+        "y": 72.35000000000002,
+        "zoom": 0.75
       }
     },
-    {
-      "id": "ssm-commands",
-      "type": "aws.cli",
-      "params": {
-        "account_id": "{{ Inputs.account_id }}",
-        "command": "aws ssm list-commands --instance-id {{ Inputs.instance_id }} --filters key=InvokedAfter,value={{ Inputs.window_start }} key=InvokedBefore,value={{ Inputs.window_end }} --max-results 50 --region {{ Inputs.region }} --output json"
+    "timeout": "5m",
+    "version": "v1",
+    "triggers": [
+      {
+        "type": "event",
+        "layout": {
+          "x": 209,
+          "y": -45
+        },
+        "params": {
+          "on": "event.created",
+          "filter": "{{ event.subject_type == \"compute-instance\" and event.labels.aws_event_state == \"ALARM\" and event.labels.aws_event_metric_name in [\"CPUUtilization\",\"StatusCheckFailed\",\"StatusCheckFailed_Instance\",\"StatusCheckFailed_System\",\"mem_used_percent\",\"disk_used_percent\",\"MemoryUtilization\",\"DiskUtilization\",\"NetworkOut\"] }}"
+        }
+      },
+      {
+        "type": "manual",
+        "layout": {
+          "x": 722,
+          "y": -30
+        }
       }
+    ],
+    "retry_policy": {
+      "initial_interval": "1s",
+      "maximum_attempts": 3,
+      "maximum_interval": "1m",
+      "backoff_coefficient": 2
     },
-    {
-      "id": "collect",
-      "type": "scripting.run_script",
-      "params": {
-        "language": "python",
-        "parser_type": "json",
-        "env": {
-          "METRIC_JSON": "{{ Tasks['metrics'].output.data }}",
-          "SSM_JSON": "{{ Tasks['ssm-commands'].output.data }}",
-          "INSTANCE": "{{ Inputs.instance_id }}",
-          "METRIC_NAME": "{{ Inputs.metric_name }}",
-          "NAMESPACE": "{{ Inputs.namespace }}",
-          "WINDOW_START": "{{ Inputs.window_start }}",
-          "WINDOW_END": "{{ Inputs.window_end }}"
-        },
-        "script": "import json, os\n\ndef load(name):\n    raw = os.environ.get(name, '') or '{}'\n    try:\n        return json.loads(raw)\n    except Exception:\n        return {}\n\nseries = load('METRIC_JSON')\nssm = load('SSM_JSON')\n\npoints = []\nfor p in series.get('Datapoints', []):\n    points.append({\n        'timestamp': p.get('Timestamp'),\n        'average': p.get('Average'),\n        'maximum': p.get('Maximum'),\n        'unit': p.get('Unit'),\n    })\npoints.sort(key=lambda x: str(x.get('timestamp') or ''))\n\n# Every command in the window is returned, in time order. Which of them\n# relates to the metric is a judgement, and this returns facts.\ncmds = []\nfor c in ssm.get('Commands', []):\n    text = (c.get('Parameters') or {}).get('commands') or []\n    if isinstance(text, list):\n        text = ' ; '.join(str(x) for x in text)\n    cmds.append({\n        'requested_at': c.get('RequestedDateTime'),\n        'command_id': c.get('CommandId'),\n        'document': c.get('DocumentName'),\n        'status': c.get('Status'),\n        'comment': c.get('Comment'),\n        'command_text': text,\n    })\ncmds.sort(key=lambda c: str(c.get('requested_at') or ''))\n\nprint(json.dumps({\n    'instance_id': os.environ.get('INSTANCE', ''),\n    'metric_name': os.environ.get('METRIC_NAME', ''),\n    'namespace': os.environ.get('NAMESPACE', ''),\n    'window_start': os.environ.get('WINDOW_START', ''),\n    'window_end': os.environ.get('WINDOW_END', ''),\n    'datapoint_count': len(points),\n    'datapoints': points,\n    'ssm_command_count': len(cmds),\n    'ssm_commands': cmds,\n}, default=str))"
-      },
-      "depends_on": [
-        "metrics",
-        "ssm-commands"
-      ]
-    },
-    {
-      "id": "inspect-host",
-      "type": "scripting.run_script",
-      "failure_policy": {
-        "action": "continue"
-      },
-      "params": {
-        "executor_type": "aws_ssm",
-        "target_id": "{{ Inputs.instance_id }}",
-        "region": "{{ Inputs.region }}",
-        "account_id": "{{ Inputs.account_id }}",
-        "language": "bash",
-        "env": {
-          "ACTION": "{{ Inputs.host_action }}"
-        },
-        "script": "#!/bin/bash\nset -o pipefail\nACTION=\"${ACTION:-triage}\"\nhr() { echo; echo \"===== $1 =====\"; }\ncase \"$ACTION\" in\n  triage)\n    hr \"uptime / load\"; uptime\n    hr \"top 10 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -11\n    hr \"top 10 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,cmd --sort=-pmem 2>/dev/null | head -11\n    hr \"memory\"; free -m 2>/dev/null\n    hr \"disk\"; df -hP 2>/dev/null\n    hr \"boot time\"; who -b 2>/dev/null; uptime -s 2>/dev/null ;;\n  top_cpu)    hr \"top 20 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -21 ;;\n  top_memory) hr \"top 20 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pmem 2>/dev/null | head -21 ;;\n  disk_usage) hr \"filesystems\"; df -hP 2>/dev/null; hr \"largest dirs under /var\"; du -xh --max-depth=2 /var 2>/dev/null | sort -rh | head -20 ;;\n  memory_usage) hr \"free\"; free -m 2>/dev/null; hr \"meminfo\"; head -20 /proc/meminfo 2>/dev/null ;;\n  network_connections) hr \"listening\"; ss -tulpn 2>/dev/null | head -60; hr \"established\"; ss -tnp state established 2>/dev/null | head -60 ;;\n  running_services) hr \"running units\"; systemctl list-units --type=service --state=running --no-pager 2>/dev/null | head -60 ;;\n  failed_services) hr \"failed units\"; systemctl --failed --no-pager 2>/dev/null ;;\n  recent_logins) hr \"last logins\"; last -a -n 40 2>/dev/null; hr \"logged in now\"; w 2>/dev/null ;;\n  shell_history)\n    hr \"shell history (most recent 100 per user)\"\n    for f in /root/.bash_history /home/*/.bash_history; do\n      [ -r \"$f\" ] || continue; echo \"--- $f\"; tail -100 \"$f\" 2>/dev/null\n    done ;;\n  cron_jobs)\n    hr \"system crontab\"; cat /etc/crontab 2>/dev/null\n    hr \"cron.d\"; ls -la /etc/cron.d 2>/dev/null\n    hr \"per-user crontabs\"\n    for u in $(cut -d: -f1 /etc/passwd 2>/dev/null); do\n      out=$(crontab -l -u \"$u\" 2>/dev/null); [ -n \"$out\" ] && { echo \"--- $u\"; echo \"$out\"; }\n    done\n    hr \"systemd timers\"; systemctl list-timers --all --no-pager 2>/dev/null | head -30 ;;\n  recent_syslog) hr \"journal (warning+, last 200)\"; journalctl -p warning -n 200 --no-pager 2>/dev/null ;;\n  process_tree) hr \"process tree\"; ps -ejH -o pid,ppid,user,pcpu,etime,cmd 2>/dev/null | head -120 ;;\n  boot_time) hr \"boot\"; who -b 2>/dev/null; uptime -s 2>/dev/null; uptime ;;\n  package_changes)\n    hr \"recent package activity\"\n    if command -v rpm >/dev/null 2>&1; then rpm -qa --last 2>/dev/null | head -40; fi\n    if command -v dpkg >/dev/null 2>&1; then grep -h ' install \\| upgrade ' /var/log/dpkg.log 2>/dev/null | tail -40; fi ;;\n  *) echo \"ERROR: unknown host_action '$ACTION'\"; exit 2 ;;\nesac\n"
-      },
-      "depends_on": [
-        "collect"
-      ]
-    },
-    {
-      "id": "report",
-      "type": "core.print",
-      "params": {
-        "message": "EC2 data \u2014 {{ Inputs.instance_id }} ({{ Inputs.region }})\nMetric: {{ Inputs.namespace }} / {{ Inputs.metric_name }}   Window: {{ Inputs.window_start }} to {{ Inputs.window_end }}\n\nDatapoints ({{ Tasks['collect'].output.data.datapoint_count }}):\n{{ Tasks['collect'].output.data.datapoints }}\n\nSSM commands in window ({{ Tasks['collect'].output.data.ssm_command_count }}):\n{{ Tasks['collect'].output.data.ssm_commands }}\n\nHost inspection ({{ Inputs.host_action }}):\n{{ Tasks['inspect-host'].output.data }}\n"
-      },
-      "depends_on": [
-        "collect",
-        "inspect-host"
-      ]
-    }
-  ],
-  "llm_description": "Returns CloudWatch datapoints, SSM Run Command history and a read-only host inspection for one EC2 instance over a time window.\n\nThis is a data tool. It fetches and returns; it does not interpret. There is no verdict and no root cause - every SSM command in the window is returned in time order with its text, comment, status and timestamp, alongside the metric datapoints and live host state. Deciding what caused what is your job, not the tool's.\n\nSet namespace and metric_name to whatever you want to look at: AWS/EC2 for CPUUtilization, NetworkOut, NetworkIn, StatusCheckFailed, DiskReadBytes, DiskWriteBytes; CWAgent for MemoryUtilization and DiskUtilization. Widen window_start beyond the alarm to see what preceded it.\n\nhost_action chooses what is read from the host - default triage; also top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes.\n\nTwo things the data cannot tell you, which matter when reading it: SSH sessions, cron jobs and boot-time processes leave no trace in SSM history, and host inspection is a snapshot taken now, so a short-lived process may already be gone. An empty result is not evidence of absence.\n\nThe instance must be SSM-managed and online. Read-only: it never kills, restarts or reconfigures anything."
+    "llm_description": "Returns CloudWatch datapoints, SSM Run Command history and a read-only host inspection for one EC2 instance over a time window.\n\nThis is a data tool. It fetches and returns; it does not interpret. There is no verdict and no root cause - every SSM command in the window is returned in time order with its text, comment, status and timestamp, alongside the metric datapoints and live host state. Deciding what caused what is your job, not the tool's.\n\nSet namespace and metric_name to whatever you want to look at: AWS/EC2 for CPUUtilization, NetworkOut, NetworkIn, StatusCheckFailed, DiskReadBytes, DiskWriteBytes; CWAgent for MemoryUtilization and DiskUtilization. Widen window_start beyond the alarm to see what preceded it.\n\nhost_action chooses what is read from the host - default triage; also top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes.\n\nTwo things the data cannot tell you, which matter when reading it: SSH sessions, cron jobs and boot-time processes leave no trace in SSM history, and host inspection is a snapshot taken now, so a short-lived process may already be gone. An empty result is not evidence of absence.\n\nThe instance must be SSM-managed and online. Read-only: it never kills, restarts or reconfigures anything."
+  }
 }

@@ -316,11 +316,31 @@ healthy the whole time. That is precisely why connection failures get blamed on
 the database. They are there to be diagnosed, not detected, and inventing an
 alarm that half-worked would teach the wrong lesson.
 
+Three of the automations in `nudgebee/` are built for this tier — a six-category
+health check, connection troubleshooting, and log analysis. Import them before
+running these scenarios, or NudgeBee sees the alarm and has no way to look
+inside the database.
+
 The clearest pair to run back to back is **Database stopped** and **Database
 port filtered**. Both look like "can't connect". One refuses instantly, the
 other hangs until it times out — and that single difference is what separates a
 database problem from a network problem. Any answer that calls both of them
 "unreachable" has thrown away the only bit that decides who fixes it.
+
+---
+
+## Give NudgeBee something to investigate with
+
+`nudgebee/` holds six automations and one knowledge-base article to import.
+They are what NudgeBee uses to collect evidence — host inspection over SSM,
+CloudTrail activity, PostgreSQL diagnostics, log analysis — and the article
+tells it when to reach for each one.
+
+None of it is needed to watch an alarm go red. It is the difference between
+"an alarm went red" and "here is what happened, and here is the evidence".
+
+Three of the six are for the database tier and need a database integration.
+`nudgebee/README.md` has the import steps and what to fill in.
 
 ---
 
@@ -342,6 +362,7 @@ don't need to do anything.
 - `scenarios/catalogue.yaml` — the scenarios; adding one is a few lines of YAML
 - `control/` — the local control panel (Python, no external services)
 - `nudgebee/` — automations and a knowledge-base article to import into NudgeBee
+  (`nudgebee/README.md` covers importing them)
 - `scripts/verify-scenarios.sh` — checks every scenario still actually works
 
 Full detail lives in each of those directories.

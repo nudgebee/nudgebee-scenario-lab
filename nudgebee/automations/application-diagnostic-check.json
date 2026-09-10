@@ -1,0 +1,433 @@
+{
+  "name": "Application Diagnostic Check",
+  "ai_invocable": true,
+  "tags": {
+    "labels": "diagnostic,read-only,triage",
+    "alert_names": "StatusCheckFailed,StatusCheckFailed_Instance,StatusCheckFailed_System,UnHealthyHostCount,HTTPCode_Target_5XX_Count",
+    "event_sources": "AWS_CloudWatch_Alarm,AWS_EventBridge,cloudwatch,aws",
+    "subject_types": "ec2,instance,application,service"
+  },
+  "definition": {
+    "inputs": [
+      {
+        "id": "account_id",
+        "type": "string",
+        "description": "Cloud account ID"
+      },
+      {
+        "id": "region",
+        "type": "string",
+        "description": "AWS region (e.g. us-east-1)"
+      },
+      {
+        "id": "instance_id",
+        "type": "string",
+        "default": "",
+        "description": "EC2 instance ID. Leave empty to resolve the target from the application name."
+      },
+      {
+        "id": "application",
+        "type": "string",
+        "default": "",
+        "description": "Application / service name, matched against the EC2 Name tag. Used to resolve the target when no instance ID is given, and to locate the systemd unit on the host."
+      },
+      {
+        "id": "lookback",
+        "type": "string",
+        "default": "1h",
+        "description": "How far back to look for metrics, alarms and logs (Go duration, e.g. 30m, 1h, 6h)."
+      },
+      {
+        "id": "log_group",
+        "type": "string",
+        "default": "",
+        "description": "CloudWatch Logs group holding the application logs. Leave empty to skip the log evidence check."
+      },
+      {
+        "id": "log_filter",
+        "type": "string",
+        "default": "ERROR",
+        "description": "CloudWatch Logs filter pattern applied to the log group."
+      },
+      {
+        "id": "dependency_endpoints",
+        "type": "string",
+        "default": "",
+        "description": "Comma-separated host:port list probed from the instance itself (e.g. db.internal:5432,cache.internal:6379). Leave empty to skip connectivity probes."
+      },
+      {
+        "id": "collect_host_evidence",
+        "type": "string",
+        "default": "true",
+        "description": "Run the on-host evidence script over AWS SSM. Requires the SSM agent and an instance profile with AmazonSSMManagedInstanceCore."
+      },
+      {
+        "id": "incident_context",
+        "type": "string",
+        "default": "",
+        "description": "Incident or event identifier, echoed into the diagnostic result for traceability."
+      },
+      {
+        "id": "event_id",
+        "type": "string",
+        "default": "",
+        "description": "Event to attach the diagnostic result to. Leave empty to run standalone."
+      }
+    ],
+    "tasks": [
+      {
+        "id": "time_window",
+        "type": "data.transform",
+        "layout": {
+          "x": 220,
+          "y": 280
+        },
+        "params": {
+          "input": "{\"lookback\": \"{{ Inputs.lookback }}\"}",
+          "inputType": "json",
+          "expression": "var m = String(data.lookback || '1h').match(/^(\\d+)([smhd])$/);\nif (!m) { throw new Error('lookback must look like 30m, 1h or 6h, got: ' + data.lookback); }\nvar unitMs = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2]];\nvar end = new Date();\nvar start = new Date(end.getTime() - (parseInt(m[1], 10) * unitMs));\nfunction iso(d) { return d.toISOString().replace(/\\.\\d{3}Z$/, 'Z'); }\n({\n  start_iso: iso(start),\n  end_iso: iso(end),\n  start_ms: start.getTime(),\n  end_ms: end.getTime(),\n  lookback: data.lookback\n})\n",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        }
+      },
+      {
+        "id": "resolve_target",
+        "type": "cloud.aws.cli",
+        "layout": {
+          "x": 580,
+          "y": 280
+        },
+        "params": {
+          "command": "aws ec2 describe-instances --region {{ Inputs.region }} {% if Inputs.instance_id %}--instance-ids {{ Inputs.instance_id }}{% else %}--filters Name=tag:Name,Values=\"{{ Inputs.application }}\"{% endif %} --output json --query \"Reservations[].Instances[].{InstanceId:InstanceId,State:State.Name,StateReason:StateTransitionReason,Type:InstanceType,Az:Placement.AvailabilityZone,PrivateIp:PrivateIpAddress,PublicIp:PublicIpAddress,LaunchTime:LaunchTime,Name:Tags[?Key=='Name']|[0].Value}\"",
+          "account_id": "{{ Inputs.account_id }}"
+        }
+      },
+      {
+        "id": "select_instance",
+        "type": "data.transform",
+        "layout": {
+          "x": 640,
+          "y": 460
+        },
+        "params": {
+          "input": "{\n  \"instances\": {{ Tasks.resolve_target.output.data | default(\"\") | to_json }},\n  \"requested_instance_id\": {{ Inputs.instance_id | to_json }},\n  \"application\": {{ Inputs.application | to_json }}\n}\n",
+          "inputType": "json",
+          "expression": "var found = [];\ntry { found = JSON.parse(data.instances || '[]') || []; } catch (e) { found = []; }\nif (!found.length) {\n  throw new Error('No EC2 instance matched instance_id=\"' + data.requested_instance_id +\n    '\" application=\"' + data.application + '\". Check the region, the instance ID, or the Name tag.');\n}\nfound.sort(function (a, b) { return String(a.InstanceId).localeCompare(String(b.InstanceId)); });\nvar primary = found[0];\n({\n  instance_id: primary.InstanceId,\n  name: primary.Name || '',\n  state: primary.State || '',\n  state_reason: primary.StateReason || '',\n  instance_type: primary.Type || '',\n  availability_zone: primary.Az || '',\n  private_ip: primary.PrivateIp || '',\n  public_ip: primary.PublicIp || '',\n  launch_time: primary.LaunchTime || '',\n  matched_count: found.length,\n  matched: found\n})\n",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        },
+        "depends_on": [
+          "resolve_target"
+        ]
+      },
+      {
+        "id": "instance_status",
+        "type": "cloud.aws.cli",
+        "layout": {
+          "x": -1040,
+          "y": 640
+        },
+        "params": {
+          "command": "aws ec2 describe-instance-status --region {{ Inputs.region }} --instance-ids {{ Tasks.select_instance.output.data.instance_id }} --include-all-instances --output json --query \"InstanceStatuses[].{InstanceState:InstanceState.Name,SystemStatus:SystemStatus.Status,InstanceStatus:InstanceStatus.Status,Events:Events}\"",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "select_instance"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "cw_alarms",
+        "type": "cloud.aws.cli",
+        "layout": {
+          "x": -80,
+          "y": 640
+        },
+        "params": {
+          "command": "aws cloudwatch describe-alarms --region {{ Inputs.region }} --state-value ALARM --max-items 200 --output json --query \"MetricAlarms[].{Name:AlarmName,Metric:MetricName,Namespace:Namespace,Reason:StateReason,Updated:StateUpdatedTimestamp,Dimensions:Dimensions}\"",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "select_instance"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "cw_cpu",
+        "type": "cloud.aws.cli",
+        "layout": {
+          "x": 400,
+          "y": 640
+        },
+        "params": {
+          "command": "aws cloudwatch get-metric-statistics --region {{ Inputs.region }} --namespace AWS/EC2 --metric-name CPUUtilization --dimensions Name=InstanceId,Value={{ Tasks.select_instance.output.data.instance_id }} --start-time {{ Tasks.time_window.output.data.start_iso }} --end-time {{ Tasks.time_window.output.data.end_iso }} --period 300 --statistics Average Maximum --output json",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "select_instance",
+          "time_window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "cw_status_check",
+        "type": "cloud.aws.cli",
+        "layout": {
+          "x": 880,
+          "y": 640
+        },
+        "params": {
+          "command": "aws cloudwatch get-metric-statistics --region {{ Inputs.region }} --namespace AWS/EC2 --metric-name StatusCheckFailed --dimensions Name=InstanceId,Value={{ Tasks.select_instance.output.data.instance_id }} --start-time {{ Tasks.time_window.output.data.start_iso }} --end-time {{ Tasks.time_window.output.data.end_iso }} --period 300 --statistics Maximum Sum --output json",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "select_instance",
+          "time_window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "lb_target_groups",
+        "type": "cloud.aws.cli",
+        "layout": {
+          "x": -560,
+          "y": 640
+        },
+        "params": {
+          "command": "aws elbv2 describe-target-groups --region {{ Inputs.region }} --output json --query \"TargetGroups[?TargetType=='instance'].{Arn:TargetGroupArn,Name:TargetGroupName,Port:Port,Protocol:Protocol}\"",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "select_instance"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "lb_target_group_arns",
+        "type": "data.transform",
+        "layout": {
+          "x": 400,
+          "y": 820
+        },
+        "params": {
+          "input": "{\"groups\": {{ Tasks.lb_target_groups.output.data | default(\"\") | to_json }}}\n",
+          "inputType": "json",
+          "expression": "var groups = [];\ntry { groups = JSON.parse(data.groups || '[]') || []; } catch (e) { groups = []; }\ngroups.sort(function (a, b) { return String(a.Arn).localeCompare(String(b.Arn)); });\ngroups.slice(0, 10).map(function (g) { return g.Arn; });\n",
+          "outputType": "json",
+          "scriptType": "javascript"
+        },
+        "depends_on": [
+          "lb_target_groups"
+        ]
+      },
+      {
+        "id": "lb_target_health",
+        "type": "core.foreach",
+        "layout": {
+          "x": 400,
+          "y": 1000
+        },
+        "params": {
+          "item": "arn",
+          "items": "{{ Tasks.lb_target_group_arns.output.data }}",
+          "tasks": [
+            {
+              "id": "health",
+              "type": "cloud.aws.cli",
+              "params": {
+                "command": "aws elbv2 describe-target-health --region {{ Inputs.region }} --target-group-arn {{ LoopItem.arn }} --output json --query \"TargetHealthDescriptions[].{Id:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason,Description:TargetHealth.Description}\"",
+                "account_id": "{{ Inputs.account_id }}"
+              },
+              "failure_policy": {
+                "action": "continue"
+              }
+            }
+          ],
+          "output": {
+            "arn": "{{ LoopItem.arn }}",
+            "targets": "{{ Tasks.health.output.data | default('') }}"
+          },
+          "concurrency": 4
+        },
+        "depends_on": [
+          "lb_target_group_arns"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "app_logs",
+        "if": "{{ Inputs.log_group != '' }}",
+        "type": "cloud.aws.cli",
+        "layout": {
+          "x": 160,
+          "y": 460
+        },
+        "params": {
+          "command": "aws logs filter-log-events --region {{ Inputs.region }} --log-group-name \"{{ Inputs.log_group }}\" --start-time {{ Tasks.time_window.output.data.start_ms }} --end-time {{ Tasks.time_window.output.data.end_ms }} --filter-pattern \"{{ Inputs.log_filter }}\" --max-items 50 --output json --query \"events[].{Timestamp:timestamp,Stream:logStreamName,Message:message}\"",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "time_window"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "host_evidence",
+        "if": "{{ Inputs.collect_host_evidence == 'true' }}",
+        "type": "scripting.run_script",
+        "layout": {
+          "x": 1360,
+          "y": 640
+        },
+        "params": {
+          "env": {
+            "NB_APP": "{{ Inputs.application }}"
+          },
+          "region": "{{ Inputs.region }}",
+          "script": "APP=\"${NB_APP:-}\"\necho \"===METRIC:failed_units===\"\nsystemctl --failed --no-legend --plain 2>/dev/null | wc -l | tr -d ' '\necho \"===METRIC:disk_max_pct===\"\ndf -P -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1 {gsub(/%/,\"\",$5); if ($5+0>m) m=$5+0} END {print m+0}'\necho \"===METRIC:app_service_state===\"\nif [ -z \"$APP\" ]; then\n  echo \"not_checked\"\nelif [ -z \"$(systemctl list-unit-files --no-legend \"$APP.service\" 2>/dev/null)\" ]; then\n  echo \"no_such_unit\"\nelse\n  systemctl is-active \"$APP\" 2>/dev/null | head -1\nfi\necho \"===SECTION:uptime_load===\"\nuptime 2>&1\necho \"===SECTION:failed_units===\"\nsystemctl --failed --no-pager 2>&1 | head -30\necho \"===SECTION:app_service===\"\nif [ -n \"$APP\" ]; then systemctl status \"$APP\" --no-pager 2>&1 | head -30; else echo \"no application name supplied\"; fi\necho \"===SECTION:disk===\"\ndf -h -x tmpfs -x devtmpfs 2>&1\necho \"===SECTION:memory===\"\nfree -m 2>&1\necho \"===SECTION:top_processes===\"\nps -eo pcpu,pmem,pid,comm --sort=-pcpu 2>&1 | head -11\necho \"===SECTION:listening_sockets===\"\n(ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | head -30\necho \"===SECTION:recent_errors===\"\n(journalctl -p err -n 100 --no-pager 2>/dev/null || tail -100 /var/log/messages 2>/dev/null || echo \"no journal or syslog readable\")\necho \"===SECTION:app_journal===\"\nif [ -n \"$APP\" ]; then journalctl -u \"$APP\" -n 100 --no-pager 2>&1 || echo \"no journal for unit $APP\"; else echo \"no application name supplied\"; fi\n",
+          "os_type": "linux",
+          "language": "bash",
+          "target_id": "{{ Tasks.select_instance.output.data.instance_id }}",
+          "account_id": "{{ Inputs.account_id }}",
+          "executor_type": "aws_ssm"
+        },
+        "timeout": "5m",
+        "depends_on": [
+          "select_instance"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "dependency_probes",
+        "if": "{{ Inputs.dependency_endpoints != '' }}",
+        "type": "scripting.run_script",
+        "layout": {
+          "x": 1840,
+          "y": 640
+        },
+        "params": {
+          "env": {
+            "NB_ENDPOINTS": "{{ Inputs.dependency_endpoints }}"
+          },
+          "region": "{{ Inputs.region }}",
+          "script": "ENDPOINTS=\"${NB_ENDPOINTS:-}\"\necho \"$ENDPOINTS\" | tr ',' '\\n' | while read -r ep; do\n  ep=$(echo \"$ep\" | tr -d '[:space:]')\n  [ -z \"$ep\" ] && continue\n  host=${ep%:*}\n  port=${ep##*:}\n  if ! getent hosts \"$host\" >/dev/null 2>&1; then\n    echo \"$ep fail dns_resolution_failed\"\n    continue\n  fi\n  if timeout 5 bash -c \"cat < /dev/null > /dev/tcp/$host/$port\" 2>/dev/null; then\n    echo \"$ep ok tcp_connect_succeeded\"\n  else\n    echo \"$ep fail tcp_connect_failed_or_timed_out\"\n  fi\ndone\n",
+          "os_type": "linux",
+          "language": "bash",
+          "target_id": "{{ Tasks.select_instance.output.data.instance_id }}",
+          "account_id": "{{ Inputs.account_id }}",
+          "executor_type": "aws_ssm"
+        },
+        "timeout": "5m",
+        "depends_on": [
+          "select_instance"
+        ],
+        "failure_policy": {
+          "action": "continue"
+        }
+      },
+      {
+        "id": "diagnostic_result",
+        "if": "true",
+        "type": "data.transform",
+        "layout": {
+          "x": 400,
+          "y": 1180
+        },
+        "params": {
+          "input": "{\n  \"incident_context\": {{ Inputs.incident_context | to_json }},\n  \"application\": {{ Inputs.application | to_json }},\n  \"region\": {{ Inputs.region | to_json }},\n  \"log_group\": {{ Inputs.log_group | to_json }},\n  \"dependency_endpoints\": {{ Inputs.dependency_endpoints | to_json }},\n  \"collect_host_evidence\": {{ Inputs.collect_host_evidence | to_json }},\n  \"window\": {{ Tasks.time_window.output.data | default(\"\") | to_json }},\n  \"instance\": {{ Tasks.select_instance.output.data | default(\"\") | to_json }},\n  \"target_groups\": {{ Tasks.lb_target_groups.output.data | default(\"\") | to_json }},\n  \"instance_status_raw\": {{ Tasks.instance_status.output.data | default(\"\") | to_json }},\n  \"alarms_raw\": {{ Tasks.cw_alarms.output.data | default(\"\") | to_json }},\n  \"cpu_raw\": {{ Tasks.cw_cpu.output.data | default(\"\") | to_json }},\n  \"status_check_raw\": {{ Tasks.cw_status_check.output.data | default(\"\") | to_json }},\n  \"lb_health\": {{ Tasks.lb_target_health.output | default(\"\") | to_json }},\n  \"app_logs_raw\": {{ Tasks.app_logs.output.data | default(\"\") | to_json }},\n  \"host_raw\": {{ Tasks.host_evidence.output.data | default(\"\") | to_json }},\n  \"deps_raw\": {{ Tasks.dependency_probes.output.data | default(\"\") | to_json }},\n  \"instance_status_state\": {{ Tasks.instance_status.status | default(\"skipped\") | to_json }},\n  \"alarms_state\": {{ Tasks.cw_alarms.status | default(\"skipped\") | to_json }},\n  \"cpu_state\": {{ Tasks.cw_cpu.status | default(\"skipped\") | to_json }},\n  \"status_check_state\": {{ Tasks.cw_status_check.status | default(\"skipped\") | to_json }},\n  \"lb_state\": {{ Tasks.lb_target_health.status | default(\"skipped\") | to_json }},\n  \"app_logs_state\": {{ Tasks.app_logs.status | default(\"skipped\") | to_json }},\n  \"host_state\": {{ Tasks.host_evidence.status | default(\"skipped\") | to_json }},\n  \"deps_state\": {{ Tasks.dependency_probes.status | default(\"skipped\") | to_json }}\n}\n",
+          "inputType": "json",
+          "expression": "function parse(raw, fallback) {\n  if (raw === null || raw === undefined || String(raw).trim() === '') { return fallback; }\n  if (typeof raw === 'object') { return raw; }\n  try { return JSON.parse(raw); } catch (e) { return fallback; }\n}\nfunction ran(state) { return String(state).toLowerCase() === 'completed'; }\n\nvar instance = parse(data.instance, {});\nvar checks = [];\nvar findings = [];\nfunction check(name, state, note) { checks.push({ check: name, status: state, note: note || '' }); }\nfunction finding(severity, check_name, detail) { findings.push({ severity: severity, check: check_name, detail: detail }); }\n\n// --- instance state -------------------------------------------------\nvar state = String(instance.state || 'unknown');\ncheck('instance_state', state === 'running' ? 'ok' : 'problem', 'state=' + state);\nif (state !== 'running') {\n  finding('critical', 'instance_state',\n    'EC2 instance ' + instance.instance_id + ' is ' + state +\n    (instance.state_reason ? ' (' + instance.state_reason + ')' : ''));\n}\n\n// --- EC2 status checks ----------------------------------------------\nif (ran(data.instance_status_state)) {\n  var statuses = parse(data.instance_status_raw, []);\n  var s = statuses.length ? statuses[0] : null;\n  if (s) {\n    var sysOk = String(s.SystemStatus) === 'ok';\n    var instOk = String(s.InstanceStatus) === 'ok';\n    check('ec2_status_checks', sysOk && instOk ? 'ok' : 'problem',\n      'system=' + s.SystemStatus + ' instance=' + s.InstanceStatus);\n    if (!sysOk) { finding('critical', 'ec2_status_checks', 'System status check is ' + s.SystemStatus + ' (host/hypervisor level).'); }\n    if (!instOk) { finding('critical', 'ec2_status_checks', 'Instance status check is ' + s.InstanceStatus + ' (guest OS / network level).'); }\n    if (s.Events && s.Events.length) {\n      finding('warning', 'ec2_status_checks', 'AWS has ' + s.Events.length + ' scheduled event(s) for this instance.');\n    }\n  } else {\n    check('ec2_status_checks', 'unavailable', 'describe-instance-status returned no rows');\n  }\n} else {\n  check('ec2_status_checks', 'unavailable', 'collector did not run (' + data.instance_status_state + ')');\n}\n\n// --- CloudWatch alarms ----------------------------------------------\nif (ran(data.alarms_state)) {\n  var alarms = parse(data.alarms_raw, []);\n  var app = String(data.application || '');\n  var mine = alarms.filter(function (a) {\n    var hit = (a.Dimensions || []).some(function (d) { return String(d.Value) === String(instance.instance_id); });\n    if (!hit && app) { hit = String(a.Name || '').indexOf(app) !== -1; }\n    return hit;\n  });\n  check('cloudwatch_alarms', mine.length ? 'problem' : 'ok',\n    mine.length + ' of ' + alarms.length + ' region alarms in ALARM relate to this target');\n  mine.forEach(function (a) {\n    finding('critical', 'cloudwatch_alarms', 'Alarm \"' + a.Name + '\" is in ALARM: ' + a.Reason);\n  });\n} else {\n  check('cloudwatch_alarms', 'unavailable', 'collector did not run (' + data.alarms_state + ')');\n}\n\n// --- CPU --------------------------------------------------------------\nvar cpuMax = null;\nif (ran(data.cpu_state)) {\n  var cpu = parse(data.cpu_raw, {});\n  var pts = cpu.Datapoints || [];\n  if (pts.length) {\n    cpuMax = pts.reduce(function (m, p) { return Math.max(m, p.Maximum || 0); }, 0);\n    check('cpu_utilization', cpuMax >= 90 ? 'problem' : 'ok', 'max=' + cpuMax.toFixed(1) + '% over ' + pts.length + ' datapoints');\n    if (cpuMax >= 90) { finding('warning', 'cpu_utilization', 'CPU peaked at ' + cpuMax.toFixed(1) + '% in the lookback window.'); }\n  } else {\n    check('cpu_utilization', 'unavailable', 'no CloudWatch datapoints in the window');\n  }\n} else {\n  check('cpu_utilization', 'unavailable', 'collector did not run (' + data.cpu_state + ')');\n}\n\n// --- StatusCheckFailed metric -----------------------------------------\nif (ran(data.status_check_state)) {\n  var sc = parse(data.status_check_raw, {});\n  var scPts = sc.Datapoints || [];\n  var failed = scPts.reduce(function (n, p) { return n + (p.Sum || 0); }, 0);\n  if (scPts.length) {\n    check('status_check_metric', failed > 0 ? 'problem' : 'ok', failed + ' failed status-check periods');\n    if (failed > 0) { finding('critical', 'status_check_metric', 'StatusCheckFailed fired in ' + failed + ' period(s) during the window.'); }\n  } else {\n    check('status_check_metric', 'unavailable', 'no CloudWatch datapoints in the window');\n  }\n} else {\n  check('status_check_metric', 'unavailable', 'collector did not run (' + data.status_check_state + ')');\n}\n\n// --- load balancer target health ---------------------------------------\nvar allGroups = parse(data.target_groups, []);\nvar lbRows = parse(data.lb_health, []);\nvar registered = [];\nlbRows.forEach(function (row) {\n  if (!row) { return; }\n  var targets = parse(row.targets, []);\n  targets.forEach(function (t) {\n    if (String(t.Id) === String(instance.instance_id)) {\n      registered.push({ target_group: row.arn, port: t.Port, state: t.State, reason: t.Reason, description: t.Description });\n    }\n  });\n});\nif (!lbRows.length) {\n  check('lb_target_health', 'not_applicable', 'no instance-type target groups scanned');\n} else if (!registered.length) {\n  check('lb_target_health', 'not_applicable', 'instance is not registered in any of the ' + lbRows.length + ' target group(s) scanned');\n} else {\n  var unhealthy = registered.filter(function (r) { return String(r.state) !== 'healthy'; });\n  check('lb_target_health', unhealthy.length ? 'problem' : 'ok',\n    registered.length + ' registration(s), ' + unhealthy.length + ' not healthy');\n  unhealthy.forEach(function (r) {\n    finding('critical', 'lb_target_health',\n      'Target ' + instance.instance_id + ':' + r.port + ' in ' + r.target_group + ' is ' + r.state +\n      (r.reason ? ' (' + r.reason + (r.description ? ': ' + r.description : '') + ')' : ''));\n  });\n}\n\n// --- application logs ---------------------------------------------------\nvar logSamples = [];\nif (!String(data.log_group || '')) {\n  check('application_logs', 'not_configured', 'no log_group supplied');\n} else if (ran(data.app_logs_state)) {\n  logSamples = parse(data.app_logs_raw, []);\n  check('application_logs', logSamples.length ? 'problem' : 'ok',\n    logSamples.length + ' line(s) matching the filter in ' + data.log_group);\n  if (logSamples.length) {\n    finding('warning', 'application_logs',\n      logSamples.length + ' log line(s) matched \"' + data.log_group + '\" in the window. First: ' +\n      String(logSamples[0].Message || '').slice(0, 300));\n  }\n} else {\n  check('application_logs', 'unavailable', 'collector did not run (' + data.app_logs_state + ')');\n}\n\n// --- host evidence -------------------------------------------------------\nvar host = { metrics: {}, sections: {} };\nif (String(data.collect_host_evidence || '') !== 'true') {\n  check('host_evidence', 'not_configured', 'collect_host_evidence is off');\n} else if (String(data.host_state).toLowerCase() !== 'completed') {\n  check('host_evidence', 'unavailable', 'SSM collector did not run (' + data.host_state + ')');\n} else {\n  var text = String(data.host_raw || '');\n  text.split(/===(METRIC|SECTION):/).forEach(function (part, i, arr) {\n    if (part !== 'METRIC' && part !== 'SECTION') { return; }\n    var body = arr[i + 1] || '';\n    var nl = body.indexOf('\\n');\n    if (nl === -1) { return; }\n    var key = body.slice(0, nl).replace(/===$/, '').trim();\n    var value = body.slice(nl + 1).trim();\n    if (part === 'METRIC') { host.metrics[key] = value; } else { host.sections[key] = value; }\n  });\n  var failedUnits = parseInt(host.metrics.failed_units || '0', 10);\n  var diskPct = parseInt(host.metrics.disk_max_pct || '0', 10);\n  var svc = host.metrics.app_service_state || 'not_checked';\n  // no_such_unit means the application is not packaged as a systemd unit named\n  // after itself, which is ordinary — reporting it as a down service would be a\n  // false critical on every instance that runs its app any other way.\n  var svcDown = svc !== 'active' && svc !== 'not_checked' && svc !== 'no_such_unit';\n  var hostProblem = failedUnits > 0 || diskPct >= 90 || svcDown;\n  check('host_evidence', hostProblem ? 'problem' : 'ok',\n    'failed_units=' + failedUnits + ' max_disk=' + diskPct + '% service=' + svc);\n  if (failedUnits > 0) { finding('warning', 'host_evidence', failedUnits + ' systemd unit(s) in a failed state.'); }\n  if (diskPct >= 90) { finding('warning', 'host_evidence', 'A filesystem is ' + diskPct + '% full.'); }\n  if (svcDown) {\n    finding('critical', 'host_evidence', 'Service \"' + data.application + '\" is ' + svc + ' on the instance.');\n  }\n}\n\n// --- dependency connectivity ----------------------------------------------\nvar deps = [];\nif (!String(data.dependency_endpoints || '')) {\n  check('dependency_connectivity', 'not_configured', 'no dependency_endpoints supplied');\n} else if (String(data.deps_state).toLowerCase() !== 'completed') {\n  check('dependency_connectivity', 'unavailable', 'SSM probe did not run (' + data.deps_state + ')');\n} else {\n  String(data.deps_raw || '').split('\\n').forEach(function (line) {\n    var parts = line.trim().split(/\\s+/);\n    if (parts.length < 2) { return; }\n    deps.push({ endpoint: parts[0], status: parts[1], detail: parts.slice(2).join(' ') });\n  });\n  var down = deps.filter(function (d) { return d.status !== 'ok'; });\n  check('dependency_connectivity', down.length ? 'problem' : 'ok',\n    deps.length + ' endpoint(s) probed, ' + down.length + ' unreachable');\n  down.forEach(function (d) {\n    finding('critical', 'dependency_connectivity', 'Dependency ' + d.endpoint + ' unreachable from the instance (' + d.detail + ').');\n  });\n}\n\n// --- verdict ----------------------------------------------------------------\nvar rank = { critical: 0, warning: 1 };\nfindings.sort(function (a, b) { return rank[a.severity] - rank[b.severity]; });\nvar criticals = findings.filter(function (f) { return f.severity === 'critical'; }).length;\nvar warnings = findings.length - criticals;\nvar unavailable = checks.filter(function (c) { return c.status === 'unavailable'; }).length;\nvar status;\nif (criticals > 0) { status = 'critical'; }\nelse if (warnings > 0) { status = 'degraded'; }\nelse if (unavailable > 0) { status = 'inconclusive'; }\nelse { status = 'healthy'; }\n\n({\n  status: status,\n  summary: status === 'healthy'\n    ? 'No problem signals found across ' + checks.length + ' checks.'\n    : criticals + ' critical and ' + warnings + ' warning finding(s) across ' + checks.length + ' checks' +\n      (unavailable ? '; ' + unavailable + ' check(s) could not be collected.' : '.'),\n  incident_context: data.incident_context,\n  target: {\n    instance_id: instance.instance_id,\n    name: instance.name,\n    application: data.application,\n    state: instance.state,\n    instance_type: instance.instance_type,\n    availability_zone: instance.availability_zone,\n    private_ip: instance.private_ip,\n    public_ip: instance.public_ip,\n    launch_time: instance.launch_time,\n    region: data.region,\n    matched_instances: instance.matched_count\n  },\n  window: parse(data.window, {}),\n  findings: findings,\n  checks: checks,\n  coverage: {\n    total: checks.length,\n    collected: checks.length - unavailable,\n    unavailable: unavailable,\n    target_groups_found: allGroups.length,\n    target_groups_scanned: lbRows.length,\n    target_groups_truncated: allGroups.length > lbRows.length\n  },\n  evidence: {\n    cpu_max_percent: cpuMax,\n    lb_registrations: registered,\n    log_samples: logSamples.slice(0, 10),\n    dependency_probes: deps,\n    host_metrics: host.metrics,\n    host_sections: host.sections\n  }\n})\n",
+          "outputType": "raw",
+          "scriptType": "javascript"
+        },
+        "depends_on": [
+          "select_instance",
+          "instance_status",
+          "cw_alarms",
+          "cw_cpu",
+          "cw_status_check",
+          "lb_target_health",
+          "app_logs",
+          "host_evidence",
+          "dependency_probes"
+        ]
+      },
+      {
+        "id": "attach_evidence",
+        "if": "{% if Inputs.event_id %}true{% else %}false{% endif %}",
+        "type": "events.add_evidence",
+        "params": {
+          "event_id": "{{ Inputs.event_id }}",
+          "evidences": [
+            {
+              "data": "## Application diagnostic — {{ Tasks.diagnostic_result.output.data.target.name | default('instance') }}\n\n**Verdict:** {{ Tasks.diagnostic_result.output.data.status | default('unknown') }} — {{ Tasks.diagnostic_result.output.data.summary | default('no summary') }}\n\n**Findings**\n\n```json\n{{ Tasks.diagnostic_result.output.data.findings | default('[]') }}\n```\n\n**Checks**\n\n```json\n{{ Tasks.diagnostic_result.output.data.checks | default('[]') }}\n```\n\n**Coverage** — what was actually collected, so an empty finding is not read as a clean bill of health.\n\n```json\n{{ Tasks.diagnostic_result.output.data.coverage | default('{}') }}\n```\n\n**Evidence**\n\n```json\n{{ Tasks.diagnostic_result.output.data.evidence | default('{}') }}\n```\n",
+              "type": "markdown",
+              "title": "Application diagnostic",
+              "insight": [],
+              "additional_info": {
+                "title": "Application diagnostic",
+                "action_name": "application_diagnostic_check",
+                "actual_action_name": "text_enricher"
+              }
+            }
+          ]
+        },
+        "depends_on": [
+          "diagnostic_result"
+        ]
+      }
+    ],
+    "layout": {
+      "viewport": {
+        "x": 349.5,
+        "y": -137.75,
+        "zoom": 0.75
+      }
+    },
+    "output": {
+      "checks": "{{ Tasks.diagnostic_result.output.data.checks }}",
+      "status": "{{ Tasks.diagnostic_result.output.data.status }}",
+      "target": "{{ Tasks.diagnostic_result.output.data.target }}",
+      "window": "{{ Tasks.diagnostic_result.output.data.window }}",
+      "summary": "{{ Tasks.diagnostic_result.output.data.summary }}",
+      "coverage": "{{ Tasks.diagnostic_result.output.data.coverage }}",
+      "evidence": "{{ Tasks.diagnostic_result.output.data.evidence }}",
+      "findings": "{{ Tasks.diagnostic_result.output.data.findings }}",
+      "incident_context": "{{ Tasks.diagnostic_result.output.data.incident_context }}"
+    },
+    "timeout": "15m",
+    "version": "v1",
+    "triggers": [
+      {
+        "type": "manual",
+        "layout": {
+          "x": 400,
+          "y": 100
+        }
+      }
+    ],
+    "retry_policy": {
+      "initial_interval": "1s",
+      "maximum_attempts": 3,
+      "maximum_interval": "1m",
+      "backoff_coefficient": 2
+    },
+    "llm_description": "Runs a deterministic first-level diagnostic for an application incident on AWS EC2 and returns a structured result (overall status, ranked findings, per-check coverage, raw evidence). Use it as the opening step of an EC2 or application incident — status check failures, an application that is down or degraded, unhealthy load balancer targets — to collect the instance, CloudWatch, load balancer, log, host and dependency evidence in one pass before deciding on a remediation runbook."
+  }
+}

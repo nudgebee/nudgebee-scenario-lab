@@ -1,116 +1,154 @@
 {
-  "version": "v1",
-  "inputs": [
-    {
-      "id": "account_id",
-      "type": "account",
-      "description": "Cloud account owning the resource. Pick your own AWS account in NudgeBee."
-    },
-    {
-      "id": "resource_name",
-      "type": "string",
-      "description": "Resource identifier as CloudTrail records it - the name or id, not the full ARN."
-    },
-    {
-      "id": "region",
-      "type": "string",
-      "default": "us-east-1",
-      "description": "AWS region of the resource."
-    },
-    {
-      "id": "namespace",
-      "type": "string",
-      "default": "AWS/RDS",
-      "description": "CloudWatch namespace, e.g. AWS/RDS, AWS/Lambda, AWS/ECS, AWS/ApplicationELB, AWS/DynamoDB, AWS/ElastiCache, AWS/EC2."
-    },
-    {
-      "id": "metric_name",
-      "type": "string",
-      "default": "CPUUtilization",
-      "description": "Metric to fetch, e.g. CPUUtilization, DatabaseConnections, ReadLatency, Errors, Duration, Throttles, TargetResponseTime."
-    },
-    {
-      "id": "dimension_name",
-      "type": "string",
-      "default": "DBInstanceIdentifier",
-      "description": "CloudWatch dimension key for this resource type: DBInstanceIdentifier (RDS), FunctionName (Lambda), ServiceName (ECS), LoadBalancer (ALB), TableName (DynamoDB), CacheClusterId (ElastiCache), InstanceId (EC2). A key that does not match the resource type returns zero datapoints."
-    },
-    {
-      "id": "dimension_value",
-      "type": "string",
-      "description": "Value for that dimension. Usually the same as resource_name; ALB wants the app/name/id form."
-    },
-    {
-      "id": "period_seconds",
-      "type": "string",
-      "default": "60",
-      "description": "Datapoint granularity in seconds."
-    },
-    {
-      "id": "window_start",
-      "type": "string",
-      "description": "ISO8601 UTC start of the window, e.g. 2026-09-03T12:00:00Z. Set this earlier than the alarm if you want to see what preceded it."
-    },
-    {
-      "id": "window_end",
-      "type": "string",
-      "description": "ISO8601 UTC end of the window."
-    }
-  ],
-  "triggers": [
-    {
-      "type": "manual"
-    }
-  ],
-  "tasks": [
-    {
-      "id": "metrics",
-      "type": "aws.cli",
-      "params": {
-        "account_id": "{{ Inputs.account_id }}",
-        "command": "aws cloudwatch get-metric-statistics --namespace {{ Inputs.namespace }} --metric-name {{ Inputs.metric_name }} --dimensions Name={{ Inputs.dimension_name }},Value={{ Inputs.dimension_value }} --start-time {{ Inputs.window_start }} --end-time {{ Inputs.window_end }} --period {{ Inputs.period_seconds }} --statistics Average Maximum --region {{ Inputs.region }} --output json"
+  "name": "aws-resource-investigation",
+  "ai_invocable": true,
+  "definition": {
+    "inputs": [
+      {
+        "id": "account_id",
+        "type": "account",
+        "description": "Cloud account owning the resource."
+      },
+      {
+        "id": "resource_name",
+        "type": "string",
+        "description": "Resource identifier as CloudTrail records it - the name or id, not the full ARN."
+      },
+      {
+        "id": "region",
+        "type": "string",
+        "default": "us-east-1",
+        "description": "AWS region of the resource."
+      },
+      {
+        "id": "namespace",
+        "type": "string",
+        "default": "AWS/RDS",
+        "description": "CloudWatch namespace, e.g. AWS/RDS, AWS/Lambda, AWS/ECS, AWS/ApplicationELB, AWS/DynamoDB, AWS/ElastiCache, AWS/EC2."
+      },
+      {
+        "id": "metric_name",
+        "type": "string",
+        "default": "CPUUtilization",
+        "description": "Metric to fetch, e.g. CPUUtilization, DatabaseConnections, ReadLatency, Errors, Duration, Throttles, TargetResponseTime."
+      },
+      {
+        "id": "dimension_name",
+        "type": "string",
+        "default": "DBInstanceIdentifier",
+        "description": "CloudWatch dimension key for this resource type: DBInstanceIdentifier (RDS), FunctionName (Lambda), ServiceName (ECS), LoadBalancer (ALB), TableName (DynamoDB), CacheClusterId (ElastiCache), InstanceId (EC2). A key that does not match the resource type returns zero datapoints."
+      },
+      {
+        "id": "dimension_value",
+        "type": "string",
+        "description": "Value for that dimension. Usually the same as resource_name; ALB wants the app/name/id form."
+      },
+      {
+        "id": "period_seconds",
+        "type": "string",
+        "default": "60",
+        "description": "Datapoint granularity in seconds."
+      },
+      {
+        "id": "window_start",
+        "type": "string",
+        "description": "ISO8601 UTC start of the window, e.g. 2026-09-03T12:00:00Z. Set this earlier than the alarm if you want to see what preceded it."
+      },
+      {
+        "id": "window_end",
+        "type": "string",
+        "description": "ISO8601 UTC end of the window."
       }
-    },
-    {
-      "id": "cloudtrail",
-      "type": "aws.cli",
-      "params": {
-        "account_id": "{{ Inputs.account_id }}",
-        "command": "aws cloudtrail lookup-events --lookup-attributes AttributeKey=ResourceName,AttributeValue={{ Inputs.resource_name }} --start-time {{ Inputs.window_start }} --end-time {{ Inputs.window_end }} --max-results 50 --region {{ Inputs.region }} --output json"
-      }
-    },
-    {
-      "id": "collect",
-      "type": "scripting.run_script",
-      "depends_on": [
-        "metrics",
-        "cloudtrail"
-      ],
-      "params": {
-        "language": "python",
-        "parser_type": "json",
-        "env": {
-          "METRIC_JSON": "{{ Tasks['metrics'].output.data }}",
-          "TRAIL_JSON": "{{ Tasks['cloudtrail'].output.data }}",
-          "RESOURCE": "{{ Inputs.resource_name }}",
-          "METRIC_NAME": "{{ Inputs.metric_name }}",
-          "NAMESPACE": "{{ Inputs.namespace }}",
-          "WINDOW_START": "{{ Inputs.window_start }}",
-          "WINDOW_END": "{{ Inputs.window_end }}"
+    ],
+    "tasks": [
+      {
+        "id": "metrics",
+        "type": "aws.cli",
+        "layout": {
+          "x": 220,
+          "y": 280
         },
-        "script": "import json, os\n\ndef load(name):\n    raw = os.environ.get(name, '') or '{}'\n    try:\n        return json.loads(raw)\n    except Exception:\n        return {}\n\nseries = load('METRIC_JSON')\ntrail = load('TRAIL_JSON')\n\npoints = []\nfor p in series.get('Datapoints', []):\n    points.append({\n        'timestamp': p.get('Timestamp'),\n        'average': p.get('Average'),\n        'maximum': p.get('Maximum'),\n        'unit': p.get('Unit'),\n    })\npoints.sort(key=lambda x: str(x.get('timestamp') or ''))\n\n# Every event is returned, including read-only ones. Whether a call is\n# relevant is a judgement, and this returns facts.\nevents = []\nfor e in trail.get('Events', []):\n    detail = {}\n    try:\n        detail = json.loads(e.get('CloudTrailEvent') or '{}')\n    except Exception:\n        pass\n    events.append({\n        'event_time': e.get('EventTime'),\n        'event_name': e.get('EventName'),\n        'event_source': e.get('EventSource'),\n        'username': e.get('Username'),\n        'read_only': detail.get('readOnly'),\n        'source_ip': detail.get('sourceIPAddress'),\n        'user_agent': (detail.get('userAgent') or '')[:160],\n        'error_code': detail.get('errorCode'),\n        'request_parameters': detail.get('requestParameters'),\n        'resources': [r.get('ResourceName') for r in (e.get('Resources') or [])],\n    })\nevents.sort(key=lambda x: str(x.get('event_time') or ''))\n\nprint(json.dumps({\n    'resource': os.environ.get('RESOURCE', ''),\n    'metric_name': os.environ.get('METRIC_NAME', ''),\n    'namespace': os.environ.get('NAMESPACE', ''),\n    'window_start': os.environ.get('WINDOW_START', ''),\n    'window_end': os.environ.get('WINDOW_END', ''),\n    'datapoint_count': len(points),\n    'datapoints': points,\n    'api_event_count': len(events),\n    'api_events': events,\n}, default=str))"
+        "params": {
+          "command": "aws cloudwatch get-metric-statistics --namespace {{ Inputs.namespace }} --metric-name {{ Inputs.metric_name }} --dimensions Name={{ Inputs.dimension_name }},Value={{ Inputs.dimension_value }} --start-time {{ Inputs.window_start }} --end-time {{ Inputs.window_end }} --period {{ Inputs.period_seconds }} --statistics Average Maximum --region {{ Inputs.region }} --output json",
+          "account_id": "{{ Inputs.account_id }}"
+        }
+      },
+      {
+        "id": "cloudtrail",
+        "type": "aws.cli",
+        "layout": {
+          "x": 580,
+          "y": 280
+        },
+        "params": {
+          "command": "aws cloudtrail lookup-events --lookup-attributes AttributeKey=ResourceName,AttributeValue={{ Inputs.resource_name }} --start-time {{ Inputs.window_start }} --end-time {{ Inputs.window_end }} --max-results 50 --region {{ Inputs.region }} --output json",
+          "account_id": "{{ Inputs.account_id }}"
+        }
+      },
+      {
+        "id": "collect",
+        "type": "scripting.run_script",
+        "layout": {
+          "x": 400,
+          "y": 460
+        },
+        "params": {
+          "env": {
+            "RESOURCE": "{{ Inputs.resource_name }}",
+            "NAMESPACE": "{{ Inputs.namespace }}",
+            "TRAIL_JSON": "{{ Tasks['cloudtrail'].output.data }}",
+            "WINDOW_END": "{{ Inputs.window_end }}",
+            "METRIC_JSON": "{{ Tasks['metrics'].output.data }}",
+            "METRIC_NAME": "{{ Inputs.metric_name }}",
+            "WINDOW_START": "{{ Inputs.window_start }}"
+          },
+          "script": "import json, os\n\ndef load(name):\n    raw = os.environ.get(name, '') or '{}'\n    try:\n        return json.loads(raw)\n    except Exception:\n        return {}\n\nseries = load('METRIC_JSON')\ntrail = load('TRAIL_JSON')\n\npoints = []\nfor p in series.get('Datapoints', []):\n    points.append({\n        'timestamp': p.get('Timestamp'),\n        'average': p.get('Average'),\n        'maximum': p.get('Maximum'),\n        'unit': p.get('Unit'),\n    })\npoints.sort(key=lambda x: str(x.get('timestamp') or ''))\n\n# Every event is returned, including read-only ones. Whether a call is\n# relevant is a judgement, and this returns facts.\nevents = []\nfor e in trail.get('Events', []):\n    detail = {}\n    try:\n        detail = json.loads(e.get('CloudTrailEvent') or '{}')\n    except Exception:\n        pass\n    events.append({\n        'event_time': e.get('EventTime'),\n        'event_name': e.get('EventName'),\n        'event_source': e.get('EventSource'),\n        'username': e.get('Username'),\n        'read_only': detail.get('readOnly'),\n        'source_ip': detail.get('sourceIPAddress'),\n        'user_agent': (detail.get('userAgent') or '')[:160],\n        'error_code': detail.get('errorCode'),\n        'request_parameters': detail.get('requestParameters'),\n        'resources': [r.get('ResourceName') for r in (e.get('Resources') or [])],\n    })\nevents.sort(key=lambda x: str(x.get('event_time') or ''))\n\nprint(json.dumps({\n    'resource': os.environ.get('RESOURCE', ''),\n    'metric_name': os.environ.get('METRIC_NAME', ''),\n    'namespace': os.environ.get('NAMESPACE', ''),\n    'window_start': os.environ.get('WINDOW_START', ''),\n    'window_end': os.environ.get('WINDOW_END', ''),\n    'datapoint_count': len(points),\n    'datapoints': points,\n    'api_event_count': len(events),\n    'api_events': events,\n}, default=str))",
+          "language": "python",
+          "parser_type": "json"
+        },
+        "depends_on": [
+          "metrics",
+          "cloudtrail"
+        ]
+      },
+      {
+        "id": "report",
+        "type": "core.print",
+        "layout": {
+          "x": 400,
+          "y": 640
+        },
+        "params": {
+          "message": "AWS resource data — {{ Inputs.resource_name }} ({{ Inputs.region }})\nMetric: {{ Inputs.namespace }} / {{ Inputs.metric_name }}   Window: {{ Inputs.window_start }} to {{ Inputs.window_end }}\n\nDatapoints ({{ Tasks['collect'].output.data.datapoint_count }}):\n{{ Tasks['collect'].output.data.datapoints }}\n\nCloudTrail events ({{ Tasks['collect'].output.data.api_event_count }}, read-only included, `read_only` flags each):\n{{ Tasks['collect'].output.data.api_events }}\n"
+        },
+        "depends_on": [
+          "collect"
+        ]
+      }
+    ],
+    "layout": {
+      "viewport": {
+        "x": 264.7,
+        "y": 1,
+        "zoom": 0.9
       }
     },
-    {
-      "id": "report",
-      "type": "core.print",
-      "depends_on": [
-        "collect"
-      ],
-      "params": {
-        "message": "AWS resource data \u2014 {{ Inputs.resource_name }} ({{ Inputs.region }})\nMetric: {{ Inputs.namespace }} / {{ Inputs.metric_name }}   Window: {{ Inputs.window_start }} to {{ Inputs.window_end }}\n\nDatapoints ({{ Tasks['collect'].output.data.datapoint_count }}):\n{{ Tasks['collect'].output.data.datapoints }}\n\nCloudTrail events ({{ Tasks['collect'].output.data.api_event_count }}, read-only included, `read_only` flags each):\n{{ Tasks['collect'].output.data.api_events }}\n"
+    "timeout": "5m",
+    "version": "v1",
+    "triggers": [
+      {
+        "type": "manual",
+        "layout": {
+          "x": 400,
+          "y": 100
+        }
       }
-    }
-  ],
-  "llm_description": "Returns CloudWatch datapoints and CloudTrail activity for one AWS resource over a time window. RDS, ECS, Lambda, ALB, DynamoDB, ElastiCache, EC2 - anything with a CloudWatch metric.\n\nThis is a data tool. It fetches and returns; it does not interpret. There is no verdict, no root cause and no filtering - every CloudTrail event in the window is returned, each flagged read_only true/false, with the caller, source IP, request parameters and any error code. Deciding which of them matters is your job, not the tool's.\n\nSet namespace, metric_name, dimension_name and dimension_value for the metric, and resource_name for the CloudTrail lookup. Widen window_start beyond the alarm if you want to see what preceded it - the tool returns exactly the window you ask for and nothing outside it.\n\nTypical dimensions: RDS DBInstanceIdentifier, Lambda FunctionName, ECS ServiceName, ALB LoadBalancer, DynamoDB TableName, ElastiCache CacheClusterId, EC2 InstanceId. A dimension key that does not match the resource type returns zero datapoints.\n\nFor EC2 also consider ec2-investigation, which additionally returns SSM command history and can run a read-only inspection on the host.\n\nRead-only. It never changes anything."
+    ],
+    "retry_policy": {
+      "initial_interval": "1s",
+      "maximum_attempts": 3,
+      "maximum_interval": "1m",
+      "backoff_coefficient": 2
+    },
+    "llm_description": "Returns CloudWatch datapoints and CloudTrail activity for one AWS resource over a time window. RDS, ECS, Lambda, ALB, DynamoDB, ElastiCache, EC2 - anything with a CloudWatch metric.\n\nThis is a data tool. It fetches and returns; it does not interpret. There is no verdict, no root cause and no filtering - every CloudTrail event in the window is returned, each flagged read_only true/false, with the caller, source IP, request parameters and any error code. Deciding which of them matters is your job, not the tool's.\n\nSet namespace, metric_name, dimension_name and dimension_value for the metric, and resource_name for the CloudTrail lookup. Widen window_start beyond the alarm if you want to see what preceded it - the tool returns exactly the window you ask for and nothing outside it.\n\nTypical dimensions: RDS DBInstanceIdentifier, Lambda FunctionName, ECS ServiceName, ALB LoadBalancer, DynamoDB TableName, ElastiCache CacheClusterId, EC2 InstanceId. A dimension key that does not match the resource type returns zero datapoints.\n\nFor EC2 also consider ec2-investigation, which additionally returns SSM command history and can run a read-only inspection on the host.\n\nRead-only. It never changes anything."
+  }
 }

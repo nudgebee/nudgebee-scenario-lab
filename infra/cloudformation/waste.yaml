@@ -243,6 +243,6 @@ Outputs:
     Value: !Sub 'aws ec2 stop-instances --instance-ids ${StoppedInstance}'
   EstimatedMonthlyCost:
     Description: Rough on-demand cost if left running (us-east-1)
-    Value: !Sub 'oversized ${OversizedInstanceType} dominates - see docs/07-cost.md. Delete the stack when finished.'
+    Value: !Sub 'oversized ${OversizedInstanceType} dominates - see "What it costs" in the README. Delete the stack when finished.'
   TearDown:
     Value: !Sub 'aws cloudformation delete-stack --stack-name ${AWS::StackName}'

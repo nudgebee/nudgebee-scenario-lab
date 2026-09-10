@@ -157,6 +157,22 @@ The panel runs on your own machine, using your own AWS access — the same
 profile as the commands above. It prints which one on startup. Nothing is
 hosted by NudgeBee and nothing is sent anywhere.
 
+**If port 8080 is already taken** — and on a developer's machine it usually is
+— pick another one:
+
+```bash
+PORT=9000 ./scripts/run-local.sh
+```
+
+The address it prints on startup is the one to open, so read that rather than
+copying the 8080 above. If the port is in use you'll see
+`address already in use` instead, which is this and not a broken lab.
+
+Running the panel through Docker Compose instead? The port is fixed in
+`control/docker-compose.yml`. Change the first `8080` in
+`"127.0.0.1:8080:8080"` — that one is the port on your machine. Leave the
+second alone; it's the port inside the container.
+
 ### 4. Break something
 
 Pick a scenario, press **Start**. Then watch NudgeBee.

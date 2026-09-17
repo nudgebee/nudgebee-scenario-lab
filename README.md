@@ -246,6 +246,18 @@ That's what you're evaluating.
 
 ---
 
+## Kubernetes scenarios
+
+If you already run Kubernetes with the NudgeBee agent installed, there is a
+second set of scenarios that runs against your own cluster instead of the lab:
+[`kubernetes/`](kubernetes/).
+
+They work the same way — break something on purpose, watch NudgeBee explain it
+— but there is nothing to deploy first, and the failure has a cause you made
+thirty seconds earlier rather than an alarm threshold you crossed.
+
+---
+
 ## The waste tier (optional)
 
 ```bash

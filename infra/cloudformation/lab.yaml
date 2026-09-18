@@ -278,13 +278,14 @@ Resources:
           set -x
           # cronie is NOT present on Amazon Linux 2023, and runaway_cron needs
           # a working scheduler or it silently does nothing.
-          dnf install -y stress-ng amazon-cloudwatch-agent cronie || yum install -y stress-ng amazon-cloudwatch-agent cronie || true
+          dnf install -y stress-ng amazon-cloudwatch-agent cronie awscli-2 || yum install -y stress-ng amazon-cloudwatch-agent cronie awscli || true
           systemctl enable --now crond || true
           mkdir -p /opt/nudgebee-scenario
           cat >/opt/aws/amazon-cloudwatch-agent/etc/cw-agent.json <<'CWCFG'
           {
             "metrics": {
               "append_dimensions": { "InstanceId": "${!aws:InstanceId}" },
+              "aggregation_dimensions": [ [ "InstanceId" ] ],
               "metrics_collected": {
                 "mem":  { "measurement": [ { "name": "mem_used_percent", "rename": "MemoryUtilization", "unit": "Percent" } ], "metrics_collection_interval": 60 },
                 "disk": { "measurement": [ { "name": "used_percent", "rename": "DiskUtilization", "unit": "Percent" } ], "resources": [ "/" ], "metrics_collection_interval": 60 }
@@ -294,6 +295,44 @@ Resources:
           CWCFG
           /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
             -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/cw-agent.json || true
+
+          # A failing systemd unit is invisible to AWS/EC2 StatusCheckFailed -
+          # that metric reports hypervisor and instance reachability, so the
+          # service_failure scenario could leave a unit dead forever without
+          # moving it. The lab publishes its own count instead, which is what
+          # "a service on this host is down while the host itself is fine"
+          # actually looks like.
+          cat >/usr/local/bin/nb-unit-health.sh <<'UNITHEALTH'
+          #!/bin/bash
+          # IMDSv2 is enforced on AL2023 - the token call is required, not optional.
+          IMDS_TOKEN=$(curl -s -m 3 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          IID=$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          FAILED=$(systemctl list-units --state=failed --no-legend --plain | grep -c . || true)
+          aws cloudwatch put-metric-data --region "${AWS::Region}" \
+            --namespace NudgebeeScenarioLab --metric-name FailedSystemdUnits \
+            --dimensions InstanceId="$IID" --value "$FAILED" --unit Count
+          UNITHEALTH
+          chmod +x /usr/local/bin/nb-unit-health.sh
+          cat >/etc/systemd/system/nb-unit-health.service <<'UNIT'
+          [Unit]
+          Description=NudgeBee scenario lab - publish failed systemd unit count
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/nb-unit-health.sh
+          UNIT
+          cat >/etc/systemd/system/nb-unit-health.timer <<'TIMER'
+          [Unit]
+          Description=Publish failed unit count every minute
+          [Timer]
+          OnBootSec=90
+          # OnUnitInactiveSec, not OnUnitActiveSec: this is Type=oneshot and exits
+          # in under a second, so "60s after it became active" never fires twice.
+          OnUnitInactiveSec=60
+          [Install]
+          WantedBy=timers.target
+          TIMER
+          systemctl daemon-reload
+          systemctl enable --now nb-unit-health.timer
       Tags:
         - { Key: Name, Value: !Sub '${AWS::StackName}-host-1' }
         - { Key: nudgebee-scenario-lab, Value: 'true' }
@@ -314,7 +353,7 @@ Resources:
           #!/bin/bash
           # cronie is NOT present on Amazon Linux 2023, and runaway_cron needs
           # a working scheduler or it silently does nothing.
-          dnf install -y stress-ng amazon-cloudwatch-agent cronie || yum install -y stress-ng amazon-cloudwatch-agent cronie || true
+          dnf install -y stress-ng amazon-cloudwatch-agent cronie awscli-2 || yum install -y stress-ng amazon-cloudwatch-agent cronie awscli || true
           systemctl enable --now crond || true
           mkdir -p /opt/nudgebee-scenario
       Tags:
@@ -406,6 +445,25 @@ Resources:
       AlarmDescription: Status check failed on scenario host 1
       Namespace: AWS/EC2
       MetricName: StatusCheckFailed
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # The signal service_failure actually trips. StatusCheckFailed above covers
+  # the host being unreachable; this covers the host being perfectly healthy
+  # while a service on it is dead - which is the distinction the scenario is
+  # there to teach, and which the status check cannot express.
+  Host1ServiceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-service-down'
+      AlarmDescription: A systemd unit is in failed state on scenario host 1
+      Namespace: NudgebeeScenarioLab
+      MetricName: FailedSystemdUnits
       Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
       Statistic: Maximum
       Period: 60

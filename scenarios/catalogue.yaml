@@ -59,8 +59,24 @@ scenarios:
       never trips the killer, so the host degrades without a crash to point at.
     naive_answer: "A memory leak in the application."
     command: |
+      # Absolute size, computed from this host, not a percentage.
+      #
+      # Two separate things were wrong with `--vm 2 --vm-bytes 70%`. --vm-bytes is
+      # PER WORKER, so two workers asked for 140% of RAM and the OOM killer took
+      # stress-ng within seconds. Dropping to one worker fixed the kill but not
+      # the alarm: `--vm-bytes 60%` held only ~110MB of the 913MB host, leaving
+      # mem_used_percent at 36% against an 80% threshold. Whatever the percentage
+      # is measured against, it is not total memory, so do the arithmetic here
+      # where it can be read and checked.
+      #
+      # Target 88% of total: clear of the 80% threshold, under the OOM kill this
+      # scenario explicitly promises not to trigger. Scales with the instance.
+      TOTAL_MB=$(free -m | awk '/^Mem:/{print $2}')
+      USED_MB=$(free -m | awk '/^Mem:/{print $3}')
+      TARGET_MB=$(( TOTAL_MB * 88 / 100 - USED_MB ))
+      [ "$TARGET_MB" -lt 64 ] && TARGET_MB=64
       if command -v stress-ng >/dev/null 2>&1; then
-        timeout {{seconds}} stress-ng --vm 2 --vm-bytes 70% --vm-keep >/dev/null 2>&1
+        timeout {{seconds}} stress-ng --vm 1 --vm-bytes ${TARGET_MB}M --vm-keep >/dev/null 2>&1
       else
         timeout {{seconds}} bash -c 'a=(); while :; do a+=($(head -c 1000000 /dev/zero | tr "\0" "x")); sleep 0.1; done # nb-scenario:memory_pressure' >/dev/null 2>&1
       fi
@@ -132,9 +148,17 @@ scenarios:
       alarm to the process and destination responsible.
     naive_answer: "Data exfiltration or a DDoS."
     command: |
-      timeout {{seconds}} bash -c 'while :; do curl -s -o /dev/null https://speed.cloudflare.com/__down?bytes=100000000 || sleep 2; done # nb-scenario:network_spike'
+      # Upload, not download. The alarm is AWS/EC2 NetworkOut and the scenario is
+      # called "outbound"; pulling from __down moves NetworkIn and leaves nothing
+      # but ACKs on the metric the alarm actually watches, so it could never fire.
+      # Two uploaders because the threshold is 50MB/min and one stream is not a
+      # reliable margin over it.
+      head -c 50000000 /dev/zero > /var/tmp/nb-netspike.bin
+      timeout {{seconds}} bash -c 'for i in 1 2; do (while :; do curl -s -o /dev/null -X POST --data-binary @/var/tmp/nb-netspike.bin https://speed.cloudflare.com/__up || sleep 2; done) & done; wait # nb-scenario:network_spike'
+      rm -f /var/tmp/nb-netspike.bin
     cleanup: |
       pkill -f 'nb-scenario:network_spike' 2>/dev/null || true
+      rm -f /var/tmp/nb-netspike.bin 2>/dev/null || true
 
 
   - id: runaway_cron
@@ -174,11 +198,15 @@ scenarios:
   - id: service_failure
     name: Service failure
     tier: lab
-    signal: status-check
+    # NOT status-check. AWS/EC2 StatusCheckFailed reports hypervisor and instance
+    # reachability - a dead systemd unit cannot move it, on any host, so the
+    # scenario ran green for weeks while its declared alarm stayed OK. The lab
+    # publishes its own failed-unit count for exactly this case.
+    signal: service-down
     requires:
       iam: [ssm:SendCommand]
       binaries: [systemctl]
-      metric: AWS/EC2 StatusCheckFailed
+      metric: NudgebeeScenarioLab FailedSystemdUnits
     default_seconds: 300
     expect_alarm_secs: 120
     teaches: >
@@ -189,6 +217,16 @@ scenarios:
       cat >/etc/systemd/system/nudgebee-scenario-broken.service <<'UNIT'
       [Unit]
       Description=NudgeBee scenario - deliberately failing service
+      # Without these the unit never reaches `failed`. Restart=always with
+      # RestartSec=5 fits about two restarts into the default 10s start-limit
+      # window, so the default burst of 5 is never spent: the unit sits in
+      # `activating (auto-restart)` forever and `systemctl --state=failed`
+      # stays empty. Observed on the lab host as a scenario that ran green
+      # while nothing it claimed to break was visible anywhere.
+      # 3 failures in 60s exhausts the limit and systemd gives up, which is
+      # what "fails and stays failed" in the description above means.
+      StartLimitIntervalSec=60
+      StartLimitBurst=3
       [Service]
       Type=simple
       ExecStart=/bin/bash -c 'echo "scenario: simulated startup failure" >&2; exit 1'
@@ -202,9 +240,16 @@ scenarios:
       systemctl disable nudgebee-scenario-broken 2>/dev/null || true
       rm -f /etc/systemd/system/nudgebee-scenario-broken.service
       systemctl daemon-reload
+      # reset-failed is what actually clears the alarm. Removing the unit file
+      # leaves systemd holding a `not-found failed` entry for it, so
+      # `list-units --state=failed` keeps counting it and FailedSystemdUnits
+      # never returns to 0 - observed as host-1-service-down stuck in ALARM for
+      # three hours after a run that had otherwise reverted cleanly.
+      systemctl reset-failed nudgebee-scenario-broken.service 2>/dev/null || true
     cleanup: |
       systemctl stop nudgebee-scenario-broken 2>/dev/null || true
       systemctl disable nudgebee-scenario-broken 2>/dev/null || true
+      systemctl reset-failed nudgebee-scenario-broken.service 2>/dev/null || true
       rm -f /etc/systemd/system/nudgebee-scenario-broken.service 2>/dev/null || true
       systemctl daemon-reload 2>/dev/null || true
 

@@ -284,6 +284,91 @@ scenarios:
     cleanup: |
       pkill -f 'nb-scenario:zombie_processes' 2>/dev/null || true
 
+
+  - id: deleted_open_file
+    name: Disk full of a deleted file
+    tier: lab
+    signal: disk-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: CWAgent DiskUtilization (needs CloudWatch agent)
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      df says the root volume is full and du cannot find the space. A large
+      file was deleted while a process still had it open, so its blocks stay
+      allocated until that process closes it or exits. NudgeBee should find the
+      open-but-deleted file (lsof +L1, or a "(deleted)" entry under
+      /proc/<pid>/fd) and name the process holding it - and recommend restarting
+      that process or truncating through its handle, not resizing the volume.
+    naive_answer: "du shows nothing large on disk, so the disk metric is wrong."
+    command: |
+      F=/var/tmp/nb-scenario-app.log
+      AVAIL_MB=$(df -Pm / | awk 'NR==2 {print $4}')
+      ALLOC_MB=$(( AVAIL_MB * 85 / 100 ))
+      fallocate -l ${ALLOC_MB}M "$F" 2>/dev/null || dd if=/dev/zero of="$F" bs=1M count=$ALLOC_MB 2>/dev/null
+      # The holder opens the file and then deletes it. From that point the
+      # space is reachable only through the holder's file descriptor, and is
+      # freed the moment the holder exits.
+      timeout {{seconds}} bash -c 'exec 3<"$1"; rm -f "$1"; while :; do sleep 5; done # nb-scenario:deleted_open_file' _ "$F"
+      rm -f "$F"
+    cleanup: |
+      pkill -f 'nb-scenario:deleted_open_file' 2>/dev/null || true
+      rm -f /var/tmp/nb-scenario-app.log 2>/dev/null || true
+
+
+  - id: memory_leak_oom
+    name: Memory leak ending in an OOM kill
+    tier: lab
+    signal: mem-high
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: [python3]
+      metric: CWAgent MemoryUtilization (needs CloudWatch agent)
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      The counterpart to memory_pressure. One process grows, sits above the
+      threshold long enough to alarm, then keeps growing until the kernel's OOM
+      killer ends it. The alarm then clears on its own - which is the trap. The
+      evidence outlives the symptom: an "Out of memory: Killed process" line in
+      the kernel log naming the process, and a memory curve that climbed
+      steadily instead of jumping. NudgeBee should name the killed process and
+      call it a leak, not treat the recovery as a resolution.
+    naive_answer: "Memory spiked briefly and recovered on its own - nothing to do."
+    command: |
+      # Allocation and timing live in Python: it can read /proc/meminfo, touch
+      # every page it allocates, and pace the growth. Leave 12% available on
+      # the plateau (~88% used, clear of the 80% threshold), hold for half the
+      # run so the alarm has time to fire, then leak until killed.
+      #
+      # The OOM kill ends the command early with exit 137. That is the
+      # scenario working, not failing, so do not report it as a failure.
+      timeout {{seconds}} python3 - nb-scenario:memory_leak_oom <<'PY' || true
+      import time
+      mem = {}
+      for line in open("/proc/meminfo"):
+          key, value = line.split(":")
+          mem[key] = int(value.split()[0]) * 1024
+      # Be the OOM killer's first choice. Otherwise it may pick the SSM or
+      # CloudWatch agent, and the evidence of what happened goes with it.
+      with open("/proc/self/oom_score_adj", "w") as f:
+          f.write("1000")
+      chunk = 16 << 20
+      plateau = mem["MemAvailable"] - mem["MemTotal"] * 12 // 100
+      held = []
+      while len(held) * chunk < plateau:
+          held.append(b"\x01" * chunk)
+          time.sleep(1)
+      time.sleep({{seconds}} // 2)
+      while True:
+          held.append(b"\x01" * chunk)
+          time.sleep(0.2)
+      PY
+    cleanup: |
+      pkill -f 'nb-scenario:memory_leak_oom' 2>/dev/null || true
+
   - id: service_failure_cascade
     name: Service failure with downstream impact
     tier: services
@@ -379,6 +464,52 @@ scenarios:
       # service, not to this scenario, and its supervisor stops it as soon as
       # the database is reachable again - killing it here would race that.
       [ -n "$DB_IP" ] && iptables -D OUTPUT -d "$DB_IP" -p tcp --dport 5432 -j DROP 2>/dev/null || true
+
+  - id: order_bad_config_deploy
+    name: Bad config change breaks order
+    tier: services
+    target_service: order
+    signal: order-down
+    requires:
+      iam: [ssm:SendCommand]
+      binaries: []
+      metric: NudgebeeScenarioLab ServiceHealthy
+    default_seconds: 600
+    expect_alarm_secs: 180
+    teaches: >
+      The cause is a change, not a fault. A config rollout points order at a
+      database hostname that does not resolve, then restarts it. Order comes
+      back up - process running, port open - but every health check fails, and
+      payment and inventory fail behind it. The alarms look like
+      order_db_connectivity_loss, but the database alarm stays green, payment
+      and inventory reach the same database without trouble, and nothing on the
+      network changed. What changed is order itself: a systemd drop-in that was
+      not there before, and a restart at the moment the failures began.
+      NudgeBee should name that change and recommend rolling it back.
+    naive_answer: "The database is down or unreachable - fix the database or the network."
+    command: |
+      DROPIN=/etc/systemd/system/order.service.d/50-nb-scenario-release.conf
+      mkdir -p /etc/systemd/system/order.service.d
+      cat >"$DROPIN" <<'CONF'
+      # Release: move order to the new database DNS name.
+      [Service]
+      Environment=NB_DB_HOST=orders-db.lab.internal
+      CONF
+      systemctl daemon-reload
+      systemctl restart order
+      sleep {{seconds}}
+      rm -f "$DROPIN"
+      systemctl daemon-reload
+      systemctl restart order
+    cleanup: |
+      # Restart order only if this scenario changed it. Reset runs every
+      # cleanup on every host, and an unconditional restart would bring order
+      # back in the middle of service_failure_cascade.
+      if [ -f /etc/systemd/system/order.service.d/50-nb-scenario-release.conf ]; then
+        rm -f /etc/systemd/system/order.service.d/50-nb-scenario-release.conf
+        systemctl daemon-reload
+        systemctl restart order 2>/dev/null || true
+      fi
 
 # ---------------------------------------------------------------------------
 # Database scenarios (db tier) — deployed by infra/cloudformation/db.yaml.

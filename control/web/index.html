@@ -440,7 +440,7 @@ function renderFindings(){
 function renderAlarms(as){
   document.getElementById('alarms').innerHTML = as.length
     ? as.map(a=>`<div class="mrow">
-        <span class="k">${esc(a.name.replace(/^.*?-host-/,'host-'))}</span>
+        <span class="k">${esc(a.name.replace(/^.*?-(host|services)-/,'$1-'))}</span>
         <span class="st ${a.state}">${a.state==='INSUFFICIENT_DATA'?'NO DATA':a.state}</span>
       </div>`).join('')
     : '<div class="empty">no lab alarms found</div>';

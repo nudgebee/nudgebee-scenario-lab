@@ -263,13 +263,23 @@ def lab_hosts() -> list[dict]:
 
 
 def alarm_map() -> dict[str, dict]:
-    """signal-suffix -> alarm, for the host prefix used by the lab stack."""
-    try:
-        alarms = cw.describe_alarms(AlarmNamePrefix=f"{STACK}-host-", MaxRecords=100)
-    except ClientError:
-        return {}
+    """
+    alarm name -> alarm, for every tier the lab deploys.
+
+    The lab, db and lb tiers name their alarms <lab-stack>-host-*. The services
+    tier names them after its own stack, <lab-stack>-services-*, so a single
+    -host- prefix found none of them: every services scenario showed no alarm
+    while its alarms were firing. Query both prefixes rather than renaming the
+    services alarms, which would mean replacing them on every existing lab.
+    """
+    found = []
+    for prefix in (f"{STACK}-host-", f"{STACK}-services-"):
+        try:
+            found += cw.describe_alarms(AlarmNamePrefix=prefix, MaxRecords=100).get("MetricAlarms", [])
+        except ClientError:
+            continue
     out = {}
-    for a in alarms.get("MetricAlarms", []):
+    for a in found:
         out[a["AlarmName"]] = {
             "name": a["AlarmName"],
             "state": a["StateValue"],

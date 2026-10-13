@@ -327,7 +327,7 @@ scenarios:
       binaries: [python3]
       metric: CWAgent MemoryUtilization (needs CloudWatch agent)
     default_seconds: 600
-    expect_alarm_secs: 180
+    expect_alarm_secs: 240
     teaches: >
       The counterpart to memory_pressure. One process grows, sits above the
       threshold long enough to alarm, then keeps growing until the kernel's OOM
@@ -339,9 +339,14 @@ scenarios:
     naive_answer: "Memory spiked briefly and recovered on its own - nothing to do."
     command: |
       # Allocation and timing live in Python: it can read /proc/meminfo, touch
-      # every page it allocates, and pace the growth. Leave 12% available on
-      # the plateau (~88% used, clear of the 80% threshold), hold for half the
-      # run so the alarm has time to fire, then leak until killed.
+      # every page it allocates, and pace the growth. Plateau at 88% used (clear
+      # of the 80% threshold), hold for half the run so the alarm has time to
+      # fire, then leak until killed.
+      #
+      # "Used" is free(1)'s used column - total minus free, buffers and cache -
+      # because that is what the CloudWatch agent reports, and the same target
+      # memory_pressure uses. Sizing from MemAvailable instead plateaued at 74%:
+      # part of the cache is not reclaimable, so MemAvailable runs out first.
       #
       # The OOM kill ends the command early with exit 137. That is the
       # scenario working, not failing, so do not report it as a failure.
@@ -356,7 +361,9 @@ scenarios:
       with open("/proc/self/oom_score_adj", "w") as f:
           f.write("1000")
       chunk = 16 << 20
-      plateau = mem["MemAvailable"] - mem["MemTotal"] * 12 // 100
+      used = (mem["MemTotal"] - mem["MemFree"] - mem["Buffers"]
+              - mem["Cached"] - mem["SReclaimable"])
+      plateau = mem["MemTotal"] * 88 // 100 - used
       held = []
       while len(held) * chunk < plateau:
           held.append(b"\x01" * chunk)

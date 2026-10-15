@@ -350,6 +350,20 @@ var hostAlerts = [
     custom: false
     allHosts: false
   }
+  {
+    // Not on AWS. Azure's Percentage CPU does not count I/O wait, so the disk
+    // I/O scenario left the CPU alert at ~3% while the disk ran at ~46% of its
+    // bandwidth. Idle is 0-1%; 25% is clear of both.
+    signal: 'disk-io-high'
+    description: 'OS disk bandwidth unusually high on scenario host'
+    namespace: 'Microsoft.Compute/virtualMachines'
+    metric: 'OS Disk Bandwidth Consumed Percentage'
+    operator: 'GreaterThan'
+    threshold: 25
+    aggregation: 'Average'
+    custom: false
+    allHosts: true
+  }
 ]
 
 var alertPairs = flatten(map(range(0, hostCount), h => map(

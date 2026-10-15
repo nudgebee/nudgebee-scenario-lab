@@ -58,8 +58,19 @@ def for_this_cloud(entry: dict) -> bool:
     return not clouds or cloud.name in clouds
 
 
+def for_cloud(entry: dict) -> dict:
+    """An entry with this cloud's `overrides` applied: `requires` merged, the rest replaced."""
+    over = (entry.get("overrides") or {}).get(cloud.name)
+    if not over:
+        return entry
+    merged = {**entry, **{k: v for k, v in over.items() if k != "requires"}}
+    if "requires" in over:
+        merged["requires"] = {**(entry.get("requires") or {}), **over["requires"]}
+    return merged
+
+
 def load_catalogue() -> dict:
-    return {s["id"]: s for s in load_doc().get("scenarios", []) if for_this_cloud(s)}
+    return {s["id"]: for_cloud(s) for s in load_doc().get("scenarios", []) if for_this_cloud(s)}
 
 
 def load_findings() -> list:

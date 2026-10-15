@@ -19,6 +19,10 @@
 #   clouds            optional - [aws], [azure] or both. Omitted means every
 #                     cloud. Tiers a cloud cannot run yet are greyed out in the
 #                     UI by the control app, so scenarios rarely need this.
+#   overrides         optional - per-cloud replacements, e.g.
+#                     overrides: {azure: {signal: ..., requires: {metric: ...}}}
+#                     for when a cloud cannot see the fault the way the default
+#                     signal assumes. `requires` is merged, the rest replaced.
 
 version: 1
 
@@ -122,6 +126,15 @@ scenarios:
       iam: [ssm:SendCommand]
       binaries: []
       metric: AWS/EC2 CPUUtilization
+    # Azure's Percentage CPU is measured from the host and does not count I/O
+    # wait. Measured on the Azure lab: this scenario wrote ~28 MB/s for eleven
+    # minutes (46% of the disk's bandwidth) while Percentage CPU sat at ~3%, so
+    # a CPU alert can never fire. There the alert watches the disk itself.
+    overrides:
+      azure:
+        signal: disk-io-high
+        requires:
+          metric: OS Disk Bandwidth Consumed Percentage (VM host metric)
     default_seconds: 300
     expect_alarm_secs: 240
     teaches: >

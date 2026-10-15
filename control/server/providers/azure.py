@@ -492,9 +492,20 @@ class AzureProvider:
         """
         A VM holds at most 25 managed Run Commands, and finished ones are not
         removed automatically. Delete the finished ones this app created so a
-        busy demo never hits the cap. Fire-and-forget: nothing waits on it.
+        busy demo never hits the cap - except the newest run of each scenario,
+        which is the panel's "last run" and the only record of its script once
+        it has ended. Fire-and-forget: nothing waits on it.
         """
-        for rc in self._run_commands(vm):
+        commands = self._run_commands(vm)
+        newest: dict[str, tuple] = {}
+        for rc in commands:
+            label = (rc.tags or {}).get(LABEL_TAG, "")
+            started = (rc.instance_view.start_time if rc.instance_view else None)
+            key = (started.isoformat() if started else "", rc.name)
+            if label and (label not in newest or key > newest[label][0]):
+                newest[label] = (key, rc.name)
+        keep = keep | {name for _, name in newest.values()}
+        for rc in commands:
             if rc.name in keep:
                 continue
             state = ((rc.instance_view.execution_state if rc.instance_view else "") or "").lower()
@@ -537,9 +548,25 @@ class AzureProvider:
         return name
 
     def cancel(self, entry: dict) -> None:
-        """Deleting a managed Run Command terminates it if it is still running."""
+        """
+        Deleting a managed Run Command terminates it if it is still running.
+
+        Only delete one that IS still running. At expiry the script has
+        normally already ended on its own `timeout`, and deleting it then
+        cancels nothing - it only erases the panel's last-run record.
+        """
+        ops = self.compute.virtual_machine_run_commands
         try:
-            self.compute.virtual_machine_run_commands.begin_delete(
+            rc = ops.get_by_virtual_machine(
+                self.stack, entry["instance_id"], entry["command_id"], expand="instanceView"
+            )
+            state = ((rc.instance_view.execution_state if rc.instance_view else "") or "").lower()
+            if state in TERMINAL:
+                return
+        except AzureError:
+            pass  # unknown state: delete, the safe direction for a cancel
+        try:
+            ops.begin_delete(
                 self.stack, entry["instance_id"], entry["command_id"]
             )
         except AzureError:

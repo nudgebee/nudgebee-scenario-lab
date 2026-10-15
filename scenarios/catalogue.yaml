@@ -121,26 +121,30 @@ scenarios:
   - id: disk_io_saturation
     name: Disk I/O saturation
     tier: lab
-    signal: cpu-high
+    # NOT cpu-high. Neither cloud's CPU metric counts I/O wait - both are
+    # measured from the hypervisor. Measured on the AWS lab: ~30,000 EBS ops a
+    # minute for five minutes while CPUUtilization sat at 2-3%, so the old
+    # cpu-high signal could never fire. The alarm watches the disk instead.
+    signal: disk-io-high
     requires:
       iam: [ssm:SendCommand]
       binaries: []
-      metric: AWS/EC2 CPUUtilization
-    # Azure's Percentage CPU is measured from the host and does not count I/O
-    # wait. Measured on the Azure lab: this scenario wrote ~28 MB/s for eleven
-    # minutes (46% of the disk's bandwidth) while Percentage CPU sat at ~3%, so
-    # a CPU alert can never fire. There the alert watches the disk itself.
+      metric: AWS/EC2 EBSReadOps + EBSWriteOps
+    # Azure has no per-op count in its host metrics; bandwidth consumed is the
+    # closest (~46% during this scenario, 0-1% idle).
     overrides:
       azure:
-        signal: disk-io-high
         requires:
           metric: OS Disk Bandwidth Consumed Percentage (VM host metric)
     default_seconds: 300
-    expect_alarm_secs: 240
+    expect_alarm_secs: 180
     teaches: >
-      I/O wait rather than compute. CPU looks busy but the bottleneck is the
-      volume - a distinction a naive reading of CPUUtilization misses.
-    naive_answer: "CPU-bound workload; add vCPUs."
+      A disk bottleneck that the CPU graph hides. The host is busy waiting on
+      its volume, but CPU utilisation stays near idle because time spent
+      waiting for I/O is not counted as CPU use. The evidence is in the disk
+      metrics and in processes stuck in uninterruptible (D state) I/O, not in
+      CPU.
+    naive_answer: "Nothing is wrong - CPU is idle."
     command: |
       timeout {{seconds}} bash -c 'while :; do dd if=/dev/zero of=/var/tmp/nb-io.tmp bs=1M count=256 oflag=direct 2>/dev/null; dd if=/var/tmp/nb-io.tmp of=/dev/null bs=1M iflag=direct 2>/dev/null; done # nb-scenario:disk_io_saturation'
       rm -f /var/tmp/nb-io.tmp

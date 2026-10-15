@@ -9,7 +9,14 @@ from pathlib import Path
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import BotoCoreError, ClientError
+
+# What a call to AWS can raise. ClientError is AWS answering "no"; BotoCoreError
+# is never reaching an answer - no credentials found, endpoint unreachable, a
+# timeout. Catching only ClientError let "no credentials" escape every handler,
+# so with no AWS login every endpoint returned a bare 500 instead of the panel
+# saying what was wrong.
+AWS_ERRORS = (ClientError, BotoCoreError)
 from fastapi import HTTPException
 
 from server.providers.base import cached, forget, repo_root
@@ -82,7 +89,7 @@ class AwsProvider:
     def _identity(self) -> dict:
         try:
             ident = self.sts.get_caller_identity()
-        except (ClientError, NoCredentialsError) as exc:
+        except AWS_ERRORS as exc:
             return {"error": str(exc)}
         arn = ident["Arn"]
         account = ident["Account"]
@@ -91,7 +98,7 @@ class AwsProvider:
         try:
             aliases = self.iam.list_account_aliases().get("AccountAliases", [])
             alias = aliases[0] if aliases else None
-        except ClientError:
+        except AWS_ERRORS:
             pass
 
         # SimulatePrincipalPolicy wants the role ARN, not the assumed-role session.
@@ -120,7 +127,7 @@ class AwsProvider:
             res = self.iam.simulate_principal_policy(
                 PolicySourceArn=src, ActionNames=list(actions)
             )["EvaluationResults"]
-        except ClientError:
+        except AWS_ERRORS:
             return {}
         return {r["EvalActionName"]: r["EvalDecision"] == "allowed" for r in res}
 
@@ -138,14 +145,14 @@ class AwsProvider:
     def max_minutes(self) -> int:
         try:
             return int(self.ssm.get_parameter(Name=self.max_param)["Parameter"]["Value"])
-        except ClientError:
+        except AWS_ERRORS:
             return 30
 
     def read_state(self) -> dict:
         try:
             raw = self.ssm.get_parameter(Name=self.state_param)["Parameter"]["Value"]
             return json.loads(raw or "{}")
-        except (ClientError, json.JSONDecodeError):
+        except (*AWS_ERRORS, json.JSONDecodeError):
             return {}
 
     def write_state(self, state: dict) -> None:
@@ -163,13 +170,13 @@ class AwsProvider:
         """
         try:
             self.ssm.get_parameter(Name=self.state_param)
-        except ClientError:
+        except AWS_ERRORS:
             return  # not deployed yet - do not create it
         try:
             self.ssm.put_parameter(
                 Name=self.state_param, Value=json.dumps(state), Type="String", Overwrite=True
             )
-        except ClientError:
+        except AWS_ERRORS:
             pass
 
     # ------------------------------------------------------------- hosts
@@ -182,14 +189,14 @@ class AwsProvider:
                     {"Name": "instance-state-name", "Values": ["running"]},
                 ]
             )
-        except ClientError:
+        except AWS_ERRORS:
             return []
         online = set()
         try:
             for i in self.ssm.describe_instance_information().get("InstanceInformationList", []):
                 if i.get("PingStatus") == "Online":
                     online.add(i["InstanceId"])
-        except ClientError:
+        except AWS_ERRORS:
             pass
 
         out = []
@@ -220,7 +227,7 @@ class AwsProvider:
         """alarm name -> alarm, for the host prefix used by the lab stack."""
         try:
             alarms = self.cw.describe_alarms(AlarmNamePrefix=f"{self.stack}-host-", MaxRecords=100)
-        except ClientError:
+        except AWS_ERRORS:
             return {}
         out = {}
         for a in alarms.get("MetricAlarms", []):
@@ -244,7 +251,7 @@ class AwsProvider:
                 "healthy": s["StackStatus"] in ("CREATE_COMPLETE", "UPDATE_COMPLETE"),
                 "created": s["CreationTime"].isoformat(),
             }
-        except ClientError:
+        except AWS_ERRORS:
             return {"deployed": False, "status": None, "healthy": False, "created": None}
 
     def recent_runs(self) -> dict[str, dict]:
@@ -252,7 +259,7 @@ class AwsProvider:
         out: dict[str, dict] = {}
         try:
             cmds = self.ssm.list_commands(MaxResults=50).get("Commands", [])
-        except ClientError:
+        except AWS_ERRORS:
             return out
         for c in cmds:
             comment = c.get("Comment") or ""
@@ -294,14 +301,14 @@ class AwsProvider:
                 Parameters={"commands": [script]},
                 TimeoutSeconds=60,
             )
-        except ClientError as exc:
+        except AWS_ERRORS as exc:
             raise HTTPException(502, f"ssm send-command failed: {exc}") from exc
         return sent["Command"]["CommandId"]
 
     def cancel(self, entry: dict) -> None:
         try:
             self.ssm.cancel_command(CommandId=entry["command_id"], InstanceIds=[entry["instance_id"]])
-        except ClientError:
+        except AWS_ERRORS:
             pass
 
     # ------------------------------------------------------------- cloud-config faults
@@ -354,7 +361,7 @@ class AwsProvider:
         }
         try:
             self.ec2.revoke_security_group_ingress(GroupId=host_sg, IpPermissions=[permission])
-        except ClientError as exc:
+        except AWS_ERRORS as exc:
             raise HTTPException(502, f"failed to revoke ALB ingress: {exc}") from exc
 
         return {"host_sg": host_sg, "alb_sg": alb_sg, "port": port}
@@ -411,7 +418,7 @@ class AwsProvider:
                     tag = t.get("nudgebee-finding")
                     if tag in present:
                         present[tag].append({"id": inst["InstanceId"], "state": inst["State"]["Name"]})
-        except ClientError:
+        except AWS_ERRORS:
             pass
         try:
             for v in self.ec2.describe_volumes(Filters=flt).get("Volumes", []):
@@ -419,7 +426,7 @@ class AwsProvider:
                 tag = t.get("nudgebee-finding")
                 if tag in present:
                     present[tag].append({"id": v["VolumeId"], "state": v["State"]})
-        except ClientError:
+        except AWS_ERRORS:
             pass
         try:
             for g in self.ec2.describe_security_groups(Filters=flt).get("SecurityGroups", []):
@@ -427,7 +434,7 @@ class AwsProvider:
                 tag = t.get("nudgebee-finding")
                 if tag in present:
                     present[tag].append({"id": g["GroupId"], "state": "present"})
-        except ClientError:
+        except AWS_ERRORS:
             pass
         return present
 
@@ -458,7 +465,7 @@ class AwsProvider:
                     )["Subnets"]
                 if subs:
                     subnet = subs[0]["SubnetId"]
-        except ClientError:
+        except AWS_ERRORS:
             pass
         return {
             "suggested_vpc": vpc,
@@ -492,7 +499,7 @@ class AwsProvider:
             try:
                 outs = self.cfn.describe_stacks(StackName=self.stack)["Stacks"][0].get("Outputs", [])
                 vpc = next((o["OutputValue"] for o in outs if o["OutputKey"] == "VpcUsed"), None)
-            except ClientError:
+            except AWS_ERRORS:
                 pass
             if vpc:
                 try:
@@ -500,7 +507,7 @@ class AwsProvider:
                         Filters=[{"Name": "vpc-id", "Values": [vpc]}]
                     )["Subnets"]
                     subnet = subs[0]["SubnetId"] if subs else None
-                except ClientError:
+                except AWS_ERRORS:
                     pass
             if not vpc or not subnet:
                 raise HTTPException(412, "deploy the lab tier first, or supply vpc_id and subnet_id")
@@ -523,6 +530,8 @@ class AwsProvider:
             if code == "AlreadyExistsException":
                 raise HTTPException(409, f"stack {name} already exists") from exc
             raise HTTPException(502, f"create_stack failed: {exc}") from exc
+        except BotoCoreError as exc:
+            raise HTTPException(502, f"create_stack failed: {exc}") from exc
 
         forget("identity")
         return name
@@ -531,7 +540,7 @@ class AwsProvider:
         name = self.stack_name_for(tier)
         try:
             st = self.cfn.describe_stacks(StackName=name)["Stacks"][0]
-        except ClientError:
+        except AWS_ERRORS:
             return {"exists": False, "status": None, "events": [], "in_progress": False}
 
         events = []
@@ -546,7 +555,7 @@ class AwsProvider:
                         "reason": e.get("ResourceStatusReason"),
                     }
                 )
-        except ClientError:
+        except AWS_ERRORS:
             pass
 
         status = st["StackStatus"]
@@ -563,6 +572,6 @@ class AwsProvider:
         name = self.stack_name_for(tier)
         try:
             self.cfn.delete_stack(StackName=name)
-        except ClientError as exc:
+        except AWS_ERRORS as exc:
             raise HTTPException(502, f"delete_stack failed: {exc}") from exc
         return name

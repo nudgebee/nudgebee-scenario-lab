@@ -14,7 +14,15 @@
 #   expect_alarm_secs rough time from start to alarm, for the UI countdown
 #   teaches           what this scenario is meant to demonstrate in NudgeBee
 #   naive_answer      the wrong-but-plausible conclusion, if any
-#   command           bash run on the host via SSM. MUST self-terminate.
+#   command           bash run on the host (SSM on AWS, Run Command on Azure).
+#                     MUST self-terminate.
+#   clouds            optional - [aws], [azure] or both. Omitted means every
+#                     cloud. Tiers a cloud cannot run yet are greyed out in the
+#                     UI by the control app, so scenarios rarely need this.
+#   overrides         optional - per-cloud replacements, e.g.
+#                     overrides: {azure: {signal: ..., requires: {metric: ...}}}
+#                     for when a cloud cannot see the fault the way the default
+#                     signal assumes. `requires` is merged, the rest replaced.
 
 version: 1
 
@@ -118,6 +126,15 @@ scenarios:
       iam: [ssm:SendCommand]
       binaries: []
       metric: AWS/EC2 CPUUtilization
+    # Azure's Percentage CPU is measured from the host and does not count I/O
+    # wait. Measured on the Azure lab: this scenario wrote ~28 MB/s for eleven
+    # minutes (46% of the disk's bandwidth) while Percentage CPU sat at ~3%, so
+    # a CPU alert can never fire. There the alert watches the disk itself.
+    overrides:
+      azure:
+        signal: disk-io-high
+        requires:
+          metric: OS Disk Bandwidth Consumed Percentage (VM host metric)
     default_seconds: 300
     expect_alarm_secs: 240
     teaches: >
@@ -181,7 +198,8 @@ scenarios:
       # /etc/cron.d, crond inactive. Writing the schedule blind fails
       # silently and the scenario does nothing at all, so install it first.
       # The lab AMI preinstalls cronie; this covers hosts built before that.
-      if ! systemctl is-active --quiet crond 2>/dev/null; then
+      # The Azure lab runs Ubuntu, where the same daemon is the `cron` unit.
+      if ! systemctl is-active --quiet crond 2>/dev/null && ! systemctl is-active --quiet cron 2>/dev/null; then
         (dnf install -y cronie || yum install -y cronie) >/dev/null 2>&1
         systemctl enable --now crond >/dev/null 2>&1 || true
       fi
@@ -594,6 +612,7 @@ scenarios:
 findings:
 
   - id: unattached_ebs_volume
+    clouds: [aws]
     name: Unattached EBS volume
     tier: waste
     tag: unattached-ebs-volume
@@ -601,6 +620,7 @@ findings:
     teaches: Cost analysis finds orphaned resources without any agent on a host.
 
   - id: unencrypted_ebs_volume
+    clouds: [aws]
     name: Unencrypted EBS volume
     tier: waste
     tag: unencrypted-ebs-volume
@@ -608,6 +628,7 @@ findings:
     teaches: Compliance posture checks against resource configuration.
 
   - id: over_permissive_security_group
+    clouds: [aws]
     name: Security group open to the world
     tier: waste
     tag: over-permissive-security-group
@@ -617,6 +638,7 @@ findings:
       so this creates a finding without creating an actual exposure.
 
   - id: oversized_instance
+    clouds: [aws]
     name: Oversized instance
     tier: waste
     tag: oversized-instance
@@ -626,6 +648,7 @@ findings:
       immediately after deploy — say so rather than treating it as a failure.
 
   - id: stopped_instance_with_storage
+    clouds: [aws]
     name: Stopped instance still billing for storage
     tier: waste
     tag: stopped-instance-with-storage
@@ -636,8 +659,67 @@ findings:
       stop command printed in the stack outputs after deploying.
 
   - id: idle_load_balancer
+    clouds: [aws]
     name: Idle load balancer
     tier: waste
     tag: idle-load-balancer
     expect: Load balancer with no healthy targets and no traffic.
     teaches: Idle managed-service spend. Off by default — costs ~$16/mo.
+
+  # --- Azure (infra/azure/waste.bicep). No unencrypted-disk twin: Azure
+  # encrypts every managed disk at rest and that cannot be turned off.
+
+  - id: unattached_managed_disk
+    clouds: [azure]
+    name: Unattached managed disk
+    tier: waste
+    tag: unattached-managed-disk
+    expect: Flagged as unused storage incurring cost with no VM attached.
+    teaches: Cost analysis finds orphaned resources without any agent on a host.
+
+  - id: unattached_public_ip
+    clouds: [azure]
+    name: Unattached public IP
+    tier: waste
+    tag: unattached-public-ip
+    expect: A static Standard public IP associated with nothing, billing hourly.
+    teaches: Small orphaned network spend that nobody owns.
+
+  - id: over_permissive_nsg
+    clouds: [azure]
+    name: Network security group open to the world
+    tier: waste
+    tag: over-permissive-nsg
+    expect: SSH (22) and RDP (3389) allowed inbound from any source.
+    teaches: >
+      Security findings on configuration. The NSG is associated with no subnet
+      or NIC, so this creates a finding without creating an actual exposure.
+
+  - id: oversized_vm
+    clouds: [azure]
+    name: Oversized VM
+    tier: waste
+    tag: oversized-vm
+    expect: Rightsizing recommendation to downsize after utilisation history builds.
+    teaches: >
+      Rightsizing needs days of Azure Monitor history, so this one will not
+      appear immediately after deploy — say so rather than treating it as a failure.
+
+  - id: deallocated_vm_with_storage
+    clouds: [azure]
+    name: Deallocated VM still billing for storage
+    tier: waste
+    tag: deallocated-vm-with-storage
+    expect: Idle-resource finding — compute deallocated, 30GB OS disk still charged.
+    teaches: Cost attribution beyond running compute.
+    manual_step: >
+      ARM cannot create a VM in the deallocated state. Run the az vm deallocate
+      command printed by the deploy after it finishes.
+
+  - id: idle_load_balancer_azure
+    clouds: [azure]
+    name: Idle load balancer
+    tier: waste
+    tag: idle-load-balancer
+    expect: Standard load balancer with an empty backend pool and no traffic.
+    teaches: Idle managed-service spend. Off by default.

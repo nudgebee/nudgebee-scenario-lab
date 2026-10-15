@@ -19,7 +19,15 @@
 # To use an existing VPC instead:
 #
 #   VPC_ID=vpc-123 SUBNET_ID=subnet-456 ./scripts/deploy.sh
+#
+# On Azure (lab and waste tiers):
+#
+#   CLOUD=azure ./scripts/deploy.sh [lab|waste|both]
 set -euo pipefail
+
+if [ "${CLOUD:-aws}" = "azure" ]; then
+  exec "$(dirname "${BASH_SOURCE[0]}")/azure/deploy.sh" "$@"
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGION="${AWS_REGION:-us-east-1}"

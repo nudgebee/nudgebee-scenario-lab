@@ -1,5 +1,10 @@
-# Runs the control app locally against YOUR AWS credentials.
+# Runs the control app locally against YOUR cloud credentials.
 # Bound to 127.0.0.1 deliberately: this is an operator tool, not a service.
+#
+# For Azure, set CLOUD=azure and AZURE_SUBSCRIPTION_ID, and either a service
+# principal (AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CLIENT_SECRET) or use
+# ./scripts/run-local.sh instead - the container has no az CLI, so an
+# `az login` session on your machine does not reach it.
 services:
   control:
     build:
@@ -8,12 +13,18 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
+      CLOUD: "${CLOUD:-aws}"
       SCENARIO_LAB_STACK: "${SCENARIO_LAB_STACK:-nudgebee-scenario-lab}"
       AWS_REGION: "${AWS_REGION:-us-east-1}"
       AWS_PROFILE: "${AWS_PROFILE:-}"
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
       AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+      AZURE_LOCATION: "${AZURE_LOCATION:-eastus}"
+      AZURE_SUBSCRIPTION_ID: "${AZURE_SUBSCRIPTION_ID:-}"
+      AZURE_TENANT_ID: "${AZURE_TENANT_ID:-}"
+      AZURE_CLIENT_ID: "${AZURE_CLIENT_ID:-}"
+      AZURE_CLIENT_SECRET: "${AZURE_CLIENT_SECRET:-}"
     volumes:
       # Mounted read-only so `aws sso login` / profiles work without copying creds
       - ~/.aws:/root/.aws:ro

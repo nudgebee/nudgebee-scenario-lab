@@ -2,8 +2,8 @@
 
 **See what NudgeBee does during a real incident — without waiting for one.**
 
-This sets up a few small, throwaway servers in your own AWS account, then lets
-you break them on purpose. High CPU. Full disk. A service that won't start.
+This sets up a few small, throwaway servers in your own AWS or Azure account,
+then lets you break them on purpose. High CPU. Full disk. A service that won't start.
 NudgeBee notices, investigates, and explains what happened — and you get to
 watch it work on a problem you created thirty seconds ago.
 
@@ -372,6 +372,63 @@ Three of the six are for the database tier and need a database integration.
 
 ---
 
+## Using Azure instead of AWS
+
+Everything above works on Azure too — put `CLOUD=azure` in front of each
+command. You need the Azure CLI, signed in with `az login` to the subscription
+you want to use.
+
+```bash
+CLOUD=azure ./scripts/preflight.sh
+```
+
+```bash
+CLOUD=azure ./scripts/deploy.sh
+```
+
+```bash
+CLOUD=azure ./scripts/run-local.sh
+```
+
+The same rule applies: **use a test or sandbox subscription, not production.**
+The lab gets a resource group of its own (`nudgebee-scenario-lab`) with its own
+private network, and nothing from the internet can connect in. Deleting it
+takes one command:
+
+```bash
+az group delete --name nudgebee-scenario-lab --yes
+```
+
+**What it costs:** about **$28 a month** left running — two small VMs, their
+disks, and the outbound-only public addresses they need to install packages.
+A few hours costs cents.
+
+**What's available:** the eight server scenarios and the waste tier
+(`CLOUD=azure ./scripts/deploy.sh waste`). The database and services tiers are
+AWS-only for now; the control panel shows them greyed out with the reason.
+
+**Things that differ from AWS:**
+
+- The waste tier has no "unencrypted disk" finding, because Azure encrypts
+  every disk and that can't be switched off. It has an unused public IP
+  address instead.
+- Disk-full alerts depend on the Azure Monitor Agent, which the lab installs.
+  Give it a few minutes after deploying before running **Disk fill**.
+- If your NudgeBee Azure integration created an action group, the deploy finds
+  it by name and sends the lab's alerts to it. To pick one yourself, set
+  `ACTION_GROUP_ID` before deploying. `preflight.sh` tells you what it found.
+- Some subscription types — free trials especially — can't create every VM
+  size. `preflight.sh` checks that the default size is allowed before you
+  deploy.
+- Import the Azure add-ons into NudgeBee as well:
+  `nudgebee/automations/azure-vm-investigation.json` and
+  `nudgebee/knowledge-base/Azure_alert_investigation.txt`. They let an
+  investigation see which Run Commands were issued against the VM, by whom
+  and when — the evidence that separates "someone ran this" from "the VM is
+  too small".
+
+---
+
 ## Two things people get wrong
 
 **Connecting your AWS account to NudgeBee isn't enough.** Alert forwarding has
@@ -387,10 +444,12 @@ don't need to do anything.
 ## For the technically minded
 
 - `infra/cloudformation/` — what gets created in AWS
+- `infra/azure/` — what gets created in Azure (Bicep)
 - `scenarios/catalogue.yaml` — the scenarios; adding one is a few lines of YAML
-- `control/` — the local control panel (Python, no external services)
-- `nudgebee/` — automations and a knowledge-base article to import into NudgeBee
-  (`nudgebee/README.md` covers importing them)
+- `control/` — the local control panel (Python, no external services);
+  `control/server/providers/` holds the AWS and Azure backends
+- `nudgebee/` — automations and knowledge-base articles to import into NudgeBee,
+  for AWS and Azure (`nudgebee/README.md` covers importing them)
 - `scripts/verify-scenarios.sh` — checks every scenario still actually works
 
 Full detail lives in each of those directories.

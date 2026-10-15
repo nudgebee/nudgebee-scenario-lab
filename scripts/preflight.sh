@@ -17,7 +17,13 @@
 # takes them:
 #
 #   AWS_PROFILE=sandbox AWS_REGION=eu-west-1 ./scripts/preflight.sh
+#
+#   CLOUD=azure ./scripts/preflight.sh  # the same checks against Azure
 set -uo pipefail
+
+if [ "${CLOUD:-aws}" = "azure" ]; then
+  exec "$(dirname "${BASH_SOURCE[0]}")/azure/preflight.sh" "$@"
+fi
 
 REGION="${AWS_REGION:-us-east-1}"
 STACK="${SCENARIO_LAB_STACK:-nudgebee-scenario-lab}"

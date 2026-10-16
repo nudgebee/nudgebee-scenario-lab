@@ -472,6 +472,44 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # Disk I/O, from the disk's own counters. CPUUtilization does not count I/O
+  # wait, so the disk I/O scenario cannot move a CPU alarm: measured at ~30,000
+  # EBS ops a minute with CPU at 2-3%. Read + write ops summed per period; idle
+  # is a few hundred a minute at most.
+  Host1DiskIoAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-disk-io-high'
+      AlarmDescription: Disk I/O saturation on scenario host 1 (EBS read + write ops)
+      Metrics:
+        - Id: reads
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: EBSReadOps
+              Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+            Period: !If [MinuteMetrics, 60, 300]
+            Stat: Sum
+        - Id: writes
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: EBSWriteOps
+              Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+            Period: !If [MinuteMetrics, 60, 300]
+            Stat: Sum
+        - Id: total
+          Label: EBS ops per period
+          Expression: reads + writes
+          ReturnData: true
+      EvaluationPeriods: 2
+      # 5,000 a minute; the 5-minute periods of basic monitoring hold five times as many
+      Threshold: !If [MinuteMetrics, 5000, 25000]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
   Host1NetworkAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:

@@ -335,7 +335,9 @@ function renderCtx(){
   const cells=[
     [L.account, id.account_alias?`${id.account_alias} · ${id.account}`:(id.account||'unknown'),
       id.account?'':'badv'],
-    ['Identity', id.principal||'—',''],
+    // id.error is set when the cloud SDK could not authenticate at all - say so,
+    // or the page reads as "not deployed" when the real problem is the login
+    ['Identity', id.principal||id.error||'—', id.error?'badv':''],
     ['Region', D.region,''],
     [L.stack, si.deployed?si.status:'not deployed', si.deployed?(si.healthy?'okv':'warnv'):'badv'],
     ['Hosts', `${online}/${D.hosts.length} ${L.agent} online`, D.hosts.length===0?'badv':(online<D.hosts.length?'warnv':'okv')],

@@ -302,6 +302,11 @@ Resources:
           # moving it. The lab publishes its own count instead, which is what
           # "a service on this host is down while the host itself is fine"
           # actually looks like.
+          #
+          # It also publishes the process count, for zombie_processes: hundreds
+          # of sleeping processes cost no CPU and do not raise the load
+          # average, so no AWS/EC2 metric moves - measured at 2-3% CPU for the
+          # whole run. The count is the only thing that does.
           cat >/usr/local/bin/nb-unit-health.sh <<'UNITHEALTH'
           #!/bin/bash
           # IMDSv2 is enforced on AL2023 - the token call is required, not optional.
@@ -311,11 +316,15 @@ Resources:
           aws cloudwatch put-metric-data --region "${AWS::Region}" \
             --namespace NudgebeeScenarioLab --metric-name FailedSystemdUnits \
             --dimensions InstanceId="$IID" --value "$FAILED" --unit Count
+          PROCS=$(ps -e --no-headers | wc -l)
+          aws cloudwatch put-metric-data --region "${AWS::Region}" \
+            --namespace NudgebeeScenarioLab --metric-name ProcessCount \
+            --dimensions InstanceId="$IID" --value "$PROCS" --unit Count
           UNITHEALTH
           chmod +x /usr/local/bin/nb-unit-health.sh
           cat >/etc/systemd/system/nb-unit-health.service <<'UNIT'
           [Unit]
-          Description=NudgeBee scenario lab - publish failed systemd unit count
+          Description=NudgeBee scenario lab - publish failed unit and process counts
           [Service]
           Type=oneshot
           ExecStart=/usr/local/bin/nb-unit-health.sh
@@ -507,6 +516,24 @@ Resources:
       EvaluationPeriods: 2
       # 5,000 a minute; the 5-minute periods of basic monitoring hold five times as many
       Threshold: !If [MinuteMetrics, 5000, 25000]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Process table pressure, from the count nb-unit-health.sh publishes. A lab
+  # host idles at ~120 processes (kernel threads included); zombie_processes
+  # adds ~400. CPU, memory and load stay flat throughout, so nothing else moves.
+  Host1ProcessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-host-1-proc-high'
+      AlarmDescription: Unusually many processes on scenario host 1
+      Namespace: NudgebeeScenarioLab
+      MetricName: ProcessCount
+      Dimensions: [ { Name: InstanceId, Value: !Ref ScenarioHost1 } ]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 300
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 

@@ -279,16 +279,23 @@ scenarios:
   - id: zombie_processes
     name: Process table pressure
     tier: lab
-    signal: cpu-high
+    # NOT cpu-high. 400 sleeping processes cost no CPU and do not raise the
+    # load average: measured at 2-3% CPU for the whole run on both clouds, so
+    # the old signal could never fire. The lab publishes its process count.
+    signal: proc-high
     requires:
       iam: [ssm:SendCommand]
       binaries: []
-      metric: AWS/EC2 CPUUtilization
+      metric: NudgebeeScenarioLab ProcessCount
     default_seconds: 300
-    expect_alarm_secs: 240
+    expect_alarm_secs: 180
     teaches: >
-      Process/fork exhaustion. Load climbs without any single process being an
-      obvious culprit - tests whether the investigation looks at process counts.
+      Process table pressure with no culprit. Hundreds of processes pile up,
+      none of them individually notable, and CPU, memory and load average all
+      stay flat - sleeping processes cost almost nothing until a limit (pids,
+      threads, file handles) is hit. The only signal is the process count, so
+      this tests whether an investigation looks at how many processes there
+      are and where they came from, rather than at the top of `top`.
     naive_answer: "One runaway process is responsible."
     command: |
       timeout {{seconds}} bash -c 'for i in $(seq 1 400); do (sleep 3600) & done; wait # nb-scenario:zombie_processes' >/dev/null 2>&1

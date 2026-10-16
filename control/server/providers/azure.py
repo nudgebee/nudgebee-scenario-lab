@@ -71,7 +71,9 @@ METRIC_MAP = (
     ("AWS/EC2 NetworkOut", "Network Out Total (VM host metric)"),
     ("AWS/EC2 StatusCheckFailed", "VmAvailabilityMetric (VM host metric)"),
     ("NudgebeeScenarioLab FailedSystemdUnits",
-     "none on Azure yet - the lab does not publish a failed-unit count"),
+     "NudgebeeScenarioLab FailedSystemdUnits (custom metric published by the VM)"),
+    ("NudgebeeScenarioLab ProcessCount",
+     "NudgebeeScenarioLab ProcessCount (custom metric published by the VM)"),
 )
 
 
@@ -459,6 +461,9 @@ class AzureProvider:
     def metric_warning(self, metric: str) -> str | None:
         if "Azure Monitor Agent" in metric or "CWAgent DiskUtilization" in metric:
             return "alarm depends on the Azure Monitor Agent publishing this metric"
+        if "custom metric published by the VM" in metric:
+            return ("alarm exists only if the lab was deployed with publishHostMetrics "
+                    "(needs a deployer who can assign roles)")
         return None
 
     # Measured on the lab: CPU pinned from 06:37, alert fired 06:41. Azure
@@ -678,6 +683,17 @@ class AzureProvider:
             self.rm.resource_groups.create_or_update(
                 rg, {"location": self.region, "tags": {LAB_TAG: "true", MAX_MINUTES_TAG: "30"}}
             )
+            if tier == "lab":
+                # The VMs' own metric publishing needs a role assignment, which
+                # only a deployer who can assign roles may create. Checked after
+                # the group exists: permissions are read at a scope, and the
+                # group is that scope. Off when it cannot be confirmed - a
+                # deployment that fails on the role is worse than one without
+                # those two alerts.
+                can_assign = self._check(("Microsoft.Authorization/roleAssignments/write",))
+                params["publishHostMetrics"] = {
+                    "value": can_assign.get("Microsoft.Authorization/roleAssignments/write") is True
+                }
             self.rm.deployments.begin_create_or_update(
                 rg, tier,
                 {"properties": {"mode": "Incremental", "template": template, "parameters": params}},

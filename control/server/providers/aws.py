@@ -81,6 +81,20 @@ class AwsProvider:
                 return p
         raise HTTPException(500, f"{tier}.yaml not found - set INFRA_DIR")
 
+    # Every tier this lab can deploy, as stack-name suffixes. Hosts and
+    # findings are matched to these, not just to the shared lab tag: with a
+    # second lab in the same account (another SCENARIO_LAB_STACK), the tag alone
+    # made each panel list the other lab's hosts too - and offer to run
+    # scenarios on them.
+    TIER_SUFFIXES = ("", "-services", "-db", "-lb", "-waste")
+
+    def _own_stacks(self) -> dict:
+        """EC2 filter for resources CloudFormation created in this lab's own stacks."""
+        return {
+            "Name": "tag:aws:cloudformation:stack-name",
+            "Values": [self.stack + suffix for suffix in self.TIER_SUFFIXES],
+        }
+
     def stack_name_for(self, tier: str) -> str:
         return self.stack if tier == "lab" else f"{self.stack}-waste"
 
@@ -186,6 +200,7 @@ class AwsProvider:
             resp = self.ec2.describe_instances(
                 Filters=[
                     {"Name": "tag:nudgebee-scenario-lab", "Values": ["true"]},
+                    self._own_stacks(),
                     {"Name": "instance-state-name", "Values": ["running"]},
                 ]
             )
@@ -489,7 +504,7 @@ class AwsProvider:
         present: dict[str, list] = {t: [] for t in tags}
         if not tags:
             return present
-        flt = [{"Name": "tag:nudgebee-finding", "Values": list(tags)}]
+        flt = [{"Name": "tag:nudgebee-finding", "Values": list(tags)}, self._own_stacks()]
         try:
             resp = self.ec2.describe_instances(Filters=flt)
             for res in resp.get("Reservations", []):

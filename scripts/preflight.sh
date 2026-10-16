@@ -162,6 +162,7 @@ if aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" >
   ok "stack '$STACK' exists"
   HOSTS=$(aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:nudgebee-scenario-lab,Values=true" "Name=instance-state-name,Values=running" \
+              "Name=tag:aws:cloudformation:stack-name,Values=$STACK,$STACK-services,$STACK-db,$STACK-lb" \
     --query 'length(Reservations[].Instances[])' --output text 2>/dev/null || echo 0)
   if [ "${HOSTS:-0}" -gt 0 ] 2>/dev/null; then
     ok "$HOSTS scenario host(s) running"

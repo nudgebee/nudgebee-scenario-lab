@@ -392,8 +392,88 @@ class AwsProvider:
                 return
             raise
 
+    def _alb_egress(self, params: dict) -> tuple[str, str, int]:
+        host_sg = self._lab_security_group(params.get("host_sg_name", f"{self.stack}-hosts"))
+        alb_sg = self._lab_security_group(params.get("alb_sg_name", f"{self.stack}-alb"))
+        return host_sg, alb_sg, int(params.get("port", 8081))
+
+    def _revoke_alb_egress(self, params: dict) -> dict:
+        """Remove the ALB's egress rule to the service and return what restores it.
+
+        Breaks the path on the ALB's own security group, not the hosts' ingress.
+        A restored rule is a re-created rule with an ID CloudFormation does not
+        know; on the hosts group it outlived delete-stack and pinned the ALB
+        group in place, so the lb stack could never be deleted. On the ALB group
+        it is deleted along with the group.
+
+        Refuses on an lb stack deployed before that change: its ALB group still
+        has the default allow-all egress, so revoking one rule would cut nothing
+        and the scenario would run green while breaking nothing.
+        """
+        host_sg, alb_sg, port = self._alb_egress(params)
+        try:
+            group = self.ec2.describe_security_groups(GroupIds=[alb_sg])["SecurityGroups"][0]
+        except AWS_ERRORS as exc:
+            raise HTTPException(502, f"failed to read the ALB security group: {exc}") from exc
+        egress = group.get("IpPermissionsEgress", [])
+        allow_all = any(
+            p.get("IpProtocol") == "-1" and any(r.get("CidrIp") == "0.0.0.0/0" for r in p.get("IpRanges", []))
+            for p in egress
+        )
+        has_rule = any(
+            p.get("FromPort") == port and any(g.get("GroupId") == host_sg for g in p.get("UserIdGroupPairs", []))
+            for p in egress
+        )
+        if allow_all or not has_rule:
+            raise HTTPException(
+                412,
+                "the load balancer tier predates this scenario's current form - its "
+                "security group still allows all egress, so there is no rule to revoke. "
+                "Redeploy it: ./scripts/deploy.sh lb",
+            )
+
+        permission = {
+            "IpProtocol": "tcp",
+            "FromPort": port,
+            "ToPort": port,
+            "UserIdGroupPairs": [{"GroupId": host_sg}],
+        }
+        try:
+            self.ec2.revoke_security_group_egress(GroupId=alb_sg, IpPermissions=[permission])
+        except AWS_ERRORS as exc:
+            raise HTTPException(502, f"failed to revoke ALB egress: {exc}") from exc
+
+        return {"direction": "egress", "host_sg": host_sg, "alb_sg": alb_sg, "port": port}
+
+    def _restore_alb_egress(self, undo: dict) -> None:
+        """Put the egress rule back. Idempotent: a duplicate rule is success."""
+        permission = {
+            "IpProtocol": "tcp",
+            "FromPort": undo["port"],
+            "ToPort": undo["port"],
+            "UserIdGroupPairs": [
+                {
+                    "GroupId": undo["host_sg"],
+                    "Description": "ALB to order service - restored by scenario cleanup",
+                }
+            ],
+        }
+        try:
+            self.ec2.authorize_security_group_egress(
+                GroupId=undo["alb_sg"], IpPermissions=[permission]
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "InvalidPermission.Duplicate":
+                return
+            raise
+
     def _actions(self) -> dict:
-        return {"revoke_alb_ingress": (self._revoke_alb_ingress, self._restore_alb_ingress)}
+        return {
+            "revoke_alb_egress": (self._revoke_alb_egress, self._restore_alb_egress),
+            # The previous form of alb_sg_block. Kept so a scenario started
+            # before an upgrade can still be undone from its stored state.
+            "revoke_alb_ingress": (self._revoke_alb_ingress, self._restore_alb_ingress),
+        }
 
     def apply_action(self, scenario_id: str, action: str, params: dict) -> dict:
         if action not in self._actions():

@@ -420,6 +420,10 @@ AWS-only for now; the control panel shows them greyed out with the reason.
 - Some subscription types — free trials especially — can't create every VM
   size. `preflight.sh` checks that the default size is allowed before you
   deploy.
+- **Service failure** and **Process table pressure** alert from counts the
+  lab's VMs publish themselves. Letting a VM publish needs a role assignment,
+  which only an Owner (or User Access Administrator) can make. If you can't,
+  the deploy says so and skips those two alerts; everything else still works.
 - Import the Azure add-ons into NudgeBee as well:
   `nudgebee/automations/azure-vm-investigation.json` and
   `nudgebee/knowledge-base/Azure_alert_investigation.txt`. They let an

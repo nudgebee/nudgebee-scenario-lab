@@ -37,6 +37,19 @@ SUB=$(az account show --query '{i:id,n:name,u:user.name}' -o tsv 2>/dev/null | t
   echo "Not logged in. Run 'az login' (and 'az account set --subscription ...') first."; exit 1; }
 IFS='|' read -r SUB_ID SUB_NAME SUB_USER <<<"$SUB"
 
+# Each VM publishes its failed-unit and process counts (service_failure,
+# zombie_processes) with Monitoring Metrics Publisher on itself. Granting that
+# is a role assignment, which only Owner or User Access Administrator may make;
+# anyone else gets the lab without those two alerts instead of a failed deploy.
+# PUBLISH_HOST_METRICS=true|false overrides the check.
+HOST_METRICS="${PUBLISH_HOST_METRICS:-}"
+if [ -z "$HOST_METRICS" ]; then
+  ME=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || az ad sp show --id "$SUB_USER" --query id -o tsv 2>/dev/null || true)
+  CAN=$(az role assignment list --assignee "$ME" --all --include-inherited --include-groups \
+          --query "[?roleDefinitionName=='Owner' || roleDefinitionName=='User Access Administrator'] | length(@)" -o tsv 2>/dev/null || echo 0)
+  [ "${CAN:-0}" -gt 0 ] 2>/dev/null && HOST_METRICS=true || HOST_METRICS=false
+fi
+
 ACTION_GROUP="${ACTION_GROUP_ID:-}"
 if [ -z "$ACTION_GROUP" ]; then
   ACTION_GROUP=$(az monitor action-group list \
@@ -51,6 +64,12 @@ echo "  location     : $LOCATION"
 echo "  resource grp : $STACK$([ "$WHAT" != lab ] && echo " (+ ${STACK}-waste)")"
 echo "  network      : a new isolated virtual network created by the deployment"
 echo "  alerts to    : ${ACTION_GROUP:-Azure Monitor only (no action group found)}"
+if [ "$HOST_METRICS" = "true" ]; then
+  echo "  host metrics : on (service-down and proc-high alerts)"
+else
+  echo "  host metrics : OFF - you cannot assign roles here, so service_failure and"
+  echo "                 zombie_processes will run without alerts (PUBLISH_HOST_METRICS=true to force)"
+fi
 
 printf '\nThese VMs are deliberately degraded by scenarios. Continue? [y/N] '
 read -r reply
@@ -87,7 +106,7 @@ deploy_lab() {
     --resource-group "$STACK" \
     --name lab \
     --template-file "$ROOT/infra/azure/lab.bicep" \
-    --parameters sshPublicKey="$(throwaway_key "$STACK")" actionGroupId="$ACTION_GROUP" \
+    --parameters sshPublicKey="$(throwaway_key "$STACK")" actionGroupId="$ACTION_GROUP" publishHostMetrics="$HOST_METRICS" \
     -o none
   c_ok "lab tier deployed"
   az vm list --resource-group "$STACK" --query '[].name' -o tsv | sed 's/^/  /'

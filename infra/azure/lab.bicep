@@ -55,6 +55,9 @@ param diskThreshold int = 80
 @description('Optional action group resource ID to notify when an alert fires - for example the one your NudgeBee Azure integration created. Empty means the alerts fire in Azure Monitor only.')
 param actionGroupId string = ''
 
+@description('Publish the failed-unit and process counts from each VM as custom metrics, and alert on them (service-down, proc-high). Needs the deployer to be allowed to assign roles (Owner or User Access Administrator): each VM is given Monitoring Metrics Publisher on itself. deploy.sh turns this off when the caller cannot, rather than failing the deployment.')
+param publishHostMetrics bool = true
+
 var tags = {
   'nudgebee-scenario-lab': 'true'
 }
@@ -73,6 +76,64 @@ runcmd:
   - systemctl enable --now cron
   - mkdir -p /opt/nudgebee-scenario
 '''
+
+// The two numbers no Azure metric carries. A failed systemd unit does not move
+// VM availability, and hundreds of sleeping processes move neither CPU nor load
+// - so service_failure and zombie_processes publish their own, the counts the
+// AWS lab sends to CloudWatch. Posted to Azure Monitor custom metrics with the
+// VM's managed identity (Monitoring Metrics Publisher, granted below).
+//
+// Installed by a run command, NOT cloud-init: Azure refuses to change
+// customData on an existing VM, so putting this in cloud-init would make every
+// existing lab fail to redeploy. A run command can be updated, and re-runs
+// when its script changes.
+//
+// Each point carries a `host` dimension. Azure's metric alerts never evaluated
+// these metrics without one - the rules sat at status Unknown with the metric
+// well over threshold - and the same rule fired within minutes once a
+// dimension was added.
+var hostMetricsInstall = '''
+cat > /usr/local/bin/nb-host-metrics.sh <<'SCRIPT'
+#!/bin/bash
+IMDS=http://169.254.169.254/metadata
+TOKEN=$(curl -s -m 5 -H Metadata:true "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://monitoring.azure.com/" \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin).get("access_token", ""))' 2>/dev/null)
+[ -n "$TOKEN" ] || exit 0
+RID=$(curl -s -m 5 -H Metadata:true "$IMDS/instance/compute/resourceId?api-version=2021-02-01&format=text")
+LOC=$(curl -s -m 5 -H Metadata:true "$IMDS/instance/compute/location?api-version=2021-02-01&format=text")
+HOST=$(hostname)
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+FAILED=$(systemctl list-units --state=failed --no-legend --plain | grep -c . || true)
+PROCS=$(ps -e --no-headers | wc -l)
+for pair in "FailedSystemdUnits:$FAILED" "ProcessCount:$PROCS"; do
+  name=${pair%%:*}; value=${pair##*:}
+  curl -s -m 10 -o /dev/null -X POST "https://$LOC.monitoring.azure.com$RID/metrics" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"time\":\"$NOW\",\"data\":{\"baseData\":{\"metric\":\"$name\",\"namespace\":\"NudgebeeScenarioLab\",\"dimNames\":[\"host\"],\"series\":[{\"dimValues\":[\"$HOST\"],\"min\":$value,\"max\":$value,\"sum\":$value,\"count\":1}]}}}"
+done
+SCRIPT
+chmod 0755 /usr/local/bin/nb-host-metrics.sh
+cat > /etc/systemd/system/nb-host-metrics.service <<'UNIT'
+[Unit]
+Description=NudgeBee scenario lab - publish failed unit and process counts
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nb-host-metrics.sh
+UNIT
+cat > /etc/systemd/system/nb-host-metrics.timer <<'TIMER'
+[Unit]
+Description=Publish failed unit and process counts every minute
+[Timer]
+OnBootSec=90
+# OnUnitInactiveSec: a oneshot that exits in a second never re-fires on OnUnitActiveSec
+OnUnitInactiveSec=60
+[Install]
+WantedBy=timers.target
+TIMER
+systemctl daemon-reload
+systemctl enable --now nb-host-metrics.timer
+'''
+
 
 // ------------------------------------------------------------------ network
 // A virtual network of its own, so the lab cannot land in one you care about.
@@ -264,6 +325,37 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
   }
 }
 
+// Lets each VM post its own custom metrics (nb-host-metrics.sh), scoped to
+// that VM alone. Assigning a role is what needs Owner-level rights to deploy.
+var monitoringMetricsPublisher = '3913510d-42f4-4e42-8a64-420c390055eb'
+
+resource metricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (name, i) in hostNames: if (publishHostMetrics) {
+  name: guid(vm[i].id, monitoringMetricsPublisher)
+  scope: vm[i]
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', monitoringMetricsPublisher)
+    principalId: vm[i].identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
+
+// Name deliberately without the nb- prefix: the control panel prunes its own
+// finished nb-* run commands, and this one must stay.
+resource hostMetricsSetup 'Microsoft.Compute/virtualMachines/runCommands@2024-03-01' = [for (name, i) in hostNames: if (publishHostMetrics) {
+  parent: vm[i]
+  name: 'lab-host-metrics'
+  location: location
+  tags: tags
+  properties: {
+    source: {
+      script: hostMetricsInstall
+    }
+    asyncExecution: false
+    timeoutInSeconds: 300
+    treatFailureAsDeploymentFailure: false
+  }
+}]
+
 resource dcrLink 'Microsoft.Insights/dataCollectionRuleAssociations@2022-06-01' = [for (name, i) in hostNames: {
   name: '${name}-guest-metrics'
   scope: vm[i]
@@ -364,10 +456,36 @@ var hostAlerts = [
     custom: false
     allHosts: true
   }
+  {
+    // Published by nb-host-metrics.sh, not by Azure - see cloudInit.
+    signal: 'service-down'
+    description: 'A systemd unit is in failed state on scenario host'
+    namespace: 'NudgebeeScenarioLab'
+    metric: 'FailedSystemdUnits'
+    operator: 'GreaterThan'
+    threshold: 0
+    aggregation: 'Maximum'
+    custom: true
+    allHosts: false
+    hostMetric: true
+  }
+  {
+    // ~120 processes at idle; zombie_processes adds ~400.
+    signal: 'proc-high'
+    description: 'Unusually many processes on scenario host'
+    namespace: 'NudgebeeScenarioLab'
+    metric: 'ProcessCount'
+    operator: 'GreaterThan'
+    threshold: 300
+    aggregation: 'Maximum'
+    custom: true
+    allHosts: false
+    hostMetric: true
+  }
 ]
 
 var alertPairs = flatten(map(range(0, hostCount), h => map(
-  filter(hostAlerts, a => h == 0 || a.allHosts),
+  filter(hostAlerts, a => (h == 0 || a.allHosts) && (publishHostMetrics || !contains(a, 'hostMetric'))),
   a => union(a, { host: h })
 )))
 
@@ -402,13 +520,19 @@ resource alert 'Microsoft.Insights/metricAlerts@2018-03-01' = [for a in alertPai
           // The guest metric has one series per mount, and Ubuntu's snap
           // packages are read-only images that always report 100% used. Without
           // this filter the disk alert is red from the moment it exists.
-          dimensions: a.custom ? [
+          dimensions: !a.custom ? [] : (contains(a, 'hostMetric') ? [
+            {
+              name: 'host'
+              operator: 'Include'
+              values: ['*']
+            }
+          ] : [
             {
               name: 'path'
               operator: 'Include'
               values: ['/']
             }
-          ] : []
+          ])
         }
       ]
     }

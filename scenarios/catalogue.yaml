@@ -279,16 +279,23 @@ scenarios:
   - id: zombie_processes
     name: Process table pressure
     tier: lab
-    signal: cpu-high
+    # NOT cpu-high. 400 sleeping processes cost no CPU and do not raise the
+    # load average: measured at 2-3% CPU for the whole run on both clouds, so
+    # the old signal could never fire. The lab publishes its process count.
+    signal: proc-high
     requires:
       iam: [ssm:SendCommand]
       binaries: []
-      metric: AWS/EC2 CPUUtilization
+      metric: NudgebeeScenarioLab ProcessCount
     default_seconds: 300
-    expect_alarm_secs: 240
+    expect_alarm_secs: 180
     teaches: >
-      Process/fork exhaustion. Load climbs without any single process being an
-      obvious culprit - tests whether the investigation looks at process counts.
+      Process table pressure with no culprit. Hundreds of processes pile up,
+      none of them individually notable, and CPU, memory and load average all
+      stay flat - sleeping processes cost almost nothing until a limit (pids,
+      threads, file handles) is hit. The only signal is the process count, so
+      this tests whether an investigation looks at how many processes there
+      are and where they came from, rather than at the top of `top`.
     naive_answer: "One runaway process is responsible."
     command: |
       timeout {{seconds}} bash -c 'for i in $(seq 1 400); do (sleep 3600) & done; wait # nb-scenario:zombie_processes' >/dev/null 2>&1
@@ -585,12 +592,15 @@ scenarios:
     name: Security group blocks the load balancer
     tier: services
     kind: aws
-    action: revoke_alb_ingress
+    # Revokes the ALB's own egress rule, not the hosts' ingress rule: a rule the
+    # cleanup re-creates on the hosts group outlived delete-stack and left the
+    # lb stack stuck deleting. See AlbSecurityGroup in lb.yaml.
+    action: revoke_alb_egress
     params:
       port: 8081
     signal: alb-unhealthy
     requires:
-      iam: [ec2:RevokeSecurityGroupIngress, ec2:AuthorizeSecurityGroupIngress, ec2:DescribeSecurityGroups]
+      iam: [ec2:RevokeSecurityGroupEgress, ec2:AuthorizeSecurityGroupEgress, ec2:DescribeSecurityGroups]
       binaries: []
       metric: AWS/ApplicationELB UnHealthyHostCount
     default_seconds: 600
@@ -598,8 +608,9 @@ scenarios:
     teaches: >
       The case every host-level check gets wrong. The order host is untouched: CPU
       flat, memory fine, the process up, /health returning 200 to anything on the
-      box. Nothing is wrong with the machine. But the security group no longer
-      admits the load balancer, so the ALB has no healthy target and clients get
+      box. Nothing is wrong with the machine. But the load balancer's security
+      group no longer lets it reach the service, so the ALB has no healthy
+      target and clients get
       5xx from the balancer itself - no application ever logs an error, because no
       request reaches an application.
 

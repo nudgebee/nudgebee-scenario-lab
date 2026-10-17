@@ -46,6 +46,9 @@ python3 - "$ROOT/scenarios/catalogue.yaml" <<'PY'
 import yaml, re, sys
 bad = 0
 for s in yaml.safe_load(open(sys.argv[1]))["scenarios"]:
+    if s.get("kind") == "aws":
+        print(f"  SKIP {s['id']} (kind: aws - no host command; its undo is checked under \"bounded\")")
+        continue
     cmd = s["command"]
     assigned = set(re.findall(r'^\s*([A-Za-z_]\w*)=', cmd, re.M))
     exported = set(re.findall(r'^\s*export\s+([A-Za-z_]\w*)', cmd, re.M))
@@ -71,11 +74,27 @@ hd "Every scenario is bounded, and recoverable if it is cut short"
 #   ... sleep {{seconds}} ; undo   - bounded, but only if a cleanup exists,
 #                                    because cancel_command kills the script
 #                                    before the undo runs (defect #3)
-python3 - "$ROOT/scenarios/catalogue.yaml" <<'PY'
-import yaml, sys
+# A kind: aws scenario has no command. It is bounded by the control plane,
+# which records an undo when it applies the change and runs it on stop or
+# expiry - so it is safe only if its action is registered with an undo.
+python3 - "$ROOT/scenarios/catalogue.yaml" "$ROOT/control/server/app.py" <<'PY'
+import yaml, sys, re
 bad = 0
+app = open(sys.argv[2]).read()
+block = re.search(r"CLOUD_SCENARIOS\s*=\s*\{(.*?)\n\}", app, re.S)
+cloud = dict(re.findall(r'"(\w+)"\s*:\s*\(\s*\w+\s*,\s*(\w+)\s*\)', block.group(1))) if block else {}
 for s in yaml.safe_load(open(sys.argv[1]))["scenarios"]:
-    cmd, sid = s["command"], s["id"]
+    sid = s["id"]
+    if s.get("kind") == "aws":
+        action = s.get("action")
+        if action in cloud:
+            print(f"  \033[32mPASS\033[0m {sid} (cloud action {action}, undone by {cloud[action]})")
+        else:
+            print(f"  \033[31mFAIL\033[0m {sid}: cloud action {action!r} is not registered in "
+                  f"CLOUD_SCENARIOS - start would fail, or nothing could undo it")
+            bad = 1
+        continue
+    cmd = s["command"]
     has_cleanup = bool(s.get("cleanup"))
     if "timeout {{seconds}}" in cmd:
         if has_cleanup:
@@ -105,6 +124,9 @@ python3 - "$ROOT/scenarios/catalogue.yaml" <<'PY'
 import yaml, sys, re
 bad = 0
 for s in yaml.safe_load(open(sys.argv[1]))["scenarios"]:
+    if s.get("kind") == "aws":
+        print(f"  SKIP {s['id']} (kind: aws - no host command; its undo is checked under \"bounded\")")
+        continue
     cleanup = s.get("cleanup", "")
     missing = [m for m in re.findall(r"pkill -f '([^']+)'", cleanup)
                if m not in s["command"]]
@@ -157,7 +179,7 @@ if [ $LIVE -eq 1 ]; then
     bad "no host available for live checks"
   else
     for SID in $(python3 -c "
-import yaml;print(' '.join(s['id'] for s in yaml.safe_load(open('$ROOT/scenarios/catalogue.yaml'))['scenarios']))"); do
+import yaml;print(' '.join(s['id'] for s in yaml.safe_load(open('$ROOT/scenarios/catalogue.yaml'))['scenarios'] if s.get('kind') != 'aws'))"); do
       PARAMS=$(python3 - "$ROOT/scenarios/catalogue.yaml" "$SID" <<'PY'
 import yaml, json, sys
 c = [s for s in yaml.safe_load(open(sys.argv[1]))["scenarios"] if s["id"] == sys.argv[2]][0]

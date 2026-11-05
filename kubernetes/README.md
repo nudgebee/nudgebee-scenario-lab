@@ -4,7 +4,8 @@
 
 The rest of this lab builds throwaway EC2 servers for you. These don't. They run
 against a cluster you already have, with the NudgeBee agent already installed,
-and they only ever touch a namespace they create themselves.
+and they only ever touch a namespace they create themselves (the
+ClusterSecretStore scenario also creates one cluster-scoped store, labelled as its own).
 
 That trade is deliberate. Kubernetes failures are interesting because of what
 surrounds them — the workload that owns the pod, the config it reads, the
@@ -17,6 +18,7 @@ Your cluster does.
 - The [NudgeBee agent](https://github.com/nudgebee/k8s-agent) installed and connected
 - Permission to create a namespace and a Deployment in it
 - [Helm](https://helm.sh) for the Helm-drift scenarios
+- [External Secrets Operator](https://external-secrets.io) for the ClusterSecretStore scenario
 
 Use a test or staging cluster. The scenarios are small and self-contained, but
 they do deliberately break things, and one of them restarts the agent.
@@ -31,6 +33,7 @@ they do deliberately break things, and one of them restarts the agent.
 | [Ingress with a typo in the host](ingress-wrong-host/) | Users get 404 for a site whose app, Service and Ingress all look fine. No alert fires — the answer is two swapped letters in a hostname |
 | [Helm drift: memory limit](helm-drift-memory/) | A pod is OOMKilled and nobody deployed. The limit was changed with `kubectl`, behind Helm's back. Needs `helm` |
 | [Helm drift: CPU request ×3](helm-drift-cpu/) | A rollout is stuck on a Pending pod after three hand-edits to the CPU request, the last one a typo. Needs `helm` |
+| [Deleted ClusterSecretStore](clustersecretstore-deleted/) | Three services in two namespaces won't start, each missing a different Secret. It is one problem: the store they all read from was deleted. Needs External Secrets Operator |
 
 ## How these differ from the AWS scenarios
 

@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels: {app: {{ .Release.Name }}}
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 120
+  strategy:
+    {{- if eq .Values.strategy "Recreate" }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+    {{- end }}
+  selector:
+    matchLabels: {app: {{ .Release.Name }}}
+  template:
+    metadata:
+      labels: {app: {{ .Release.Name }}}
+    spec:
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: {{ .Release.Name }}
+          image: {{ .Values.image }}
+          command:
+            - sh
+            - -c
+            - |
+              echo "{{ .Release.Name }} starting, loading model ({{ .Values.holdMi }}Mi)"
+              model=$(head -c {{ mul .Values.holdMi 1048576 }} /dev/zero | tr '\0' m)
+              echo "{{ .Release.Name }} ready"
+              while true; do sleep 3600; done
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}

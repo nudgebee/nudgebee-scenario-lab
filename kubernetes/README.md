@@ -16,6 +16,7 @@ Your cluster does.
 - A Kubernetes cluster and `kubectl` pointed at it
 - The [NudgeBee agent](https://github.com/nudgebee/k8s-agent) installed and connected
 - Permission to create a namespace and a Deployment in it
+- [Helm](https://helm.sh) for the Helm-drift scenarios
 
 Use a test or staging cluster. The scenarios are small and self-contained, but
 they do deliberately break things, and one of them restarts the agent.
@@ -28,6 +29,8 @@ they do deliberately break things, and one of them restarts the agent.
 | [NetworkPolicy on the wrong port](networkpolicy-wrong-port/) | Requests hang while every pod is Running and Ready. No alert fires — you ask NudgeBee, and the answer is a port number in a policy that looks correct |
 | [Service on the wrong port](service-wrong-port/) | Every call is refused instantly, but the Service has endpoints and every pod is Ready. No alert fires — the answer is one number on the Service |
 | [Ingress with a typo in the host](ingress-wrong-host/) | Users get 404 for a site whose app, Service and Ingress all look fine. No alert fires — the answer is two swapped letters in a hostname |
+| [Helm drift: memory limit](helm-drift-memory/) | A pod is OOMKilled and nobody deployed. The limit was changed with `kubectl`, behind Helm's back. Needs `helm` |
+| [Helm drift: CPU request ×3](helm-drift-cpu/) | A rollout is stuck on a Pending pod after three hand-edits to the CPU request, the last one a typo. Needs `helm` |
 
 ## How these differ from the AWS scenarios
 

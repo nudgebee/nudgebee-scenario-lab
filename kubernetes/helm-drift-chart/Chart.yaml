@@ -1,0 +1,5 @@
+apiVersion: v2
+name: demo-service
+description: Small service used by the NudgeBee Scenario Lab Helm-drift scenarios
+version: 0.1.0
+appVersion: "1.0"

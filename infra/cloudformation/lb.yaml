@@ -92,16 +92,35 @@ Resources:
           ToPort: 80
           CidrIp: !Ref AllowedClientCidr
           Description: HTTP from clients
+      # THE BREAKABLE DEPENDENCY. The ALB may reach the order service and
+      # nothing else; scenario alb_sg_block revokes this rule. Revoke it and the
+      # ALB can no longer reach its target, targets go unhealthy, clients get
+      # 5xx - while the host itself is untouched and every host-level check
+      # keeps passing.
+      #
+      # It lives HERE, inline on the ALB's own group, on purpose. The scenario
+      # restores a rule by re-creating it, and a re-created rule has a new ID
+      # that CloudFormation does not know. When the broken rule was the hosts
+      # group's ingress (below), that re-created rule outlived delete-stack and
+      # pointed at the ALB group, so the group could never be deleted and the
+      # stack hung in DELETE_IN_PROGRESS. A rule on this group goes when the
+      # group goes, whoever created it.
+      #
+      # Declaring any egress also drops AWS's default allow-all egress, which is
+      # what makes revoking this one rule actually cut the path.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref OrderServicePort
+          ToPort: !Ref OrderServicePort
+          DestinationSecurityGroupId: { 'Fn::ImportValue': !Sub '${LabStackName}-SecurityGroupId' }
+          Description: ALB to order service - scenario alb_sg_block revokes this
       Tags:
         - { Key: Name, Value: !Sub '${LabStackName}-alb' }
         - { Key: nudgebee-scenario-lab, Value: 'true' }
 
-  # THE BREAKABLE DEPENDENCY. This single rule is the whole point of the tier:
-  # revoke it and the ALB can no longer reach the order service, targets go
-  # unhealthy, clients get 5xx - while the host itself is untouched and every
-  # host-level check keeps passing. Kept as its own resource, separate from the
-  # host security group in lab.yaml, so a scenario can remove and restore it
-  # without CloudFormation drift on another stack.
+  # The other half of the path: the hosts must admit the ALB. Kept as its own
+  # resource so this stack never rewrites the host security group that belongs
+  # to lab.yaml. No scenario touches it any more - see AlbSecurityGroup.
   HostIngressFromAlb:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -110,7 +129,7 @@ Resources:
       FromPort: !Ref OrderServicePort
       ToPort: !Ref OrderServicePort
       SourceSecurityGroupId: !Ref AlbSecurityGroup
-      Description: !Sub 'ALB to order service on ${OrderServicePort} - scenario alb_sg_block revokes this'
+      Description: !Sub 'ALB to order service on ${OrderServicePort}'
 
   # ---------------------------------------------------------------- Load balancer
 

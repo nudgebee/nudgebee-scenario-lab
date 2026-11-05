@@ -1,0 +1,116 @@
+For Azure Monitor alerts and event analysis on Azure resources.
+
+Azure Monitor tells you the number. It does not tell you what caused it.
+Do not conclude "high load", recommend resizing, or close the event until
+you have looked at what was happening on that resource around the alert.
+
+The azure-vm-investigation automation fetches that evidence. It is a
+read-only data tool: it returns Azure Monitor datapoints alongside the
+activity recorded against the VM, in time order, and nothing else. It does
+not rank, filter or conclude. The reasoning is yours.
+
+  azure-vm-investigation
+    Virtual machines. Returns metric datapoints, the Activity Log for the
+    VM (including every Run Command and who issued it), the Run Commands
+    still present on the VM with their script text, and a read-only
+    inspection of the host itself.
+    Inputs: subscription_id, resource_group, vm_name, metric_namespace,
+    metric_name, window_start, window_end, host_action.
+
+Prefer it over composing az monitor or az vm run-command calls by hand.
+
+Where "what ran on this VM" is recorded on Azure:
+- Managed Run Commands are Azure resources. Creating one is logged in the
+  Activity Log as Microsoft.Compute/virtualMachines/runCommands/write,
+  with the caller and the time. Deleting one - which is also how a running
+  script is stopped - is logged as runCommands/delete.
+- The older action Run Command (az vm run-command invoke, the portal's
+  Run command blade) is logged as
+  Microsoft.Compute/virtualMachines/runCommand/action. Same caller and
+  time, but there is no resource left afterwards to read.
+- The Activity Log records WHO and WHEN, never the script. The script text
+  is only on the Run Command resource itself, and only while it exists.
+  Once it is deleted, the name, caller and timing are all that remain - say
+  so rather than guessing what it ran.
+- The Activity Log reaches the API a few minutes after the operation. An
+  operation from the last five minutes may not be visible yet.
+
+Choosing the window:
+The tool returns exactly the window you ask for. Nothing outside it is
+fetched. A cause precedes its effect, so start the window before the alert
+- thirty minutes earlier is usually enough, longer if the metric climbed
+slowly. Azure metric alerts also fire several minutes after the metric
+moved: they average over a window (often five minutes) and metrics take a
+minute or two to arrive. Start well before the alert's fired time.
+If the first result shows the metric already elevated at the start, the
+window began too late; widen it and fetch again.
+
+Choosing metric_namespace and metric_name:
+- CPU             Microsoft.Compute/virtualMachines  Percentage CPU
+- memory          Microsoft.Compute/virtualMachines  Available Memory Percentage
+                  (this falls as memory fills - low is bad)
+- network out     Microsoft.Compute/virtualMachines  Network Out Total
+- availability    Microsoft.Compute/virtualMachines  VmAvailabilityMetric
+- disk full       azure.vm.linux.guestmetrics        disk/used_percent
+                  (needs the Azure Monitor Agent; one series per mount,
+                  dimension `path`)
+
+disk/used_percent has a series for every mount. On Ubuntu the snap package
+mounts (/snap/...) are read-only images that ALWAYS report 100% used. A
+100% reading on a /snap path is normal and is not the cause of anything -
+look at the path, not the maximum across all of them.
+
+`datapoint_count: 0` can mean the wrong namespace or name, a missing
+agent, or a resource with genuinely nothing to report. It does not tell
+you which - check the namespace and name before reporting that nothing
+happened.
+
+Datapoints right after a VM boots can read 0 - including Available Memory
+Percentage and VmAvailabilityMetric. An alert that fired within a few
+minutes of the VM starting, and resolved on its own, is often that and not
+a real fault. Check the VM's start time before treating it as one.
+
+Choosing host_action, by what alerted:
+- CPU        -> top_cpu, then process_tree
+- memory     -> top_memory, memory_usage
+- disk full  -> disk_usage
+- disk I/O   -> top_cpu (I/O wait surfaces there), process_tree
+- network    -> network_connections
+- availability -> failed_services, recent_syslog, boot_time
+
+And by what you suspect, whatever alerted:
+- something still running -> top_cpu or top_memory (gives owning user and
+  how long it has been alive)
+- a person -> shell_history, recent_logins, and the Activity Log
+- periodic or daily timing -> cron_jobs
+- a crash or restart loop -> failed_services, recent_syslog
+- started right after a change -> package_changes
+
+Reading the results honestly:
+- Order is not cause. An operation that happened before the metric moved
+  is a candidate, not an answer. Check that its timing and its content
+  plausibly explain the change, and say which parts you are inferring.
+- The Activity Log records each operation several times (Started,
+  Accepted, Succeeded). One operation, not three.
+- Policy evaluations (Microsoft.Authorization/policies/...) fill the
+  Activity Log and almost never explain an alert. Do not mistake their
+  volume for activity on the VM.
+- A process that started well before the metric moved is unlikely to be
+  the cause. Compare start times; do not assume.
+- Host inspection is a snapshot taken now, after the alert. A short-lived
+  process may already be gone - say so rather than reporting "nothing
+  found" as if it were proof.
+- SSH sessions, cron jobs and boot-time processes leave NO trace in the
+  Activity Log. An empty result means nothing was run through Azure, not
+  that nothing happened on the VM.
+- If the evidence does not explain the alert, say that. An honest "the
+  data does not show a cause, here is what I ruled out" is worth more than
+  a confident guess.
+
+Host inspection runs through Run Command, so the VM must be running with
+its VM agent ready. If it is not, report that limitation instead of
+guessing. The inspection itself appears in the Activity Log as a Run
+Command from the investigation's own identity - do not mistake it for the
+cause.
+
+Never kill, restart, or reconfigure anything during an investigation.

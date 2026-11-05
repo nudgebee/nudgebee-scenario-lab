@@ -2,10 +2,10 @@
 
 The lab breaks things. These are what NudgeBee uses to investigate them:
 
-- `automations/` — six automations, exported from the environment they were
-  built and demoed in
-- `knowledge-base/` — one article that tells the assistant when to reach for
-  them and how to read what comes back
+- `automations/` — seven automations: six exported from the environment they
+  were built and demoed in, plus `azure-vm-investigation.json` for the Azure lab
+- `knowledge-base/` — one article per cloud that tells the assistant when to
+  reach for them and how to read what comes back
 
 None of it is required to see an alarm fire. It is what turns "an alarm went
 red" into "here is what happened, and here is the evidence".
@@ -19,7 +19,7 @@ panel → paste the file → Apply → Save.** The same JSON is the body
 
 Two things to set after the first import:
 
-- **The AWS account.** Automations that take an `account_id` ship without a
+- **The cloud account** (AWS, or Azure for `azure-vm-investigation`). Automations that take an `account_id` ship without a
   default on purpose, so nothing points at somebody else's account by
   accident. Pick yours.
 - **"Allow the AI assistant to run this automation"** (automation settings, AI
@@ -39,12 +39,19 @@ Anything else with a blank default is listed under "What to fill in" below.
 | `db-diagnostics-postgresql-ec2.json` | Six-category PostgreSQL check — connectivity, resource use, blocking sessions, replication, storage, database errors | `pg_*` alarm, or manual | db tier + database integration |
 | `db-connection-troubleshooting-postgresql-ec2.json` | Why a client cannot connect: DNS and TCP from the client, security group and NACL rules, server availability, connection headroom, authentication failures — ranked into a likely cause | `pg_*` alarm, or manual | db tier + database integration; SSH integration optional |
 | `db-log-analysis-postgresql-ec2.json` | PostgreSQL log errors for the incident window, grouped by SQLSTATE and compared against a baseline | `pg_*` alarm, or manual | db tier |
+| `azure-vm-investigation.json` | Metric datapoints, Activity Log Run Command history (who ran what, when), the script text of Run Commands still on the VM, and a read-only inspection of the host, for one Azure VM over a window | manual | Azure lab tier |
 
 The event triggers match the alarms this lab actually raises: the EC2 one on
 `CPUUtilization`, `StatusCheckFailed*`, `mem_used_percent`, `disk_used_percent`
 and `NetworkOut`; the database ones on `pg_up`, `pg_connections_pct` and
 `pg_blocked_sessions`, which are the three the db tier publishes. Nothing fires
 on an alarm the lab cannot produce.
+
+**The Azure automation runs manually for now.** `ec2-investigation.json` also
+fires on its own when an EC2 alarm event arrives; that trigger filters on the
+labels NudgeBee puts on AWS events (`aws_event_metric_name` and friends).
+Adding the same to the Azure one needs the matching labels on Azure alert
+events. Pair it with `knowledge-base/Azure_alert_investigation.txt`.
 
 ## What to fill in
 

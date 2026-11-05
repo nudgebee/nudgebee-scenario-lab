@@ -14,7 +14,15 @@
 #   expect_alarm_secs rough time from start to alarm, for the UI countdown
 #   teaches           what this scenario is meant to demonstrate in NudgeBee
 #   naive_answer      the wrong-but-plausible conclusion, if any
-#   command           bash run on the host via SSM. MUST self-terminate.
+#   command           bash run on the host (SSM on AWS, Run Command on Azure).
+#                     MUST self-terminate.
+#   clouds            optional - [aws], [azure] or both. Omitted means every
+#                     cloud. Tiers a cloud cannot run yet are greyed out in the
+#                     UI by the control app, so scenarios rarely need this.
+#   overrides         optional - per-cloud replacements, e.g.
+#                     overrides: {azure: {signal: ..., requires: {metric: ...}}}
+#                     for when a cloud cannot see the fault the way the default
+#                     signal assumes. `requires` is merged, the rest replaced.
 
 version: 1
 
@@ -113,17 +121,30 @@ scenarios:
   - id: disk_io_saturation
     name: Disk I/O saturation
     tier: lab
-    signal: cpu-high
+    # NOT cpu-high. Neither cloud's CPU metric counts I/O wait - both are
+    # measured from the hypervisor. Measured on the AWS lab: ~30,000 EBS ops a
+    # minute for five minutes while CPUUtilization sat at 2-3%, so the old
+    # cpu-high signal could never fire. The alarm watches the disk instead.
+    signal: disk-io-high
     requires:
       iam: [ssm:SendCommand]
       binaries: []
-      metric: AWS/EC2 CPUUtilization
+      metric: AWS/EC2 EBSReadOps + EBSWriteOps
+    # Azure has no per-op count in its host metrics; bandwidth consumed is the
+    # closest (~46% during this scenario, 0-1% idle).
+    overrides:
+      azure:
+        requires:
+          metric: OS Disk Bandwidth Consumed Percentage (VM host metric)
     default_seconds: 300
-    expect_alarm_secs: 240
+    expect_alarm_secs: 180
     teaches: >
-      I/O wait rather than compute. CPU looks busy but the bottleneck is the
-      volume - a distinction a naive reading of CPUUtilization misses.
-    naive_answer: "CPU-bound workload; add vCPUs."
+      A disk bottleneck that the CPU graph hides. The host is busy waiting on
+      its volume, but CPU utilisation stays near idle because time spent
+      waiting for I/O is not counted as CPU use. The evidence is in the disk
+      metrics and in processes stuck in uninterruptible (D state) I/O, not in
+      CPU.
+    naive_answer: "Nothing is wrong - CPU is idle."
     command: |
       timeout {{seconds}} bash -c 'while :; do dd if=/dev/zero of=/var/tmp/nb-io.tmp bs=1M count=256 oflag=direct 2>/dev/null; dd if=/var/tmp/nb-io.tmp of=/dev/null bs=1M iflag=direct 2>/dev/null; done # nb-scenario:disk_io_saturation'
       rm -f /var/tmp/nb-io.tmp
@@ -181,7 +202,8 @@ scenarios:
       # /etc/cron.d, crond inactive. Writing the schedule blind fails
       # silently and the scenario does nothing at all, so install it first.
       # The lab AMI preinstalls cronie; this covers hosts built before that.
-      if ! systemctl is-active --quiet crond 2>/dev/null; then
+      # The Azure lab runs Ubuntu, where the same daemon is the `cron` unit.
+      if ! systemctl is-active --quiet crond 2>/dev/null && ! systemctl is-active --quiet cron 2>/dev/null; then
         (dnf install -y cronie || yum install -y cronie) >/dev/null 2>&1
         systemctl enable --now crond >/dev/null 2>&1 || true
       fi
@@ -257,16 +279,23 @@ scenarios:
   - id: zombie_processes
     name: Process table pressure
     tier: lab
-    signal: cpu-high
+    # NOT cpu-high. 400 sleeping processes cost no CPU and do not raise the
+    # load average: measured at 2-3% CPU for the whole run on both clouds, so
+    # the old signal could never fire. The lab publishes its process count.
+    signal: proc-high
     requires:
       iam: [ssm:SendCommand]
       binaries: []
-      metric: AWS/EC2 CPUUtilization
+      metric: NudgebeeScenarioLab ProcessCount
     default_seconds: 300
-    expect_alarm_secs: 240
+    expect_alarm_secs: 180
     teaches: >
-      Process/fork exhaustion. Load climbs without any single process being an
-      obvious culprit - tests whether the investigation looks at process counts.
+      Process table pressure with no culprit. Hundreds of processes pile up,
+      none of them individually notable, and CPU, memory and load average all
+      stay flat - sleeping processes cost almost nothing until a limit (pids,
+      threads, file handles) is hit. The only signal is the process count, so
+      this tests whether an investigation looks at how many processes there
+      are and where they came from, rather than at the top of `top`.
     naive_answer: "One runaway process is responsible."
     command: |
       timeout {{seconds}} bash -c 'for i in $(seq 1 400); do (sleep 3600) & done; wait # nb-scenario:zombie_processes' >/dev/null 2>&1
@@ -563,12 +592,15 @@ scenarios:
     name: Security group blocks the load balancer
     tier: services
     kind: aws
-    action: revoke_alb_ingress
+    # Revokes the ALB's own egress rule, not the hosts' ingress rule: a rule the
+    # cleanup re-creates on the hosts group outlived delete-stack and left the
+    # lb stack stuck deleting. See AlbSecurityGroup in lb.yaml.
+    action: revoke_alb_egress
     params:
       port: 8081
     signal: alb-unhealthy
     requires:
-      iam: [ec2:RevokeSecurityGroupIngress, ec2:AuthorizeSecurityGroupIngress, ec2:DescribeSecurityGroups]
+      iam: [ec2:RevokeSecurityGroupEgress, ec2:AuthorizeSecurityGroupEgress, ec2:DescribeSecurityGroups]
       binaries: []
       metric: AWS/ApplicationELB UnHealthyHostCount
     default_seconds: 600
@@ -576,8 +608,9 @@ scenarios:
     teaches: >
       The case every host-level check gets wrong. The order host is untouched: CPU
       flat, memory fine, the process up, /health returning 200 to anything on the
-      box. Nothing is wrong with the machine. But the security group no longer
-      admits the load balancer, so the ALB has no healthy target and clients get
+      box. Nothing is wrong with the machine. But the load balancer's security
+      group no longer lets it reach the service, so the ALB has no healthy
+      target and clients get
       5xx from the balancer itself - no application ever logs an error, because no
       request reaches an application.
 
@@ -594,6 +627,7 @@ scenarios:
 findings:
 
   - id: unattached_ebs_volume
+    clouds: [aws]
     name: Unattached EBS volume
     tier: waste
     tag: unattached-ebs-volume
@@ -601,6 +635,7 @@ findings:
     teaches: Cost analysis finds orphaned resources without any agent on a host.
 
   - id: unencrypted_ebs_volume
+    clouds: [aws]
     name: Unencrypted EBS volume
     tier: waste
     tag: unencrypted-ebs-volume
@@ -608,6 +643,7 @@ findings:
     teaches: Compliance posture checks against resource configuration.
 
   - id: over_permissive_security_group
+    clouds: [aws]
     name: Security group open to the world
     tier: waste
     tag: over-permissive-security-group
@@ -617,6 +653,7 @@ findings:
       so this creates a finding without creating an actual exposure.
 
   - id: oversized_instance
+    clouds: [aws]
     name: Oversized instance
     tier: waste
     tag: oversized-instance
@@ -626,6 +663,7 @@ findings:
       immediately after deploy — say so rather than treating it as a failure.
 
   - id: stopped_instance_with_storage
+    clouds: [aws]
     name: Stopped instance still billing for storage
     tier: waste
     tag: stopped-instance-with-storage
@@ -636,8 +674,67 @@ findings:
       stop command printed in the stack outputs after deploying.
 
   - id: idle_load_balancer
+    clouds: [aws]
     name: Idle load balancer
     tier: waste
     tag: idle-load-balancer
     expect: Load balancer with no healthy targets and no traffic.
     teaches: Idle managed-service spend. Off by default — costs ~$16/mo.
+
+  # --- Azure (infra/azure/waste.bicep). No unencrypted-disk twin: Azure
+  # encrypts every managed disk at rest and that cannot be turned off.
+
+  - id: unattached_managed_disk
+    clouds: [azure]
+    name: Unattached managed disk
+    tier: waste
+    tag: unattached-managed-disk
+    expect: Flagged as unused storage incurring cost with no VM attached.
+    teaches: Cost analysis finds orphaned resources without any agent on a host.
+
+  - id: unattached_public_ip
+    clouds: [azure]
+    name: Unattached public IP
+    tier: waste
+    tag: unattached-public-ip
+    expect: A static Standard public IP associated with nothing, billing hourly.
+    teaches: Small orphaned network spend that nobody owns.
+
+  - id: over_permissive_nsg
+    clouds: [azure]
+    name: Network security group open to the world
+    tier: waste
+    tag: over-permissive-nsg
+    expect: SSH (22) and RDP (3389) allowed inbound from any source.
+    teaches: >
+      Security findings on configuration. The NSG is associated with no subnet
+      or NIC, so this creates a finding without creating an actual exposure.
+
+  - id: oversized_vm
+    clouds: [azure]
+    name: Oversized VM
+    tier: waste
+    tag: oversized-vm
+    expect: Rightsizing recommendation to downsize after utilisation history builds.
+    teaches: >
+      Rightsizing needs days of Azure Monitor history, so this one will not
+      appear immediately after deploy — say so rather than treating it as a failure.
+
+  - id: deallocated_vm_with_storage
+    clouds: [azure]
+    name: Deallocated VM still billing for storage
+    tier: waste
+    tag: deallocated-vm-with-storage
+    expect: Idle-resource finding — compute deallocated, 30GB OS disk still charged.
+    teaches: Cost attribution beyond running compute.
+    manual_step: >
+      ARM cannot create a VM in the deallocated state. Run the az vm deallocate
+      command printed by the deploy after it finishes.
+
+  - id: idle_load_balancer_azure
+    clouds: [azure]
+    name: Idle load balancer
+    tier: waste
+    tag: idle-load-balancer
+    expect: Standard load balancer with an empty backend pool and no traffic.
+    teaches: Idle managed-service spend. Off by default.

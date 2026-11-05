@@ -1,0 +1,214 @@
+{
+  "name": "azure-vm-investigation",
+  "ai_invocable": true,
+  "definition": {
+    "version": "v1",
+    "timeout": "5m",
+    "retry_policy": {
+      "initial_interval": "1s",
+      "maximum_attempts": 3,
+      "maximum_interval": "1m",
+      "backoff_coefficient": 2
+    },
+    "layout": {
+      "viewport": {
+        "x": 340,
+        "y": 72,
+        "zoom": 0.75
+      }
+    },
+    "inputs": [
+      {
+        "id": "account_id",
+        "type": "account",
+        "description": "Cloud account owning the VM."
+      },
+      {
+        "id": "subscription_id",
+        "type": "string",
+        "description": "Azure subscription ID of the VM, e.g. 00000000-0000-0000-0000-000000000000."
+      },
+      {
+        "id": "resource_group",
+        "type": "string",
+        "description": "Resource group of the VM, e.g. nudgebee-scenario-lab."
+      },
+      {
+        "id": "vm_name",
+        "type": "string",
+        "description": "VM name, e.g. nudgebee-scenario-lab-host-1."
+      },
+      {
+        "id": "metric_namespace",
+        "type": "string",
+        "default": "Microsoft.Compute/virtualMachines",
+        "description": "Azure Monitor metric namespace. Microsoft.Compute/virtualMachines for Percentage CPU, Available Memory Percentage, Network Out Total, VmAvailabilityMetric. azure.vm.linux.guestmetrics for disk/used_percent (needs the Azure Monitor Agent)."
+      },
+      {
+        "id": "metric_name",
+        "type": "string",
+        "default": "Percentage CPU",
+        "description": "Metric that alerted, e.g. Percentage CPU, Available Memory Percentage, disk/used_percent, Network Out Total, VmAvailabilityMetric."
+      },
+      {
+        "id": "window_start",
+        "type": "string",
+        "description": "Optional. ISO8601 UTC start of the window, e.g. 2026-09-03T12:00:00Z. Set this well before the alert - Azure metric alerts fire several minutes after the metric moves, and the tool returns exactly the window you ask for and nothing outside it. Blank means the last 30 minutes."
+      },
+      {
+        "id": "window_end",
+        "type": "string",
+        "description": "Optional. ISO8601 UTC end of the window, e.g. 2026-09-03T12:30:00Z. Blank means now."
+      },
+      {
+        "id": "host_action",
+        "type": "string",
+        "default": "triage",
+        "description": "What to read from the host. Default triage (load, top CPU/memory processes, disk, boot time). Others: top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes. All read-only."
+      }
+    ],
+    "triggers": [
+      {
+        "type": "manual",
+        "layout": {
+          "x": 722,
+          "y": -30
+        }
+      }
+    ],
+    "tasks": [
+      {
+        "id": "resolve",
+        "type": "data.transform",
+        "params": {
+          "input": "{\"in_ns\": \"{{ Inputs.metric_namespace }}\", \"in_metric\": \"{{ Inputs.metric_name }}\", \"in_start\": \"{{ Inputs.window_start }}\", \"in_end\": \"{{ Inputs.window_end }}\"}",
+          "inputType": "json",
+          "expression": "function iso(x){ return x.toISOString().replace(/\\.\\d{3}Z$/,'Z'); }\nvar now = new Date();\n// 30m of lead so the result shows what preceded the alert, not just the breach.\n// Azure alerts fire several minutes after the metric moves, so the lead matters more here.\nvar start = data.in_start || iso(new Date(now.getTime() - 30*60000));\nvar end   = data.in_end   || iso(now);\n({\n  metric_namespace: data.in_ns || 'Microsoft.Compute/virtualMachines',\n  metric_name: data.in_metric || 'Percentage CPU',\n  window_start: start, window_end: end\n})"
+        },
+        "layout": {
+          "x": 400,
+          "y": 120
+        }
+      },
+      {
+        "id": "metrics",
+        "type": "azure.cli",
+        "params": {
+          "account_id": "{{ Inputs.account_id }}",
+          "command": "az monitor metrics list --resource /subscriptions/{{ Inputs.subscription_id }}/resourceGroups/{{ Inputs.resource_group }}/providers/Microsoft.Compute/virtualMachines/{{ Inputs.vm_name }} --namespace \"{{ Tasks['resolve'].output.data.metric_namespace }}\" --metric \"{{ Tasks['resolve'].output.data.metric_name }}\" --start-time {{ Tasks['resolve'].output.data.window_start }} --end-time {{ Tasks['resolve'].output.data.window_end }} --interval PT1M --aggregation Average Maximum --output json"
+        },
+        "depends_on": [
+          "resolve"
+        ],
+        "layout": {
+          "x": 160,
+          "y": 280
+        }
+      },
+      {
+        "id": "activity-log",
+        "type": "azure.cli",
+        "params": {
+          "account_id": "{{ Inputs.account_id }}",
+          "command": "az monitor activity-log list --subscription {{ Inputs.subscription_id }} --resource-group {{ Inputs.resource_group }} --start-time {{ Tasks['resolve'].output.data.window_start }} --end-time {{ Tasks['resolve'].output.data.window_end }} --max-events 5000 --query \"[?!starts_with(operationName.value, 'Microsoft.Authorization/policies')].{eventTimestamp:eventTimestamp, operationName:{value:operationName.value}, resourceId:resourceId, caller:caller, status:{value:status.value}, operationId:operationId, correlationId:correlationId, properties:{statusMessage:properties.statusMessage}}\" --output json"
+        },
+        "depends_on": [
+          "resolve"
+        ],
+        "layout": {
+          "x": 400,
+          "y": 280
+        }
+      },
+      {
+        "id": "run-commands",
+        "type": "azure.cli",
+        "failure_policy": {
+          "action": "continue"
+        },
+        "params": {
+          "account_id": "{{ Inputs.account_id }}",
+          "command": "az vm run-command list --subscription {{ Inputs.subscription_id }} --resource-group {{ Inputs.resource_group }} --vm-name {{ Inputs.vm_name }} --output json"
+        },
+        "layout": {
+          "x": 640,
+          "y": 280
+        }
+      },
+      {
+        "id": "collect",
+        "type": "scripting.run_script",
+        "params": {
+          "language": "python",
+          "parser_type": "json",
+          "env": {
+            "METRIC_JSON": "{{ Tasks['metrics'].output.data }}",
+            "ACTIVITY_JSON": "{{ Tasks['activity-log'].output.data }}",
+            "RUNCMD_JSON": "{{ Tasks['run-commands'].output.data }}",
+            "VM_ID": "/subscriptions/{{ Inputs.subscription_id }}/resourceGroups/{{ Inputs.resource_group }}/providers/Microsoft.Compute/virtualMachines/{{ Inputs.vm_name }}",
+            "VM_NAME": "{{ Inputs.vm_name }}",
+            "METRIC_NAMESPACE": "{{ Tasks['resolve'].output.data.metric_namespace }}",
+            "METRIC_NAME": "{{ Tasks['resolve'].output.data.metric_name }}",
+            "WINDOW_START": "{{ Tasks['resolve'].output.data.window_start }}",
+            "WINDOW_END": "{{ Tasks['resolve'].output.data.window_end }}"
+          },
+          "script": "import json, os\n\ndef load(name, empty):\n    raw = os.environ.get(name, '') or ''\n    try:\n        return json.loads(raw) if raw.strip() else empty\n    except Exception:\n        return empty\n\nmetrics = load('METRIC_JSON', {})\nactivity = load('ACTIVITY_JSON', [])\npresent = load('RUNCMD_JSON', [])\nvm_id = os.environ.get('VM_ID', '').lower().rstrip('/')\n\npoints = []\nfor v in metrics.get('value', []) or []:\n    for ts in v.get('timeseries', []) or []:\n        dims = {m.get('name', {}).get('value'): m.get('value')\n                for m in ts.get('metadatavalues', []) or []}\n        for p in ts.get('data', []) or []:\n            if p.get('average') is None and p.get('maximum') is None:\n                continue\n            points.append({\n                'timestamp': p.get('timeStamp'),\n                'average': p.get('average'),\n                'maximum': p.get('maximum'),\n                'dimensions': dims or None,\n                'unit': v.get('unit'),\n            })\npoints.sort(key=lambda x: str(x.get('timestamp') or ''))\n\n# Activity Log for the VM and its child resources (run commands, extensions).\n# Azure logs one operation several times - Started, Accepted, Succeeded -\n# so collapse to one row per operation, keeping every status seen.\nops = {}\nfor e in activity if isinstance(activity, list) else []:\n    rid = (e.get('resourceId') or '').lower()\n    if not rid.startswith(vm_id):\n        continue\n    op = (e.get('operationName') or {}).get('value') or ''\n    if op.lower().startswith('microsoft.authorization/policies/'):\n        continue  # policy evaluations: high volume, never the cause\n    # the phases of one operation share a correlationId, not an operationId\n    key = (e.get('correlationId') or e.get('operationId') or e.get('eventDataId'), op)\n    row = ops.setdefault(key, {\n        'time': e.get('eventTimestamp'),\n        'operation': op,\n        'resource': (e.get('resourceId') or '').split('/')[-1],\n        'caller': e.get('caller'),\n        'statuses': [],\n        'error': None,\n    })\n    if e.get('eventTimestamp') and str(e['eventTimestamp']) < str(row['time']):\n        row['time'] = e['eventTimestamp']\n    status = (e.get('status') or {}).get('value')\n    if status and status not in row['statuses']:\n        row['statuses'].append(status)\n    props = e.get('properties') or {}\n    if status == 'Failed' and not row['error']:\n        row['error'] = props.get('statusMessage') or props.get('message')\nactivity_rows = sorted(ops.values(), key=lambda r: str(r['time'] or ''))\nrun_ops = [r for r in activity_rows if 'runcommand' in r['operation'].lower()]\n\n# Run Commands still on the VM - the only place the script text survives.\nscripts = []\nfor rc in present if isinstance(present, list) else []:\n    src = rc.get('source') or {}\n    view = rc.get('instanceView') or {}\n    scripts.append({\n        'name': rc.get('name'),\n        'script': src.get('script') or src.get('commandId') or src.get('scriptUri'),\n        'execution_state': view.get('executionState'),\n        'start_time': view.get('startTime'),\n        'end_time': view.get('endTime'),\n        'tags': rc.get('tags'),\n    })\n\nprint(json.dumps({\n    'vm': os.environ.get('VM_NAME', ''),\n    'metric_namespace': os.environ.get('METRIC_NAMESPACE', ''),\n    'metric_name': os.environ.get('METRIC_NAME', ''),\n    'window_start': os.environ.get('WINDOW_START', ''),\n    'window_end': os.environ.get('WINDOW_END', ''),\n    'datapoint_count': len(points),\n    'datapoints': points,\n    'run_command_operation_count': len(run_ops),\n    'run_command_operations': run_ops,\n    'other_activity': [r for r in activity_rows if r not in run_ops],\n    'run_commands_present': scripts,\n}, default=str))\n",
+          "os_type": "linux",
+          "account_id": "{{ Inputs.account_id }}"
+        },
+        "depends_on": [
+          "activity-log",
+          "metrics",
+          "resolve",
+          "run-commands"
+        ],
+        "layout": {
+          "x": 400,
+          "y": 460
+        }
+      },
+      {
+        "id": "inspect-host",
+        "type": "scripting.run_script",
+        "failure_policy": {
+          "action": "continue"
+        },
+        "params": {
+          "executor_type": "azure_run_command",
+          "target_id": "/subscriptions/{{ Inputs.subscription_id }}/resourceGroups/{{ Inputs.resource_group }}/providers/Microsoft.Compute/virtualMachines/{{ Inputs.vm_name }}",
+          "account_id": "{{ Inputs.account_id }}",
+          "language": "bash",
+          "env": {
+            "ACTION": "{{ Inputs.host_action }}"
+          },
+          "script": "#!/bin/bash\nset -o pipefail\nACTION=\"${ACTION:-triage}\"\nhr() { echo; echo \"===== $1 =====\"; }\ncase \"$ACTION\" in\n  triage)\n    hr \"uptime / load\"; uptime\n    hr \"top 10 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -11\n    hr \"top 10 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,cmd --sort=-pmem 2>/dev/null | head -11\n    hr \"memory\"; free -m 2>/dev/null\n    hr \"disk\"; df -hP 2>/dev/null\n    hr \"boot time\"; who -b 2>/dev/null; uptime -s 2>/dev/null ;;\n  top_cpu)    hr \"top 20 by CPU\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pcpu 2>/dev/null | head -21 ;;\n  top_memory) hr \"top 20 by memory\"; ps -eo pid,ppid,user,pcpu,pmem,etime,lstart,cmd --sort=-pmem 2>/dev/null | head -21 ;;\n  disk_usage) hr \"filesystems\"; df -hP 2>/dev/null; hr \"largest dirs under /var\"; du -xh --max-depth=2 /var 2>/dev/null | sort -rh | head -20 ;;\n  memory_usage) hr \"free\"; free -m 2>/dev/null; hr \"meminfo\"; head -20 /proc/meminfo 2>/dev/null ;;\n  network_connections) hr \"listening\"; ss -tulpn 2>/dev/null | head -60; hr \"established\"; ss -tnp state established 2>/dev/null | head -60 ;;\n  running_services) hr \"running units\"; systemctl list-units --type=service --state=running --no-pager 2>/dev/null | head -60 ;;\n  failed_services) hr \"failed units\"; systemctl --failed --no-pager 2>/dev/null ;;\n  recent_logins) hr \"last logins\"; last -a -n 40 2>/dev/null; hr \"logged in now\"; w 2>/dev/null ;;\n  shell_history)\n    hr \"shell history (most recent 100 per user)\"\n    for f in /root/.bash_history /home/*/.bash_history; do\n      [ -r \"$f\" ] || continue; echo \"--- $f\"; tail -100 \"$f\" 2>/dev/null\n    done ;;\n  cron_jobs)\n    hr \"system crontab\"; cat /etc/crontab 2>/dev/null\n    hr \"cron.d\"; ls -la /etc/cron.d 2>/dev/null\n    hr \"per-user crontabs\"\n    for u in $(cut -d: -f1 /etc/passwd 2>/dev/null); do\n      out=$(crontab -l -u \"$u\" 2>/dev/null); [ -n \"$out\" ] && { echo \"--- $u\"; echo \"$out\"; }\n    done\n    hr \"systemd timers\"; systemctl list-timers --all --no-pager 2>/dev/null | head -30 ;;\n  recent_syslog) hr \"journal (warning+, last 200)\"; journalctl -p warning -n 200 --no-pager 2>/dev/null ;;\n  process_tree) hr \"process tree\"; ps -ejH -o pid,ppid,user,pcpu,etime,cmd 2>/dev/null | head -120 ;;\n  boot_time) hr \"boot\"; who -b 2>/dev/null; uptime -s 2>/dev/null; uptime ;;\n  package_changes)\n    hr \"recent package activity\"\n    if command -v rpm >/dev/null 2>&1; then rpm -qa --last 2>/dev/null | head -40; fi\n    if command -v dpkg >/dev/null 2>&1; then grep -h ' install \\| upgrade ' /var/log/dpkg.log 2>/dev/null | tail -40; fi ;;\n  *) echo \"ERROR: unknown host_action '$ACTION'\"; exit 2 ;;\nesac\n",
+          "os_type": "linux"
+        },
+        "depends_on": [
+          "collect"
+        ],
+        "layout": {
+          "x": 400,
+          "y": 640
+        }
+      },
+      {
+        "id": "report",
+        "type": "core.print",
+        "params": {
+          "message": "Azure VM data \u2014 {{ Inputs.vm_name }} ({{ Inputs.resource_group }})\nMetric: {{ Tasks['resolve'].output.data.metric_namespace }} / {{ Tasks['resolve'].output.data.metric_name }}   Window: {{ Tasks['resolve'].output.data.window_start }} to {{ Tasks['resolve'].output.data.window_end }}\n\nDatapoints ({{ Tasks['collect'].output.data.datapoint_count }}):\n{{ Tasks['collect'].output.data.datapoints }}\n\nRun Command operations in window ({{ Tasks['collect'].output.data.run_command_operation_count }}):\n{{ Tasks['collect'].output.data.run_command_operations }}\n\nRun Commands still on the VM (script text):\n{{ Tasks['collect'].output.data.run_commands_present }}\n\nOther activity on the VM:\n{{ Tasks['collect'].output.data.other_activity }}\n\nHost inspection ({{ Inputs.host_action }}):\n{{ Tasks['inspect-host'].output.data }}\n"
+        },
+        "depends_on": [
+          "collect",
+          "inspect-host",
+          "resolve"
+        ],
+        "layout": {
+          "x": 400,
+          "y": 820
+        }
+      }
+    ],
+    "llm_description": "Returns Azure Monitor datapoints, the Activity Log for the VM (including every Run Command, who issued it and when), the Run Commands still present on the VM with their script text, and a read-only host inspection, for one Azure VM over a time window.\n\nThis is a data tool. It fetches and returns; it does not interpret. There is no verdict and no root cause - every operation in the window is returned in time order with its caller, status and timestamp, alongside the metric datapoints and live host state. Deciding what caused what is your job, not the tool's.\n\nSet metric_namespace and metric_name to whatever you want to look at: Microsoft.Compute/virtualMachines for Percentage CPU, Available Memory Percentage (low is bad), Network Out Total, VmAvailabilityMetric; azure.vm.linux.guestmetrics for disk/used_percent (one series per mount - /snap paths always read 100% and mean nothing). Leave the window blank for the last 30 minutes, or start window_start well before the alert: Azure alerts fire several minutes after the metric moves.\n\nhost_action chooses what is read from the host - default triage; also top_cpu, top_memory, shell_history, cron_jobs, recent_logins, running_services, failed_services, network_connections, disk_usage, memory_usage, recent_syslog, process_tree, boot_time, package_changes.\n\nThings the data cannot tell you, which matter when reading it: the Activity Log records who ran a Run Command and when, never the script - the script text exists only while the Run Command resource does. SSH sessions, cron jobs and boot-time processes leave no trace in the Activity Log. Host inspection is a snapshot taken now, so a short-lived process may already be gone, and the inspection itself appears in the Activity Log as a Run Command - do not mistake it for the cause. An empty result is not evidence of absence.\n\nThe VM must be running with its VM agent ready for host inspection. Read-only: it never kills, restarts or reconfigures anything."
+  }
+}

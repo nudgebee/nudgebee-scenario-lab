@@ -128,23 +128,36 @@ else
   if [ -z "$IDS" ] || [ "$IDS" = "None" ]; then
     warn "stack $STACK not deployed - skipping"
   else
-    MON=$(aws ec2 describe-instances --instance-ids $IDS --region "$REGION" \
-          --query 'Reservations[].Instances[].Monitoring.State' --output text 2>/dev/null | tr '\t' '\n' | sort -u)
-    echo "  instance monitoring: $(echo $MON)"
-    # EC2 publishes AWS/EC2 metrics every 300s on basic, 60s on detailed.
-    # StatusCheckFailed is always 60s, so it is exempt.
-    PUBRATE=300; [ "$MON" = "enabled" ] && PUBRATE=60
-    while read -r name period ns metric; do
+    # The lab, db and lb tiers name their alarms <stack>-host-*; the services
+    # tier names them after its own stack, <stack>-services-*.
+    ALARMS=$(for p in "${STACK}-host-" "${STACK}-services-"; do
+               aws cloudwatch describe-alarms --alarm-name-prefix "$p" --region "$REGION" \
+                 --query 'MetricAlarms[].[AlarmName,Period,Namespace,MetricName,Dimensions[?Name==`InstanceId`].Value|[0]]' \
+                 --output text 2>/dev/null
+             done | sort)
+    # Publish rate is per instance, and the services tier has its own
+    # DetailedMonitoring parameter - so read the monitoring of the instance
+    # each alarm watches, rather than assuming the lab hosts' setting holds.
+    ALARM_IDS=$(echo "$ALARMS" | awk '$5 ~ /^i-/ {print $5}' | sort -u)
+    MONMAP=""
+    [ -n "$ALARM_IDS" ] && MONMAP=$(aws ec2 describe-instances --instance-ids $ALARM_IDS --region "$REGION" \
+          --query 'Reservations[].Instances[].[InstanceId,Monitoring.State]' --output text 2>/dev/null)
+    echo "  instance monitoring: $(echo "$MONMAP" | awk 'NF {print $1"="$2}' | tr '\n' ' ')"
+    while read -r name period ns metric iid; do
       [ -z "$name" ] && continue
       [ "$ns" != "AWS/EC2" ] && { ok "$name ($ns publishes on its own schedule)"; continue; }
+      # StatusCheckFailed is always 60s, so it is exempt.
       [ "$metric" = "StatusCheckFailed" ] && { ok "$name (status checks are always 1-minute)"; continue; }
+      MON=$(echo "$MONMAP" | awk -v i="$iid" '$1 == i {print $2}')
+      [ -z "$MON" ] && { warn "$name: cannot read monitoring for instance '$iid' - skipping"; continue; }
+      # EC2 publishes AWS/EC2 metrics every 300s on basic, 60s on detailed.
+      PUBRATE=300; [ "$MON" = "enabled" ] && PUBRATE=60
       if [ "$period" -lt "$PUBRATE" ]; then
-        bad "$name: Period=${period}s but AWS/EC2 publishes every ${PUBRATE}s - most periods are empty, so this alarm may never fire"
+        bad "$name: Period=${period}s but $iid publishes every ${PUBRATE}s - most periods are empty, so this alarm may never fire"
       else
         ok "$name (Period=${period}s >= publish rate ${PUBRATE}s)"
       fi
-    done < <(aws cloudwatch describe-alarms --alarm-name-prefix "${STACK}-host-" --region "$REGION" \
-             --query 'MetricAlarms[].[AlarmName,Period,Namespace,MetricName]' --output text 2>/dev/null | sort)
+    done <<< "$ALARMS"
   fi
 fi
 

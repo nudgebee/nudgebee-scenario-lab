@@ -239,13 +239,23 @@ class AwsProvider:
         return sorted(out, key=lambda h: h["name"])
 
     def alarm_map(self) -> dict[str, dict]:
-        """alarm name -> alarm, for the host prefix used by the lab stack."""
-        try:
-            alarms = self.cw.describe_alarms(AlarmNamePrefix=f"{self.stack}-host-", MaxRecords=100)
-        except AWS_ERRORS:
-            return {}
+        """
+        alarm name -> alarm, for every tier the lab deploys.
+
+        The lab, db and lb tiers name their alarms <lab-stack>-host-*. The services
+        tier names them after its own stack, <lab-stack>-services-*, so a single
+        -host- prefix found none of them: every services scenario showed no alarm
+        while its alarms were firing. Query both prefixes rather than renaming the
+        services alarms, which would mean replacing them on every existing lab.
+        """
+        found = []
+        for prefix in (f"{self.stack}-host-", f"{self.stack}-services-"):
+            try:
+                found += self.cw.describe_alarms(AlarmNamePrefix=prefix, MaxRecords=100).get("MetricAlarms", [])
+            except AWS_ERRORS:
+                continue
         out = {}
-        for a in alarms.get("MetricAlarms", []):
+        for a in found:
             out[a["AlarmName"]] = {
                 "name": a["AlarmName"],
                 "state": a["StateValue"],

@@ -206,8 +206,10 @@ Everything the lab created disappears. Nothing is left behind and billing stops.
 | Runaway scheduled job | A job fires every minute and keeps burning CPU |
 | Service failure | A service fails to start and keeps retrying forever |
 | Zombie processes | Hundreds of stuck processes pile up |
+| Deleted file filling the disk | The disk is full, but no file on it is big enough to explain why |
+| Memory leak | Memory climbs, holds, then the kernel kills the process and the alarm clears itself |
 
-With the services tier deployed, three more — and these are the ones worth
+With the services tier deployed, four more — and these are the ones worth
 showing, because the fault and the symptom are on different machines:
 
 | Scenario | What it looks like |
@@ -215,6 +217,7 @@ showing, because the fault and the symptom are on different machines:
 | Service failure cascade | One service stops and two others start failing behind it |
 | Database outage | The database stops; three applications break at once |
 | Order loses its database | One service can't reach its database, and everything downstream burns CPU retrying |
+| Bad config change | A config rollout restarts one service into a broken state; three services alarm and the database is fine |
 
 With the load balancer tier, one more:
 

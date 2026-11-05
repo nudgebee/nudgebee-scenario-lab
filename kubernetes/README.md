@@ -25,6 +25,7 @@ they do deliberately break things, and one of them restarts the agent.
 | Scenario | What it looks like |
 |---|---|
 | [CrashLoopBackOff](crashloop-backoff/) | A service won't start. It restarts, dies, backs off, and restarts again — and the reason is in a config value nobody looked at |
+| [NetworkPolicy on the wrong port](networkpolicy-wrong-port/) | Requests hang while every pod is Running and Ready. No alert fires — you ask NudgeBee, and the answer is a port number in a policy that looks correct |
 
 ## How these differ from the AWS scenarios
 
@@ -32,8 +33,8 @@ they do deliberately break things, and one of them restarts the agent.
 |---|---|---|
 | Infrastructure | The lab creates it | Yours, already running |
 | Trigger | Control app or CLI, over SSM | A script you run with `kubectl` access |
-| Signal | CloudWatch alarm | The agent's own event, from the Kubernetes API |
-| Cleanup | Self-limiting, plus **Reset everything** | `./run.sh cleanup` deletes the namespace |
+| Signal | CloudWatch alarm | The agent's own event, from the Kubernetes API — or none, for silent failures you ask about |
+| Cleanup | Self-limiting, plus **Reset everything** | `./run.sh cleanup` removes what the scenario created |
 
 There is no countdown and no automatic expiry here: the broken workload stays
 broken until you fix it or delete it. That is the point of the scenario — an

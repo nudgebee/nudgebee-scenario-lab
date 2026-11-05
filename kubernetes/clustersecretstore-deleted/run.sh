@@ -212,7 +212,7 @@ cmd_break() {
     stuck=0
     for pair in $FAILING_DEPLOY; do
       kubectl -n "${pair#*:}" get pods -l app="${pair%%:*}" \
-        -o jsonpath='{.items[*].status.containerStatuses[0].state.waiting.reason}' | grep -q CreateContainerConfigError \
+        -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' | grep -q CreateContainerConfigError \
         && stuck=$((stuck + 1))
     done
     [ "$stuck" = 3 ] && break

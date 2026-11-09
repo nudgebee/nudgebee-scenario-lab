@@ -27,6 +27,7 @@ they do deliberately break things, and one of them restarts the agent.
 | [CrashLoopBackOff](crashloop-backoff/) | A service won't start. It restarts, dies, backs off, and restarts again — and the reason is in a config value nobody looked at |
 | [NetworkPolicy on the wrong port](networkpolicy-wrong-port/) | Requests hang while every pod is Running and Ready. No alert fires — you ask NudgeBee, and the answer is a port number in a policy that looks correct |
 | [Service on the wrong port](service-wrong-port/) | Every call is refused instantly, but the Service has endpoints and every pod is Ready. No alert fires — the answer is one number on the Service |
+| [A volume filling up](volume-filling-up/) | A database's volume grows a steady 13% a day while every pod is healthy. This one takes days: NudgeBee forecasts the day the volume fills, and the cause is a mount a tidy-up dropped |
 | [Ingress with a typo in the host](ingress-wrong-host/) | Users get 404 for a site whose app, Service and Ingress all look fine. No alert fires — the answer is two swapped letters in a hostname |
 
 ## How these differ from the AWS scenarios

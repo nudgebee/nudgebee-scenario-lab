@@ -238,7 +238,7 @@ cmd_break() {
 
   cat <<TXT
 
-  The volume now grows about $DAILY_WRITE_MIB MiB a day (timings below are for $SIZE = 10Gi):
+  The volume now grows about $DAILY_WRITE_MIB MiB a day. The timings below are for a 10Gi volume:
 
   1. Now, in NudgeBee: Apps & Infra -> PVC -> $CLAIM ($NS) -> row menu
      -> Disk SLO -> 85% -> Save. Check now shows the climb; it needs
@@ -272,8 +272,8 @@ cmd_fix() {
 
 cmd_status() {
   echo "workload: $NS/$APP -> $NS/$DB"
-  kubectl -n "$NS" get pods -l "app in ($DB,$APP)" 2>/dev/null || echo "  (not deployed)"
-  kubectl -n "$NS" get pod "$DB-0" >/dev/null 2>&1 || return 0
+  kubectl -n "$NS" get pod "$DB-0" >/dev/null 2>&1 || { echo "  (not deployed)"; return 0; }
+  kubectl -n "$NS" get pods -l "app in ($DB,$APP)"
   echo
   echo "volume $CLAIM: $(disk)"
   echo

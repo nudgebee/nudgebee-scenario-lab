@@ -60,6 +60,7 @@ after it fires (its `group_interval`, often 5 minutes).
 | `SEVERITY` | `warning` | your Alertmanager sends only some severities to NudgeBee, or pages people on `warning` |
 | `MONITOR_LABELS` | none | your Prometheus only picks up rules and monitors with a label, e.g. `release=kube-prometheus-stack` |
 | `ALERTS` | `auto` | `vm` or `prometheus` to choose; `none` for no alarms, and you ask NudgeBee instead |
+| `ALERT_WEBHOOK` | none | your Alertmanager does not already send these alarms to NudgeBee: set it to the agent's `http://<runner service>.<namespace>.svc/api/alerts`, and `deploy` adds a route for just these two alarms |
 | `LIMIT`, `WORKERS` | `20`, `20` | the processor's calls a second, and `ledger-reconcile`'s workers after `break` (2 calls a second each) |
 
 ## Why it's easy to miss

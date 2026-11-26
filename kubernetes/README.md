@@ -4,7 +4,9 @@
 
 The rest of this lab builds throwaway EC2 servers for you. These don't. They run
 against a cluster you already have, with the NudgeBee agent already installed,
-and they only ever touch namespaces they create themselves.
+and they only ever touch namespaces they create themselves -- except
+[the one that runs on the OpenTelemetry demo](otel-demo-payment-quota/), which
+adds a sidecar to the demo's `payment` and says so.
 
 That trade is deliberate. Kubernetes failures are interesting because of what
 surrounds them — the workload that owns the pod, the config it reads, the
@@ -30,6 +32,7 @@ they do deliberately break things, and one of them restarts the agent.
 | [A volume filling up](volume-filling-up/) | A database's volume grows a steady 13% a day while every pod is healthy. This one takes days: NudgeBee forecasts the day the volume fills, and the cause is a mount a tidy-up dropped |
 | [Ingress with a typo in the host](ingress-wrong-host/) | Users get 404 for a site whose app, Service and Ingress all look fine. No alert fires — the answer is two swapped letters in a hostname |
 | [Upstream rate limit](upstream-rate-limit/) | Checkout fails half its orders and two alarms fire, while every pod is healthy. The cause is a batch job in another namespace, sped up just before, using a limit checkout shares |
+| [Payment quota on the OpenTelemetry demo](otel-demo-payment-quota/) | The same story on the Astronomy Shop: checkout fails, payment refuses calls, and the cause is a settlement batch that started sharing payment's quota. Needs the OpenTelemetry demo |
 
 ## How these differ from the AWS scenarios
 

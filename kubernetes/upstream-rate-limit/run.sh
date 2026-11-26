@@ -29,6 +29,7 @@ WORKERS=${WORKERS:-20}            # ledger-reconcile workers after `break`, 2 ca
 SEVERITY=${SEVERITY:-warning}     # severity label on both alarms
 ALERTS=${ALERTS:-auto}            # auto | vm | prometheus | none
 MONITOR_LABELS=${MONITOR_LABELS:-}  # extra labels for the rules and the scrape: k=v,k=v
+ALERT_WEBHOOK=${ALERT_WEBHOOK:-}  # optional: route these two alarms to this URL (a NudgeBee agent's /api/alerts)
 IMAGE=${IMAGE:-python:3.12-alpine}
 HERE=$(cd "$(dirname "$0")" && pwd)
 NAME=upstream-rate-limit
@@ -196,6 +197,58 @@ spec:
 EOF
 }
 
+# $1 = vm | prometheus, $2 = alert names as a regex. Routes this scenario's
+# alarms, and only those, at $SEVERITY, to ALERT_WEBHOOK -- for example a
+# NudgeBee agent's http://<runner service>.<namespace>.svc/api/alerts.
+# Alertmanager scopes the route to this namespace by itself. If your root
+# routes stop on your severity before namespace routes are reached, choose a
+# SEVERITY they do not match.
+render_route() {
+  if [ "$1" = vm ]; then
+    cat <<EOF
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertmanagerConfig
+metadata:
+  name: $NAME
+  namespace: $NS
+  labels: {scenario: $NAME$(extra_labels)}
+spec:
+  receivers:
+    - name: nudgebee
+      webhook_configs: [{url: "$ALERT_WEBHOOK", send_resolved: true}]
+  route:
+    receiver: nudgebee
+    matchers: ['alertname=~"$2"', 'severity="$SEVERITY"']
+    group_by: [alertname]
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 1h
+EOF
+  else
+    cat <<EOF
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: $NAME
+  namespace: $NS
+  labels: {scenario: $NAME$(extra_labels)}
+spec:
+  receivers:
+    - name: nudgebee
+      webhookConfigs: [{url: "$ALERT_WEBHOOK", sendResolved: true}]
+  route:
+    receiver: nudgebee
+    matchers:
+      - {name: alertname, matchType: "=~", value: "$2"}
+      - {name: severity, matchType: "=", value: "$SEVERITY"}
+    groupBy: [alertname]
+    groupWait: 10s
+    groupInterval: 1m
+    repeatInterval: 1h
+EOF
+  fi
+}
+
 # The last full 10-second window, as each service counts it: "ok=48 failed=2".
 stats() { kubectl -n "$NS" exec deploy/storefront -- wget -q -O- -T 5 "http://$1/stats" 2>/dev/null || true; }
 field() { printf '%s\n' "$2" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
@@ -256,6 +309,10 @@ cmd_deploy() {
   else
     render_alarms "$flavour" | kubectl apply -f -
     echo "     PaymentsGatewayRateLimited and CheckoutErrorRateHigh, severity=$SEVERITY"
+    if [ -n "$ALERT_WEBHOOK" ]; then
+      render_route "$flavour" "PaymentsGatewayRateLimited|CheckoutErrorRateHigh" | kubectl apply -f -
+      echo "     routed to $ALERT_WEBHOOK"
+    fi
   fi
 
   cat <<TXT
@@ -340,7 +397,7 @@ cmd_status() {
 cmd_cleanup() {
   kubectl -n "$NS" delete deploy,service,configmap -l "scenario=$NAME" --ignore-not-found
   local kind
-  for kind in vmrule vmpodscrape prometheusrule podmonitor; do  # a kind the cluster lacks just errors
+  for kind in vmrule vmpodscrape vmalertmanagerconfig prometheusrule podmonitor alertmanagerconfig; do  # a kind the cluster lacks just errors
     kubectl -n "$NS" delete "$kind" -l "scenario=$NAME" --ignore-not-found 2>/dev/null || true
   done
   kubectl -n "$BATCH_NS" delete deploy,configmap -l "scenario=$NAME" --ignore-not-found 2>/dev/null || true

@@ -1,0 +1,96 @@
+# Envoy config for the `processor-gateway` sidecar this scenario adds to the
+# demo's payment pod. Same config as fault mj-06 in nudgebee/opentelemetry-demo
+# (deploy/kubernetes/sample-app/values.yaml, `payment:`); keep the two in step.
+#
+# run.sh drops every full-line comment, these included, when it renders this
+# file into the ConfigMap, so comments here never reach the cluster. It fills
+# the three double-underscore placeholders (listen port, app port, limit);
+# envsubst fills the collector address when the container starts, so this file
+# must contain no other dollar sign.
+static_resources:
+  listeners:
+    - name: payment
+      address:
+        socket_address: { address: 0.0.0.0, port_value: __LISTEN_PORT__ }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: payment
+                codec_type: AUTO
+                access_log:
+                  # Throttled calls only: one line per refusal, naming the caller.
+                  - name: envoy.access_loggers.stdout
+                    filter:
+                      response_flag_filter: { flags: ["RL"] }
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "[%START_TIME%] processor quota exceeded: %REQ(:PATH)% from %DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% (%REQ(USER-AGENT)%)\n"
+                route_config:
+                  virtual_hosts:
+                    - name: payment
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: payment, timeout: 10s }
+                http_filters:
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: processor_quota
+                      token_bucket: { max_tokens: __LIMIT__, tokens_per_fill: __LIMIT__, fill_interval: 1s }
+                      filter_enabled:
+                        default_value: { numerator: 100, denominator: HUNDRED }
+                      filter_enforced:
+                        default_value: { numerator: 100, denominator: HUNDRED }
+                      rate_limited_as_resource_exhausted: true
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: payment
+      type: STATIC
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: { http2_protocol_options: {} }
+      load_assignment:
+        cluster_name: payment
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: __APP_PORT__ } } }
+    - name: otel_collector
+      type: STRICT_DNS
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config: { http2_protocol_options: {} }
+      load_assignment:
+        cluster_name: otel_collector
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: "${OTEL_COLLECTOR_NAME}", port_value: 4317 } } }
+# Counters go to the demo's own collector (OTLP), so they reach whatever
+# metrics backend the demo already reports to, labelled with the payment pod.
+stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig
+      grpc_service: { envoy_grpc: { cluster_name: otel_collector } }
+      emit_tags_as_attributes: true
+      use_tag_extracted_name: true
+stats_flush_interval: 15s
+stats_config:
+  stats_matcher:
+    inclusion_list:
+      patterns:
+        - safe_regex: { regex: ".*processor_quota.*" }
+        - prefix: "http.payment.downstream_rq"
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
